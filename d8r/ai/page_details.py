@@ -14,8 +14,8 @@ async def generate_details(config: client.AIConfig, document: str) -> tuple[str,
         raise client.AIError("This query is too large to generate page details (65,536 character limit).")
     messages = [
         {"role": "system", "content": (
-            "Name and describe a D8R query document. D8R uses backslash clauses such as "
-            "\\from, \\select, \\where, \\group, \\join and \\limit. "
+            "Name and describe a native SQL document in PGTUI (PostgreSQL, Cloudflare D1 SQLite, or local Parquet DuckDB). "
+            "Saved query templates may use @parameter expression placeholders. "
             "Return only a JSON object with exactly two string fields: title (a short name, "
             "at most 120 characters) and description (a concise explanation, at most 2000 "
             "characters). Describe only what the query expresses; do not invent results. "

@@ -22,7 +22,6 @@ from d8r.ai.client import AIConfig
 from d8r.ai.config import import_yolo_config
 
 from d8r.credentials import CredentialError
-from d8r.engine import DIALECT_BY_NAME, DIALECTS
 from d8r.themes import THEMES, theme_label
 
 from .add_source import AddSourceModal
@@ -38,7 +37,6 @@ MENUS: dict[str, str] = {
     "theme": "Theme",
     "values": "Value cache",
     "sources": "Data source",
-    "dialects": "Dialect",
     "ai": "AI provider",
     "keys": "Keybindings",
 }
@@ -50,7 +48,7 @@ class Row:
     label: str
     detail: str = ""
     # pane | intellisense | entry-screen | default-rows | value-cache | value-limit | clear-values |
-    # source | dialect | ai | ai-auto-accept | ai-sample-data | ai-schema-refreshes | add-source.
+    # source | ai | ai-auto-accept | ai-sample-data | ai-schema-refreshes | add-source.
     action: str = ""
     value: str = ""
 
@@ -155,17 +153,17 @@ class SettingsScreen(ModalScreen[None]):
             "menus": "Show or hide workspace panes without changing your document.",
             "theme": "Choose a palette with Enter or a click. Colors change immediately and are saved for next time. "
                      "Nord is the default palette.",
-            "values": "Autocomplete and the schema explorer share a memory-only value cache. "
-                      "Values are fetched lazily on the first read of a column; there is no startup scan "
-                      "or distinct-value fetch across every column. Values never go to disk and are cleared "
-                      "at exit. Only these preferences are saved. Changing them clears cached values.",
-            "sources": "Connect an Ibis database or Cloudflare D1, or select an existing source. Selecting a source refreshes its schema and completion.",
-            "dialects": "Choose the SQL rendering target independently of the active data source. Changing dialect does not execute a query.",
+            "values": "The schema explorer caches explicitly requested column values in memory. "
+                      "Completion uses cached metadata only and never queries while typing. "
+                      "Values never go to disk and are cleared at exit. Changing these settings clears cached values.",
+            "sources": "Connect PostgreSQL, Cloudflare D1 or a local Parquet file. SQL dialect and engine version follow the selected source.",
             "ai": "Provider changes require Save. Permission toggles save immediately. Schema refreshes control AI metadata lookups, not IDE indexing. "
                   "Test AI Queries permits read-only execution with bounded result rows; aggregates can still scan many source rows. "
                   "Query-check failures and bounded row counts are shared even when Allow Sample Data is off; result samples are sent only when it is on. "
                   "Sample records per read and Request timeout also govern query checks. "
                   "Automatically applied edits update validated, unchanged drafts only; they never run queries or save functions. "
+                  "AI completion while typing sends the current SQL window and permitted cached schema after an idle pause; "
+                  "it never samples rows or auto-applies; SQL literals may contain sensitive data. F4 or Ctrl+Shift+Space requests it manually. "
                   "Disabling reads does not remove data already shared in chat.",
             "keys": "Keyboard shortcuts from the running app. This reference is read-only.",
         }
@@ -180,7 +178,6 @@ class SettingsScreen(ModalScreen[None]):
             "theme": "enter / click apply and save theme",
             "values": "enter / click toggle, edit or clear",
             "sources": "enter / click select or add",
-            "dialects": "enter / click select",
             "ai": "enter / click toggle or edit",
             "keys": "read-only reference",
         }[self.menu]
@@ -225,7 +222,7 @@ class SettingsScreen(ModalScreen[None]):
         if self.menu == "keys":
             return binding_rows()
         if self.menu == "sources":
-            return [Row("Add data source", "Trino, PostgreSQL, other Ibis backends or Cloudflare D1", "add-source")] + [
+            return [Row("Add data source", "PostgreSQL, Cloudflare D1 or Local Parquet", "add-source")] + [
                 Row(
                     label,
                     "active" if source_id == self.session.active_id else
@@ -236,8 +233,6 @@ class SettingsScreen(ModalScreen[None]):
                 )
                 for label, source_id in self.session.source_options()
             ]
-        if self.menu == "dialects":
-            return [Row(spec["label"], self._dialect_detail(spec["name"]), "dialect", spec["name"]) for spec in DIALECTS]
         if self.menu == "ai":
             config = self.session.ai_config
             return [
@@ -255,23 +250,16 @@ class SettingsScreen(ModalScreen[None]):
                     "off · no query-check execution", "ai-test-queries"),
                 Row("Automatically Apply AI Edits", "on · validated drafts only" if self.session.ai_auto_accept else
                     "off · review and Apply manually", "ai-auto-accept"),
+                Row("AI completion while typing", "on · sends SQL/cached schema after pauses" if self.session.ai_completion else
+                    "off · F4 / Ctrl+Shift+Space requests manually", "ai-completion"),
             ]
         return [
             Row("Intellisense", "on" if self.session.intellisense else "off", "intellisense"),
             Row("Default rows returned", str(self.session.default_rows) if self.session.default_rows else
-                "0 · no default limit", "default-rows"),
+                "0 · safe 10,000-row preview cap", "default-rows"),
             Row("Entry screen", "on · shown at next startup" if self.session.entry_screen else
                 "off · open workspace directly", "entry-screen"),
         ]
-
-    def _dialect_detail(self, name: str) -> str:
-        """What a dialect row says about itself, honestly."""
-        if name == self.session.dialect:
-            return "active"
-        spec = DIALECT_BY_NAME.get(name)
-        if spec is not None and not spec["compiles"]:
-            return "known but does not compile in this build"
-        return ""
 
     # -- acting -------------------------------------------------------------
 
@@ -310,6 +298,8 @@ class SettingsScreen(ModalScreen[None]):
             self.ide.update_settings(entry_screen=not self.session.entry_screen)
         elif row.action == "ai-auto-accept":
             self.ide.update_settings(ai_auto_accept=not self.session.ai_auto_accept)
+        elif row.action == "ai-completion":
+            self.ide.update_settings(ai_completion=not self.session.ai_completion)
         elif row.action == "ai-sample-data":
             self.ide.update_settings(ai_allow_sample_data=not self.session.ai_allow_sample_data)
         elif row.action == "ai-schema-refreshes":
@@ -351,8 +341,6 @@ class SettingsScreen(ModalScreen[None]):
             return
         elif row.action == "source":
             self.ide.select_source(row.value)
-        elif row.action == "dialect":
-            self.ide.select_dialect(row.value)
         self._draw(highlight=event.option_index)
 
     def action_back(self) -> None:
@@ -384,12 +372,12 @@ class DefaultRowsScreen(ModalScreen[None]):
         with VerticalScroll(id="rows-settings"):
             yield Static("Default rows returned")
             yield Static(
-                "Applies to ordinary Run and Compile when the query has no explicit \\limit. "
-                "An explicit \\limit always wins, including \\limit 0. "
-                "Your document is not edited, and temporary-table writes are not capped. "
+                "Caps rows fetched for the results grid; SQL is never rewritten. "
+                "An authored LIMIT remains part of your query. Writes are not capped. "
+                "SQL preview only expands local functions and does not check server grammar. "
                 "AI sample reads keep their own limits.", markup=False,
             )
-            yield Static("Whole number from 0 to 1,000,000; 0 means no default limit.")
+            yield Static("Whole number from 0 to 1,000,000; 0 uses the safe 10,000-row preview cap.")
             yield Input(str(self.ide.session.default_rows), type="integer", id="default-rows")
             yield Static("", id="rows-settings-error", markup=False)
             with Horizontal(id="rows-settings-buttons"):

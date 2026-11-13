@@ -1,67 +1,16 @@
-"""Shared fixtures: one engine registry bound to the real bundled data tree.
-
-`DATA_DIR` is the engine's own Parquet tree (resolved from this file, not the
-working directory), so every test runs against the data D8R actually ships.
-"""
-
+"""Isolated local state, native vault boundary, and generated Parquet test data."""
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
-
-from d8r.engine import DataSource, datasources
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = REPO_ROOT / "d8r" / "engine" / "data"
-FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
-
-FIRST10_PAYLOAD = {
-    "dataset": "events",
-    "select": [],
-    "where": None,
-    "groupBy": [],
-    "orderBy": [{"target": "timestamp", "direction": "asc"}],
-    "limit": 10,
-}
-
-JOIN_REVENUE_PAYLOAD = {
-    "dataset": "events",
-    "joins": [{"dataset": "users", "left": "user_id", "right": "user_id"}],
-    "select": [
-        {"column": "region", "aggregate": None, "alias": None},
-        {"column": None, "aggregate": {"fn": "sum", "arg": "amount"}, "alias": "revenue"},
-    ],
-    "where": None,
-    "groupBy": ["region"],
-    "orderBy": [{"target": "revenue", "direction": "desc"}],
-    "limit": 5,
-}
-
-ALIAS_REVENUE_PAYLOAD = {
-    "dataset": "events",
-    "alias": "e",
-    "joins": [{"dataset": "users", "alias": "u", "left": "user_id", "right": "user_id"}],
-    "select": [
-        {"column": "u.region", "aggregate": None, "alias": None},
-        {"column": None, "aggregate": {"fn": "sum", "arg": "e.amount"}, "alias": None},
-    ],
-    "where": None,
-    "groupBy": ["u.region"],
-    "orderBy": [{"target": "amount_sum", "direction": "desc"}],
-    "limit": 5,
-}
 
 
 @pytest.fixture(autouse=True)
 def _isolated_memory(tmp_path, monkeypatch):
-    """No test reads or writes the user's durable memory, settings, or credentials."""
-    monkeypatch.setenv("D8R_DATA_DIR", str(tmp_path / "d8r-data"))
+    monkeypatch.setenv("PGTUI_DATA_DIR", str(tmp_path / "pgtui-state"))
 
 
 @pytest.fixture(autouse=True)
 def credential_backend(monkeypatch):
-    """Deterministic OS boundary; no test can read or write the user's keyring."""
     from keyring.backend import KeyringBackend
     from keyring.errors import PasswordDeleteError
     from d8r import credentials
@@ -89,13 +38,52 @@ def credential_backend(monkeypatch):
     return backend
 
 
-@pytest.fixture(scope="session")
-def sources() -> dict[str, DataSource]:
-    """The registry the UI holds: `demo` first, then every mock, in order."""
-    return datasources.load(DATA_DIR)
+@pytest.fixture
+def parquet_source(tmp_path):
+    import duckdb
+    from d8r.engine import add_parquet_source, close_source
+
+    path = tmp_path / "records.parquet"
+    connection = duckdb.connect()
+    try:
+        connection.execute(
+            "COPY (SELECT * FROM (VALUES (1::BIGINT, 'alpha'), (2, 'beta'), (3, NULL)) AS t(id, label)) "
+            "TO ? (FORMAT PARQUET)", [str(path)],
+        )
+    finally:
+        connection.close()
+    source = add_parquet_source(str(path))
+    try:
+        yield source
+    finally:
+        close_source(source)
 
 
-@pytest.fixture(scope="session")
-def con(sources: dict[str, DataSource]):
-    """The demo connection every payload test builds against."""
-    return sources[datasources.DEMO_ID].con
+@pytest.fixture
+def sources(parquet_source):
+    return {parquet_source.id: parquet_source}
+
+
+@pytest.fixture
+def d1_harness(monkeypatch):
+    from d8r.engine import d1api
+    from tests.d1_support import D1Harness
+
+    harness = D1Harness()
+    monkeypatch.setattr(d1api, "create_client", harness.client)
+    try:
+        yield harness
+    finally:
+        harness.close()
+
+
+@pytest.fixture
+def d1_source(d1_harness):
+    from d8r.engine import add_d1_source, close_source
+    from tests.d1_support import ACCOUNT_ID, DATABASE_ID, API_TOKEN
+
+    source = add_d1_source("test-d1", account_id=ACCOUNT_ID, database=DATABASE_ID, api_token=API_TOKEN)
+    try:
+        yield source
+    finally:
+        close_source(source)

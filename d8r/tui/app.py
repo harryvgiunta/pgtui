@@ -1,9 +1,6 @@
-"""D8R's Textual application: editor, explorer, results — all in-process.
+"""PGTUI's native SQL workspace, explorer, results and assistant.
 
-There is no webserver behind this app and none in front of it: the document is
-parsed by `d8r.query`, executed by `d8r.engine`, and everything the widgets
-show comes back as plain Python. The TUI is a *consumer* of those two layers —
-it never re-implements a rule of the language or the engine.
+SQL expansion belongs to d8r.sql; the selected native engine owns grammar.
 """
 
 from __future__ import annotations
@@ -27,7 +24,6 @@ from textual.widgets import (
     Button,
     DataTable,
     Input,
-    LoadingIndicator,
     OptionList,
     Select,
     Static,
@@ -37,15 +33,14 @@ from textual.widgets import (
     Tree,
 )
 from textual.widgets.option_list import Option
-from textual.worker import Worker
 
 from d8r.ai.context import AIProposal
-from d8r.engine import DIALECTS, DIALECT_BY_NAME, DataSource
-from d8r.query import ColumnDef
+from d8r.engine import POSTGRES_VERSION, DataSource
+from d8r.sql import ColumnDef
 from d8r.themes import COZY_PASTEL
 
 from .add_source import AddSourceModal
-from .connection import CONNECTION_TIMEOUT, ConnectionProgress, build_saved_source, saved_source_label
+from .connection import ConnectionProgress, build_saved_source, saved_source_label
 from .ai import AIChats, AIPanel, AITarget, AgentsPane, DeleteOptionList
 from .palette import CommandPalette, EditorPane
 from .query_editor import QueryTextArea
@@ -57,17 +52,8 @@ from .fn import FnEditor, FnExplorer, HINT as FUNCTION_HINT
 from .layout import PaneSplitter
 from . import splash
 
-# The document a fresh session opens with: a real query against the demo
-# source, so `ctrl+enter` does something true on the very first keystroke.
-WELCOME_DOCUMENT = """\\from events
-\\select event_type
-\\select sum(amount) as total
-\\group event_type
-\\order total desc
-\\limit 10
-"""
 
-KEY_HINTS = "ctrl+enter run · ctrl+k compile · ctrl+o data source · ctrl+comma settings · \\ palette · ctrl+q quit"
+KEY_HINTS = "ctrl+enter run · ctrl+k SQL preview · ctrl+space complete · F4 AI complete · ctrl+comma settings · \\ actions · ctrl+q quit"
 
 
 
@@ -147,11 +133,11 @@ class HistoryPreview(Static):
 
 
 class D8RApp(App):
-    """The data IDE: a `\\command` document, the live schema, and the rows."""
+    """The native SQL IDE: query documents, live metadata and buffered rows."""
 
     CSS_PATH = "app.tcss"
-    TITLE = "D8R"
-    SUB_TITLE = "data IDE"
+    TITLE = "PGTUI"
+    SUB_TITLE = "native SQL IDE"
 
     # Result tabs, left explorer and right-side assistant/agents tabs stay
     # mounted across editor modes.
@@ -181,8 +167,8 @@ class D8RApp(App):
         Binding("ctrl+j", "agents", "Agents", priority=True),
         Binding("ctrl+enter", "run_or_chat", "Run", priority=True),
         Binding("f5", "run", "Run", priority=True, show=False),
-        Binding("ctrl+k", "compile", "Compile", priority=True),
-        Binding("f6", "compile", "Compile", priority=True, show=False),
+        Binding("ctrl+k", "compile", "SQL preview", priority=True),
+        Binding("f6", "compile", "SQL preview", priority=True, show=False),
         Binding("ctrl+r", "preview_function", "Preview function", show=False),
         Binding("ctrl+d", "delete_function", "Delete function", show=False),
         Binding("ctrl+o", "add_source", "Data source", priority=True),
@@ -200,7 +186,7 @@ class D8RApp(App):
         self._document_identity = self.session.workspace.get("document_id") or str(uuid4())
         self._workspace_key = self.session.source_key()
         document = self.session.workspace.get("document")
-        self._initial_document = (WELCOME_DOCUMENT if self._workspace_key == "demo" else "") if document is None else document
+        self._initial_document = document or ""
         self._workspace_editor: TextArea | None = None
         self._workspace_timer = None
         self._workspace_edited = 0.0
@@ -218,8 +204,6 @@ class D8RApp(App):
         self._connection_progress: ConnectionProgress | None = None
         self._connection_generation = 0
         self._startup_connection_started = False
-        self._schema_workers: dict[str, tuple[DataSource, Worker]] = {}
-        self._schema_errors: dict[str, str] = {}
         self._data_tabs: dict[str, dict] = {}
         self._data_tab_seq = 0
         self._results_closed = False
@@ -246,9 +230,6 @@ class D8RApp(App):
                     with TabPane("Schema", id="tab-schema"):
                         with Vertical(id="schema-pane"):
                             yield Static("Expand column: values · Enter: insert", id="schema-hint", markup=False)
-                            with Horizontal(id="schema-index"):
-                                yield LoadingIndicator(id="schema-index-dots")
-                                yield Static("", id="schema-index-label", markup=False)
                             yield Tree(Text("datasets"), id="schema-tree")
                     with TabPane("Pages", id="tab-pages"):
                         with Horizontal(id="page-actions"):
@@ -271,11 +252,7 @@ class D8RApp(App):
                                 value=self.session.active_id, id="source-select",
                                 tooltip="Switch source workspace",
                             )
-                            yield Select(
-                                self._dialect_options(), allow_blank=False,
-                                value=self.session.dialect, id="dialect-select",
-                                tooltip="SQL dialect for this query page",
-                            )
+                            yield Static("", id="source-version", markup=False)
                         with Horizontal(id="document-actions"):
                             yield Button("New Query", id="query-new", compact=True,
                                          tooltip="Create a blank query page; keep the current draft")
@@ -284,7 +261,8 @@ class D8RApp(App):
                             yield Button("Reconnect", id="reconnect-source", compact=True)
                         yield PageDetails(self, id="page-details")
                     with EditorPane(id="editor-pane"):
-                        yield QueryTextArea(self._initial_document, show_line_numbers=True, id="editor")
+                        yield QueryTextArea(self._initial_document, dialect=self.session.source.dialect,
+                                            show_line_numbers=True, id="editor")
                         yield CommandPalette(self.session, id="palette", markup=False)
                     yield FnEditor(self, id="function-editor")
                 yield PaneSplitter("#editor-slot", "height", "editor", min_size=8,
@@ -361,18 +339,16 @@ class D8RApp(App):
         self._flush_workspace()
         self._refresh_pages()
         self.call_after_refresh(self._restore_startup_view)
-        for source in self.session.sources.values():
-            self._start_schema_index(source)
 
     def _restore_startup_view(self) -> None:
-        """Restore the visible target before reconnecting it once, without running."""
+        """Restore the selected local draft, then reconnect only its saved target."""
         if self._closing or self._startup_connection_started:
             return
         self._startup_connection_started = True
         if self.session.workspace.get("active_view") == "function":
             self._open_fn(reveal_list=False)
         source_id = self.session.active_id
-        if self.session.source_connected(source_id):
+        if self.session.source_connected(source_id) or self.session.saved_source_profile(source_id) is None:
             return
 
         def connected(source: DataSource | None) -> None:
@@ -384,8 +360,9 @@ class D8RApp(App):
 
     def on_unmount(self) -> None:
         self._closing = True
+        for palette in self.query(CommandPalette):
+            palette.close()
         self._cancel_connection()
-        self._cancel_schema_indexes()
         self.session.clear_value_cache()
         self.ai_chats.shutdown()
         self._flush_workspace()
@@ -395,8 +372,9 @@ class D8RApp(App):
 
     def exit(self, *args, **kwargs) -> None:
         """Flush live widget values even if their change messages are still queued."""
+        for palette in self.query(CommandPalette):
+            palette.close()
         self._cancel_connection()
-        self._cancel_schema_indexes()
         self.session.clear_value_cache()
         if self._workspace_ready:
             self.function_editor.flush_draft()
@@ -467,6 +445,8 @@ class D8RApp(App):
 
     def _prepare_workspace_switch(self) -> None:
         """Capture outgoing widgets before their source or stable identities change."""
+        for palette in self.query(CommandPalette):
+            palette.close()
         self._workspace_outputs[self._workspace_key] = (
             self._main_outcome, self.query_one("#sql-text", TextArea).text)
         self.function_editor.flush_draft()
@@ -488,7 +468,6 @@ class D8RApp(App):
             page = {"id": str(uuid4()), "document": "", "cursor": [0, 0],
                     "dialect": self.session.dialect}
         self._document_identity = page["id"]
-        self.session.dialect = page["dialect"] or self.session.dialect
         self.editor.load_text(page["document"])
         self.editor.move_cursor(tuple(page["cursor"]))
         draft = state.get("function_draft")
@@ -497,7 +476,6 @@ class D8RApp(App):
         self.function_mode = state.get("active_view") == "function"
         self.palette.close()
         self._sync_source_select()
-        self._sync_dialect_select()
         self._refresh_header()
         self._refresh_tree()
         self._refresh_history()
@@ -670,6 +648,8 @@ class D8RApp(App):
 
     def _restore_page(self, page: dict) -> None:
         """Swap the stable draft and its offline target without running or connecting."""
+        for palette in self.query(CommandPalette):
+            palette.close()
         self._cancel_connection()
         changed_source = page["source"] != self._workspace_key
         if changed_source:
@@ -684,7 +664,6 @@ class D8RApp(App):
         with self.prevent(Select.Changed):
             self.query_one("#source-select", Select).set_options(self._source_options())
         self._sync_source_select()
-        self._sync_dialect_select()
         self._refresh_header()
         self._refresh_tree()
         self.palette.close()
@@ -791,7 +770,8 @@ class D8RApp(App):
     def refresh_functions(self) -> None:
         """Refresh consumers after a saved definition changes, not editor text."""
         self.function_editor._draw_list()
-        self.palette.sync(respect_dismissal=True)
+        for palette in self.query(CommandPalette):
+            palette.close()
 
     @on(TextArea.Changed, "#editor")
     def _ai_document_changed(self) -> None:
@@ -809,22 +789,15 @@ class D8RApp(App):
             for label, source_id in sorted(self.session.source_options(), key=lambda option: option[0].casefold())
         ]
 
-    def _dialect_options(self) -> list[tuple[Content, str]]:
-        """Every advertised compile target; unavailable ones say so."""
-        options: list[tuple[Content, str]] = []
-        for spec in DIALECTS:
-            label = spec["label"] if spec["compiles"] else f"{spec['label']} · requires live source"
-            options.append((Content(label), spec["name"]))
-        return options
-
     def _refresh_header(self) -> None:
         self.query_one("#reconnect-source", Button).display = not self.session.source_connected()
-
-    def _sync_dialect_select(self) -> None:
-        select = self.query_one("#dialect-select", Select)
-        if select.value != self.session.dialect:
-            with self.prevent(Select.Changed):
-                select.value = self.session.dialect
+        source = self.session.source
+        self.editor.dialect = source.dialect
+        label = "Cloudflare D1 · SQLite" if source.dialect == "sqlite" else (
+            "PostgreSQL" if source.dialect == "postgres" else "DuckDB")
+        version = source.server_version or (f"target {POSTGRES_VERSION}" if source.dialect == "postgres" else "")
+        state = "" if self.session.source_connected() else " · disconnected"
+        self.query_one("#source-version", Static).update(f"{label} {version}{state}")
 
     def _sync_source_select(self) -> None:
         select = self.query_one("#source-select", Select)
@@ -851,65 +824,12 @@ class D8RApp(App):
             # A placeholder keeps the node expandable; expanding replaces it
             # with the columns the schema registry holds for that dataset.
             node.add_leaf(Text("…", style="dim"), data={"kind": "placeholder"})
-        self._refresh_schema_status()
-
-    def _refresh_schema_status(self) -> None:
-        source = self.session.source
-        pending = self._schema_workers.get(source.id)
-        indexing = pending is not None and pending[0] is source
-        error = self._schema_errors.get(source.id, "")
-        self.query_one("#schema-index").display = indexing or bool(error)
-        self.query_one("#schema-index-dots").display = indexing
-        self.query_one("#schema-index-label", Static).update("Indexing schema…" if indexing else error)
-
-    def _start_schema_index(self, source: DataSource) -> None:
-        """Index only already-connected D1 sources; never reserve the query lane."""
-        if self._closing or source.d1 is None or source.schema_indexed:
-            return
-        pending = self._schema_workers.get(source.id)
-        if pending is not None:
-            if pending[0] is source:
-                return
-            pending[1].cancel()
-        self._schema_errors.pop(source.id, None)
-        worker = self.run_worker(
-            self._index_schema(source), name="Index D1 schema", group="schema-index", exit_on_error=False,
-        )
-        self._schema_workers[source.id] = (source, worker)
-        self._refresh_schema_status()
-
-    async def _index_schema(self, source: DataSource) -> None:
-        error = ""
-        try:
-            schemas = await asyncio.wait_for(asyncio.to_thread(source.d1.schemas), CONNECTION_TIMEOUT)
-            if not self._closing:
-                self.session.sync_d1_schema(source, schemas)
-        except asyncio.CancelledError:
-            raise
-        except TimeoutError:
-            error = "Schema indexing timed out; Run still available"
-        except Exception:
-            error = "Schema indexing failed; Run still available"
-        finally:
-            pending = self._schema_workers.get(source.id)
-            if pending is not None and pending[0] is source:
-                self._schema_workers.pop(source.id)
-                if not self._closing and self.session.sources.get(source.id) is source:
-                    if error:
-                        self._schema_errors[source.id] = error
-                    if self.is_running:
-                        self._schema_updated(source)
-
     def _schema_updated(self, source: DataSource) -> None:
+        for palette in self.query(CommandPalette):
+            palette.close()
         if self.session.source is source:
             self._refresh_tree()
-        # Completion captures the fresh snapshot on its next editor event.
-        # Do not synthesize a sync here: value suggestions can issue a query.
-
-    def _cancel_schema_indexes(self) -> None:
-        for _, worker in self._schema_workers.values():
-            worker.cancel()
-        self._schema_workers.clear()
+        # The next completion event reads the current metadata snapshot.
 
     def _refresh_history(self) -> None:
         table = self.query_one("#history-table", DataTable)
@@ -938,6 +858,9 @@ class D8RApp(App):
             self._set_status(str(exc))
             self.notify(str(exc), title="Settings could not be saved", severity="error")
             return False
+        if {"intellisense", "ai", "ai_completion", "ai_allow_schema_refreshes"} & changes.keys():
+            for palette in self.query(CommandPalette):
+                palette.close()
         if self.session.value_cache_epoch != value_epoch:
             self.value_cache_changed()
         if "theme" in changes:
@@ -952,7 +875,7 @@ class D8RApp(App):
     def value_cache_changed(self) -> None:
         """Discard visible old pools without starting another read from Settings."""
         for palette in self.query(CommandPalette):
-            palette.reset_values()
+            palette.close()
         self._refresh_tree()
 
     def _set_sql(self, sql: str) -> None:
@@ -1181,20 +1104,20 @@ class D8RApp(App):
     def _run_after_connect(self, source: DataSource | None, document: str, target: str) -> None:
         if source is None:
             return
-        self._source_added(source, index_schema=False)
+        self._source_added(source)
         if self.session.source_key() != target:
             self._set_status("Source changed while reconnecting; press Run to query the new target.")
-            self._start_schema_index(source)
             return
         self._start_run(document)
 
     def _start_run(self, document: str) -> None:
         if self.refuse_busy("Run"):
             return
-        self.palette.close()
+        self.palette.cancel_ai()
+        self.palette.sync(respect_dismissal=True)
         self.run_busy = True
         self.session.busy = "Query running"
-        self._set_status(f"running · {self.session.active_id} · {self.session.dialect} · completion paused; editor and Settings remain available")
+        self._set_status(f"running · {self.session.active_id} · {self.session.dialect} · cached SQL completion remains available")
         self.run_worker(
             self._run_document(document), name="Run document", group="query",
             exit_on_error=False,
@@ -1225,7 +1148,6 @@ class D8RApp(App):
             outcomes = [RunOutcome(status=message, error=message)]
         if self._closing or not self.is_running:
             return
-        self.session.sync_d1_schema(source)
         outcome = outcomes[0]
         self._set_error(outcome.error)
         self._render_results(outcome)
@@ -1243,24 +1165,20 @@ class D8RApp(App):
             self.notify(self.session.workspace_error, title="History could not be saved", severity="error", timeout=15)
         self._show_tab("tab-results")
         self.call_next(self._open_data_tabs, outcomes[1:])
-        # A reconnect-for-Run gives the first query priority over full discovery.
-        # Subsequent runs never restart a failed index implicitly.
-        if source.id not in self._schema_errors:
-            self._start_schema_index(source)
 
     def action_compile(self) -> None:
-        """Render the document as SQL for the active dialect — never executes."""
+        """Expand local functions only; native SQL grammar is checked on Run."""
         if self.function_mode or self._modal_open() or self.ai_panel.has_focus_within:
             return
-        if self.refuse_busy("Compile"):
+        if self.refuse_busy("SQL preview"):
             return
         self.palette.close()
-        sql, message = self.session.compile(self.editor.text)
-        if sql is None:
-            self._set_status(message)
+        outcome = self.session.compile(self.editor.text)
+        self._set_error(outcome.error)
+        self._set_status(outcome.status)
+        if not outcome.ok:
             return
-        self._set_sql(sql)
-        self._set_status(message)
+        self._set_sql(outcome.sql)
         self._show_tab("tab-sql")
 
     def action_add_source(self) -> None:
@@ -1270,8 +1188,7 @@ class D8RApp(App):
         if self.refuse_busy("Add data source"):
             return
         self.palette.close()
-        snapshot_path = self.session.saved_snapshot_path(self.session.active_id) if not self.session.source_connected() else None
-        self.push_screen(AddSourceModal(self.session, snapshot_path=snapshot_path), self._source_added)
+        self.push_screen(AddSourceModal(self.session), self._source_added)
 
     @on(Button.Pressed, "#reconnect-source")
     def _reconnect_active_source(self) -> None:
@@ -1286,18 +1203,15 @@ class D8RApp(App):
         self._sync_source_select()
         self._cancel_connection()
         profile = self.session.saved_source_profile(source_id)
-        snapshot_path = self.session.saved_snapshot_path(source_id)
         if self.refuse_busy("Connect data source"):
             return
         self.palette.close()
-        missing_credentials = (profile is not None and
-                               (profile.get("credentials_missing") or
-                                ("account_id" in profile and not profile.get("api_token"))))
-        if (profile is None and snapshot_path is None) or missing_credentials:
+        missing_credentials = profile is not None and profile.get("credentials_missing")
+        if profile is None or missing_credentials:
             self._set_status("Saved credentials are unavailable. Re-enter them to reconnect." if missing_credentials else
                              "This source is disconnected. Add its connection details to reconnect.")
             if prompt_for_credentials:
-                self.push_screen(AddSourceModal(self.session, profile=profile, snapshot_path=snapshot_path), connected)
+                self.push_screen(AddSourceModal(self.session, profile=profile), connected)
             return
         profile = deepcopy(profile) if profile is not None else None
         generation = self._connection_generation
@@ -1315,8 +1229,8 @@ class D8RApp(App):
             connected(built)
 
         progress = ConnectionProgress(
-            saved_source_label(profile=profile, snapshot_path=snapshot_path),
-            lambda: build_saved_source(self.session, profile=profile, snapshot_path=snapshot_path),
+            saved_source_label(profile=profile),
+            lambda: build_saved_source(self.session, profile=profile),
             completed, valid=valid, failed=self._set_status,
         )
         self._connection_progress = progress
@@ -1588,7 +1502,7 @@ class D8RApp(App):
         return self.query_one("#results-table", ResultsTable)
 
 
-    def _source_added(self, source, *, activate: bool = True, index_schema: bool = True) -> None:
+    def _source_added(self, source, *, activate: bool = True) -> None:
         """Register a built source; function targets need not switch the workspace."""
         if source is None:
             return
@@ -1599,14 +1513,10 @@ class D8RApp(App):
         self._sync_source_select()
         self._refresh_header()
         self._refresh_tree()
-        self._sync_dialect_select()
         self.ai_panel.target_changed()
         self._queue_workspace_save()
-        self._schema_errors.pop(source.id, None)
-        if index_schema:
-            self._start_schema_index(source)
         if activate and self.select_source(source.id):
-            detail = f"{len(source.datasets)} tables" if source.schema_indexed else "ready"
+            detail = f"{len(source.datasets)} tables · {source.server_version}"
             self._set_status(f"{source.id} added · {detail}")
         if isinstance(self.screen, SettingsScreen):
             self.screen._draw()
@@ -1647,39 +1557,6 @@ class D8RApp(App):
             self._cancel_connection()
         return True
 
-    @on(Select.Changed, "#dialect-select")
-    def _dialect_changed(self, event: Select.Changed) -> None:
-        if isinstance(event.value, str) and event.value == event.select.value:
-            self.select_dialect(event.value)
-
-    def select_dialect(self, name: str) -> None:
-        """Choose the one compile dialect every source renders for.
-
-        The header's select and the Settings menu's Dialect rows both land here;
-        compiling never executes anything.
-        """
-        if name == self.session.dialect:
-            return
-        if self.refuse_busy("Change dialect"):
-            self._sync_dialect_select()
-            return
-        if not self.update_settings(dialect=name):
-            self._sync_dialect_select()
-            return
-        self._sync_dialect_select()
-        self._queue_workspace_save()
-        spec = DIALECT_BY_NAME.get(name)
-        if (spec is not None and not spec["compiles"]
-                and not (self.session.source.kind == "ibis" and self.session.source.dialect == name)):
-            self._set_status(f"{name} is known but does not compile in this build")
-            return
-        sql, message = self.session.compile(self.editor.text)
-        if sql is None:
-            self._set_status(f"dialect {name} · not compiled: {message}")
-            return
-        self._set_sql(sql)
-        self._set_status(f"dialect {name}")
-
     @on(Tree.NodeExpanded, "#schema-tree")
     def _dataset_expanded(self, event: Tree.NodeExpanded) -> None:
         """Load a dataset's columns from the session snapshot, once."""
@@ -1719,7 +1596,7 @@ class D8RApp(App):
         )
 
     async def _column_values(self, source: DataSource, dataset: str, column: str) -> tuple[list[object], bool]:
-        """One in-flight request per source/column, shared by tree and completion."""
+        """One in-flight explicit explorer request per source/column."""
         if self._closing or self.session.sources.get(source.id) is not source:
             raise RuntimeError("The value source has changed.")
         cached = self.session.cached_values(source, dataset, column)
@@ -1728,25 +1605,20 @@ class D8RApp(App):
         key = (id(source), dataset, column, self.session.value_cache_epoch)
         task = self._value_reads.get(key)
         if task is None:
-            # Local backends share one transaction-owning connection. D1's
-            # independent HTTP reads do not reserve or block the query lane.
-            reserve = source.d1 is None
-            if reserve and self.session.busy:
-                raise RuntimeError("The local connection is busy; try again after it finishes.")
-            if reserve:
-                self.session.busy = "Loading distinct values"
+            if self.session.busy:
+                raise RuntimeError("The connection is busy; try again after it finishes.")
+            self.session.busy = "Loading distinct values"
             task = asyncio.create_task(asyncio.to_thread(
                 self.session.distinct_values, source, dataset, column, epoch=key[-1],
             ))
             self._value_reads[key] = task
-            task.add_done_callback(lambda done: self._value_read_finished(key, done, reserve))
+            task.add_done_callback(lambda done: self._value_read_finished(key, done))
         return await asyncio.shield(task)
 
-    def _value_read_finished(self, key, task, reserved: bool) -> None:
+    def _value_read_finished(self, key, task) -> None:
         if self._value_reads.get(key) is task:
             self._value_reads.pop(key)
-        if reserved:
-            self.session.busy = ""
+        self.session.busy = ""
         if not task.cancelled():
             task.exception()  # Also consume failures after a consumer or the app has closed.
 
@@ -1809,23 +1681,6 @@ class D8RApp(App):
         preview.show_document(preview.document, width, height)
         preview.display = True
 
-    @on(CommandPalette.ValuesRequested)
-    def _palette_values_requested(self, event: CommandPalette.ValuesRequested) -> None:
-        event.stop()
-        self.run_worker(self._complete_palette_values(event), group="completion-values", exit_on_error=False)
-
-    async def _complete_palette_values(self, event: CommandPalette.ValuesRequested) -> None:
-        if not event.palette.needs_values(event.key):
-            return
-        try:
-            values, _ = await self._column_values(event.source, event.dataset, event.column)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            values = []
-        if not self._closing and self.session.sources.get(event.source.id) is event.source:
-            event.palette.values_received(event.key, values)
-
     async def _read_distinct_values(self, source, node, data: dict, epoch: int) -> None:
         try:
             values, capped = await self._column_values(source, data["dataset"], data["name"])
@@ -1859,17 +1714,9 @@ class D8RApp(App):
         editor = self.function_editor.query_one("#fn-body", TextArea) if self.function_mode else self.editor
         palette = self.function_editor.query_one(CommandPalette) if self.function_mode else self.palette
         if data.get("kind") == "dataset":
-            palette.sync(respect_dismissal=True)
-            view = palette.view
-            row, _ = editor.cursor_location
-            head = editor.document[row].split(maxsplit=1)
-            if (view is not None and view.phase == "argument" and head
-                    and head[0].lower() in {"\\from", "\\open", "\\join"}):
-                index = next((index for index, entry in enumerate(view.entries) if entry.label == data["name"]), None)
-                if index is not None and palette.accept(index):
-                    editor.focus()
-                    self._set_status(f"inserted {data['name']} with alias")
-                    return
+            if palette.accept_table(data["name"]):
+                self._set_status(f"inserted {data['name']}")
+                return
             event.node.toggle()
             return
         if event.node.is_root:
@@ -1877,7 +1724,10 @@ class D8RApp(App):
             return
         if data.get("kind") != "column":
             return
-        reference = self.session.column_reference(editor.text, data["dataset"], data["name"])
+        with self.session.target_source(palette.source_id):
+            reference = self.session.column_reference(
+                editor.text, data["dataset"], data["name"],
+                offset=editor.document.get_index_from_location(editor.cursor_location))
         editor.insert(reference)
         editor.focus()
         palette.sync()
@@ -1898,7 +1748,6 @@ class D8RApp(App):
             with self.prevent(Select.Changed):
                 self.query_one("#source-select", Select).set_options(self._source_options())
             self._sync_source_select()
-            self._sync_dialect_select()
             self._refresh_header()
             self._refresh_tree()
             self._load_document(entry.doc)

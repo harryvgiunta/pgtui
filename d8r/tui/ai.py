@@ -25,7 +25,6 @@ from d8r.ai import client
 from d8r.ai.context import AIContext, AIProposal, AIQuestion
 from d8r.ai.diagnostics import AIDiagnostics
 from d8r.credentials import CredentialError
-from d8r.engine.connectors import profile_secrets
 
 
 class ComposerArea(TextArea):
@@ -308,10 +307,11 @@ class AIChats:
         config = self.session.ai_config
         chat.diagnostics.protect([
             config.api_key,
-            *(profile.get("api_token", "") for profile in self.session.d1_profiles),
             *(profile.get("password", "") for profile in self.session.postgres_profiles),
-            *(secret for profile in self.session.backend_profiles for secret in profile_secrets(profile)),
-            *(source.d1.api_token for source in self.session.sources.values() if source.d1 is not None),
+            *(source.postgres.get("password", "") for source in self.session.sources.values()),
+            *(profile.get("api_token", "") for profile in self.session.d1_profiles),
+            *(getattr(source.con, "api_token", "") for source in self.session.sources.values()
+              if source.kind == "d1-live"),
         ])
         try:
             config.validate()
@@ -384,13 +384,13 @@ class AIChats:
         chat.messages = chat.request_messages[1:]
         # Close the abandoned turn with an explicit IDE receipt, not partial
         # model text. This also keeps persisted/provider role ordering valid.
-        interruption = "D8R interrupted this response for a follow-up. No incomplete reply or tool exchange was retained."
+        interruption = "PGTUI interrupted this response for a follow-up. No incomplete reply or tool exchange was retained."
         # A change may have committed before another tool in the same batch
         # was interrupted. Keep its receipt even when the batch cannot replay.
         if saved := self._mutation_status(chat):
-            interruption += "\nD8R confirmed: " + saved
+            interruption += "\nPGTUI confirmed: " + saved
         chat.messages.append({"role": "assistant", "content": interruption})
-        chat.transcript += "D8R: Response interrupted by a follow-up. Completed exchanges and saves retained.\n\n"
+        chat.transcript += "PGTUI: Response interrupted by a follow-up. Completed exchanges and saves retained.\n\n"
         chat.diagnostics.record("Turn steered", "Restarting with the original request, completed exchanges and new instruction.")
         self._clear_question(chat)
         chat.worker.cancel()
@@ -417,9 +417,9 @@ class AIChats:
                     and json.loads(message["content"]).get("answer")):
                 # run_turn commits whole tool batches atomically. Its completed
                 # results need a terminal assistant receipt for durable replay.
-                receipt = "D8R stopped this response before completion. Completed clarification answers were retained."
+                receipt = "PGTUI stopped this response before completion. Completed clarification answers were retained."
                 if saved := self._mutation_status(chat):
-                    receipt += "\nD8R confirmed: " + saved
+                    receipt += "\nPGTUI confirmed: " + saved
                 chat.messages = [*messages[1:], {"role": "assistant", "content": receipt}]
                 return
 
@@ -517,10 +517,10 @@ class AIChats:
             result_fields = json.loads(result)
             if result_fields.get("saved"):
                 receipt = f'Saved function "{result_fields["name"]}". Query unchanged; saving does not execute it.'
-                chat.transcript += f"D8R: {receipt}\n\n"
+                chat.transcript += f"PGTUI: {receipt}\n\n"
                 chat.status_text = receipt
                 chat.diagnostics.record("Saved function", receipt)
-                confirmation = {"role": "assistant", "content": "D8R confirmed: " + self._mutation_status(chat)}
+                confirmation = {"role": "assistant", "content": "PGTUI confirmed: " + self._mutation_status(chat)}
                 if had_changes:
                     chat.messages[-1] = confirmation
                 else:
@@ -593,8 +593,8 @@ class AIChats:
                 chat.status_text = "Response complete. Reply below to continue."
                 if chat.proposal is not None:
                     chat.validation_error = context.validate_replacement(chat.proposal)
-                    chat.diagnostics.record("Proposal validation (offline schema)",
-                                            chat.validation_error or "Valid against cached schemas; offline validation alone does not check execution.")
+                    chat.diagnostics.record("Proposal validation (offline lexical/template-only)",
+                                            chat.validation_error or "Lexical/template checks passed; server SQL syntax, schema, types and execution are not validated offline.")
                     if chat.validation_error:
                         chat.status = "error"
                         chat.status_text = "Needs a fix: " + chat.validation_error
@@ -616,7 +616,7 @@ class AIChats:
                             checks.append(f"{title}: {evidence}.")
                         receipt = "\n".join(checks)
                         chat.status_text += "\n" + receipt
-                        chat.transcript += f"D8R: {receipt}\n\n"
+                        chat.transcript += f"PGTUI: {receipt}\n\n"
                         chat.diagnostics.record("Proposal runtime checks", receipt)
         except asyncio.CancelledError:
             if generation == chat.generation:
@@ -691,7 +691,7 @@ class AIChats:
         if error is not None:
             chat.status = "error"
             chat.status_text = "Proposal cannot be applied: " + error
-            chat.diagnostics.record("Apply rejected (offline schema)", error)
+            chat.diagnostics.record("Apply rejected (offline lexical/template-only)", error)
             self.changed(chat)
             return False
         saves_function = chat.saves_function
@@ -715,7 +715,7 @@ class AIChats:
                                 "Drafts updated; applying does not execute queries or save functions.")
         chat.status_text = ("Function saved. Saving does not execute it." if saves_function else
                             "Query drafts applied. Applying does not execute them.")
-        chat.transcript += f"D8R: {chat.status_text}\n\n"
+        chat.transcript += f"PGTUI: {chat.status_text}\n\n"
         self.persist(chat)
         self.changed(chat)
         return True
@@ -954,7 +954,8 @@ class AIPanel(Vertical):
     def compose(self) -> ComposeResult:
         yield Static("AI assistant", classes="pane-title", id="ai-title", markup=False)
         yield Static("Document, schema, samples, functions and history may be sent to your configured provider. "
-                     "Data tasks apply directly. Clarifications offer options + Other; previews keep Apply. Nothing runs automatically. "
+                     "Query proposals require Apply unless Auto accept is enabled. Explicitly requested function saves may persist directly. "
+                     "Apply and Save never execute SQL; AI read-only checks require opt-in. Clarifications offer options + Other. "
                      "Send during a response interrupts it; completed changes remain.",
                      classes="ai-notice", markup=False)
         with VerticalScroll(id="ai-review"):

@@ -1,26 +1,7 @@
-"""The 6-second boot splash: the dozer clears the data wall, D8R lands.
+"""Optional six-second PGTUI entry animation, skipped for non-interactive output.
 
-`play()` writes one frame every 50 ms for 6.000 s straight to a terminal, then
-returns; the IDE's `main()` plays it, once, before the first frame. It is pure
-stdlib and touches no server, no socket, and the engine not at all — a
-keystroke never reaches it, and a non-tty (a pipe, a file, the pilot) skips it.
-
-Choreography — 120 frames x 50 ms = 6.000 s:
-
-  frames  0..20  CHAOS   dense fast streams of SQL / DuckDB / Polars text
-                         and database endpoints fill the screen, scrolling
-                         left — the old world, unreadable and relentless.
-  frame     21   ENTRY   the D8R dozer appears at the left edge: one frame,
-                         no fade.
-  frames 21..43  SWEEP   it drives in, blade flat, pushing the whole wall of
-                         data rightward until it spills off the right edge
-                         and the machine parks flush against it. Behind the
-                         blade: nothing. Clean.
-  frames 44..54  WIPE    the D8R wordmark wipes in, left to right, in solid
-                         blocks — no noise, no flicker.
-  frames 56..71  TITLE   "THE DATA HARNESS" types in beneath it.
-  frames 72..119 HOLD    the ending stays clean: wordmark, title, and the
-                         dozer parked at the edge it cleared to.
+The dozer clears a wall of native SQL; the PGTUI wordmark and subtitle appear.
+This presentation opens no data sources and performs no SQL work.
 """
 
 import sys
@@ -39,33 +20,27 @@ TYPE_AT = 56   # subtitle typing begins, one character per frame
 
 # --- geometry ---------------------------------------------------------------
 ROWS, W = 8, 62
-LOGO_ROWS, LOGO_X, LOGO_Y = 5, 20, 1        # wordmark box, cols 20..40
+LOGO_ROWS, LOGO_X, LOGO_Y = 5, 8, 1
 ART_Y = 3                                    # dozer art occupies rows 3..7
 WALL_ROWS = (1, 2, 3, 4, 5, 6, 7)           # the data wall fills the screen
-TITLE, TITLE_X, TITLE_ROW = "THE DATA HARNESS", 20, 7
+TITLE, TITLE_X, TITLE_ROW = "NATIVE SQL WORKSPACE", 8, 7
 
-# the data being replaced: tapes of real syntax + endpoints
+# Native query text is decoration only; no bundled datasets or startup queries.
 TAPES = {
-    0: ("SELECT user_id, sum(amount) AS revenue FROM events WHERE ts >= "
-        "now() - INTERVAL '7d' GROUP BY 1 HAVING count(*) > 3 ORDER BY "
-        "revenue DESC LIMIT 50 ; JOIN users ON users.id = events.user_id ; "),
-    1: ("duckdb> ATTACH 'warehouse.duckdb' AS wh; COPY (SELECT * FROM "
-        "wh.campaigns) TO 'out.parquet' (FORMAT PARQUET); FROM readings; "
-        "SELECT * FROM sqlite_scan('legacy.db', 'orders'); "),
-    2: ("pl.scan_parquet('events.parquet').filter(col('ts') > t0)"
-        ".group_by('user_id').agg(pl.sum('amount')).join(users, on='id')"
-        ".sort('revenue', descending=True)  "),
-    3: ("postgres://orders@prod:5432  mysql://reviews  "
-        "snowflake://analytics.public  bigquery://web_sessions  "
-        "cloudflare:d1/stations  spend_log  conversions  customers  "),
+    0: "SELECT * FROM data WHERE id > 1 ORDER BY id LIMIT 50; ",
+    1: "PostgreSQL 18.7 · BEGIN; SAVEPOINT review; ROLLBACK; COMMIT; ",
+    2: "Local Parquet · DuckDB · SELECT count(*) FROM data; ",
+    3: "WITH filtered AS (SELECT * FROM data) SELECT * FROM filtered; ",
 }
 ROW_TAPE = {1: 0, 2: 1, 3: 3, 4: 0, 5: 1, 6: 2, 7: 3}  # wall row -> tape
 SCROLL_IN, PUSH = 4, 3                       # leftward chaos / rightward push
 
 _G = {  # wordmark glyphs, 5x5
-    "D": ["████ ", "█   █", "█   █", "█   █", "████ "],
-    "8": [" ███ ", "█   █", " ███ ", "█   █", " ███ "],
-    "R": ["████ ", "█   █", "████ ", "█ █  ", "█  █ "],
+    "P": ["████ ", "█   █", "████ ", "█    ", "█    "],
+    "G": [" ████", "█    ", "█  ██", "█   █", " ███ "],
+    "T": ["█████", "  █  ", "  █  ", "  █  ", "  █  "],
+    "U": ["█   █", "█   █", "█   █", "█   █", " ███ "],
+    "I": ["█████", "  █  ", "  █  ", "  █  ", "█████"],
 }
 
 # the machine, 19 wide x 5 tall: cab + exhaust stack over a sealed track loop
@@ -86,7 +61,7 @@ DIM, AMBER, CYAN, GREEN = "2", "33", "36", "32"
 def _wordmark() -> dict[tuple[int, int], str]:
     cells: dict[tuple[int, int], str] = {}
     for row in range(LOGO_ROWS):
-        for i, ch in enumerate("D8R"):
+        for i, ch in enumerate("PGTUI"):
             for col in range(5):
                 g = _G[ch][row][col]
                 if g != " ":

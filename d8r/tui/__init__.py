@@ -1,9 +1,4 @@
-"""D8R's Textual terminal UI — the application itself.
-
-The React front end and its HTTP sidecar are gone: this package is the whole
-product. It renders the `\\command` document, the live schema, and the rows the
-engine returns, all in one process, with no server anywhere.
-"""
+"""PGTUI's native SQL workspace, rendered entirely in Textual."""
 
 from .app import D8RApp, main
 from .results import ResultsTable

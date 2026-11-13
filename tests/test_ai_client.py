@@ -96,7 +96,7 @@ def transport(monkeypatch):
 
 def test_byte_boundaries_multiline_events_and_multiple_streamed_tools(transport):
     calls = []
-    final = "Here is the full replacement:\n```d8r\n\\from café\n```"
+    final = "Here is the full replacement:\n```sql\nSELECT * FROM café\n```"
     first = (
         b"\xef\xbb\xbf: keepalive\r\n\r\n"
         + b'event: message\r\ndata: {"choices": [],\r\ndata: "usage": null}\r\n\r\n'
@@ -240,7 +240,7 @@ def test_auth_failure_does_not_retry_or_expose_response(transport):
 
 
 def test_partial_visible_answer_is_never_replayed_or_committed(transport):
-    partial = "```d8r\n\\from users\n```"
+    partial = "```sql\nSELECT * FROM users\n```"
     requests = transport(lambda request: stream_response(event(delta(partial)), httpx.ReadError(SECRET)))
     messages = [{"role": "user", "content": "Suggest a query"}]
     events = []

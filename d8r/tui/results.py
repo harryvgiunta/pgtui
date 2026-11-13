@@ -21,7 +21,7 @@ from textual.geometry import Size
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, Select, Static
 
-from .session import PREVIEW_ROW_CAP, RunOutcome
+from .session import RunOutcome
 
 MIN_COLUMN_WIDTH = 4
 
@@ -105,10 +105,8 @@ class ResultsTable(DataTable):
             selected = f"{(bottom - top + 1) * (right - left + 1):,} cells"
         else:
             selected = f"{len(self.selected_rows):,} rows"
-        self.border_subtitle = (
-            f"{selected} selected · {len(self.raw_rows):,} buffered / "
-            f"{self.result_total:,} total · preview cap {PREVIEW_ROW_CAP:,}"
-        )
+        extent = "more rows available" if self.result_total > len(self.raw_rows) else "all returned rows"
+        self.border_subtitle = f"{selected} selected · {len(self.raw_rows):,} buffered · {extent}"
 
     def _selection_changed(self) -> None:
         # Textual 8's row and line caches do not include owner selection state.
@@ -381,10 +379,10 @@ class ExportModal(ModalScreen):
     def _update_summary(self) -> None:
         snapshot = self.snapshot
         scope = self.query_one("#export-scope", Select).value
+        extent = "More rows are available; their total was not counted." if snapshot.total > len(snapshot.rows) else "All returned rows are buffered."
         self.query_one("#export-summary", Static).update(
             f"Exporting {len(self._indices()):,} {scope} row(s), plus headers.\n"
-            f"{len(snapshot.rows):,} buffered of {snapshot.total:,} total rows. "
-            f"Preview cap: {PREVIEW_ROW_CAP:,} rows.\n"
+            f"{len(snapshot.rows):,} buffered rows. {extent}\n"
             "Only this captured buffer is exported; the query is not rerun."
         )
 

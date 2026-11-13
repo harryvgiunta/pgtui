@@ -1,13 +1,14 @@
 """Atomic metadata/settings storage; credentials live only in the OS vault.
 
 New directories and files are owner-only on POSIX; Windows uses filesystem ACLs.
-Legacy plaintext files migrate only after every credential has been secured.
+PGTUI uses its own data directory and never migrates another application's files.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
@@ -17,8 +18,6 @@ from uuid import UUID
 
 from d8r.ai.client import AIConfig
 from d8r.credentials import CredentialError, CredentialVault
-from d8r.engine.datasources import DIALECT_BY_NAME
-from d8r.engine.connectors import BACKENDS, profile_id, validate_profile
 from d8r.themes import DEFAULT_THEME, THEMES
 
 # How long a lock or temp file may exist before it is assumed to belong to a
@@ -29,10 +28,10 @@ _STALE_SECONDS = 60.0
 
 def data_directory() -> Path:
     """Resolve the user data directory without creating it."""
-    override = os.environ.get("D8R_DATA_DIR")
+    override = os.environ.get("PGTUI_DATA_DIR")
     if override:
         return Path(override).expanduser()
-    return Path.home() / ".d8r"
+    return Path.home() / ".pgtui"
 
 
 def _object(pairs: list[tuple[str, object]]) -> dict:
@@ -62,20 +61,16 @@ def _text(value: object, label: str, *, nonempty: bool = False) -> None:
 def _validate(value: object) -> dict:
     """Validate structure, never parse/execute bodies against the active schema."""
     if isinstance(value, dict):
-        value = {"postgres_profiles": [], "backend_profiles": [], **value}
-    document = _record(value, {"version", "functions", "d1_profiles", "postgres_profiles", "backend_profiles"}, "memory")
+        value = {"d1_profiles": [], **value}
+    document = _record(value, {"version", "functions", "postgres_profiles", "d1_profiles"}, "memory")
     if type(document["version"]) is not int or document["version"] != 1:
         raise ValueError("unsupported memory version (expected 1)")
     functions = document["functions"]
-    if isinstance(functions, dict):
-        for key in functions:
-            _text(key, "function source key", nonempty=True)
-        groups = functions.values()
-    elif isinstance(functions, list):
-        # Session binds legacy definitions after restoring the selected target.
-        groups = (functions,)
-    else:
+    if not isinstance(functions, dict):
         raise ValueError("functions must map source keys to definition lists")
+    for key in functions:
+        _text(key, "function source key", nonempty=True)
+    groups = functions.values()
     for group in groups:
         if not isinstance(group, list):
             raise ValueError("source functions must be a list")
@@ -94,28 +89,6 @@ def _validate(value: object) -> dict:
                 _text(param, "function parameter", nonempty=True)
             if len(set(fn["params"])) != len(fn["params"]):
                 raise ValueError("duplicate function parameter")
-    profiles = document["d1_profiles"]
-    if not isinstance(profiles, list):
-        raise ValueError("d1_profiles must be a list")
-    identities = set()
-    for profile in profiles:
-        if not isinstance(profile, dict) or profile.keys() not in (
-            {"account_id", "database", "display"},
-            {"account_id", "database", "display", "api_token"},
-        ):
-            raise ValueError("invalid D1 profile fields")
-        record = {**profile, "api_token": profile.get("api_token", "")}
-        for key in ("account_id", "database", "display"):
-            _text(record[key], f"D1 profile {key}", nonempty=True)
-        _text(record["api_token"], "D1 profile API token")
-        try:
-            database = UUID(record["database"])
-        except ValueError:
-            raise ValueError("D1 profile database must be a resolved database UUID") from None
-        identity = (record["account_id"], database)
-        if identity in identities:
-            raise ValueError("duplicate D1 profile")
-        identities.add(identity)
     postgres_profiles = document["postgres_profiles"]
     if not isinstance(postgres_profiles, list):
         raise ValueError("postgres_profiles must be a list")
@@ -132,22 +105,31 @@ def _validate(value: object) -> dict:
         if identity in identities:
             raise ValueError("duplicate PostgreSQL profile")
         identities.add(identity)
-    backend_profiles = document["backend_profiles"]
-    if not isinstance(backend_profiles, list):
-        raise ValueError("backend_profiles must be a list")
-    normalized_profiles = []
+    if not isinstance(document["d1_profiles"], list):
+        raise ValueError("d1_profiles must be a list")
     identities = set()
-    for profile in backend_profiles:
-        _record(profile, {"backend", "options", "display"}, "backend profile")
-        normalized = validate_profile(profile)
-        identity = profile_id(normalized)
+    for profile in document["d1_profiles"]:
+        _record(profile, {"account_id", "database", "api_token", "display"}, "D1 profile")
+        for key, text in profile.items():
+            _text(text, f"D1 profile {key}", nonempty=key != "api_token")
+        if not re.fullmatch(r"[0-9a-fA-F]{32}", profile["account_id"]):
+            raise ValueError("D1 account ID must contain 32 hexadecimal characters")
+        try:
+            database = str(UUID(profile["database"]))
+        except ValueError:
+            raise ValueError("D1 saved database must be a resolved UUID") from None
+        profile = dict(profile, account_id=profile["account_id"].lower(), database=database)
+        identity = (profile["account_id"], profile["database"])
         if identity in identities:
-            raise ValueError("duplicate backend profile")
+            raise ValueError("duplicate D1 profile")
         identities.add(identity)
-        normalized_profiles.append(normalized)
-    return {**document, "d1_profiles": [
-        {**profile, "api_token": profile.get("api_token", "")} for profile in profiles
-    ], "backend_profiles": normalized_profiles}
+    document = deepcopy(document)
+    for profile in document["d1_profiles"]:
+        profile["account_id"] = profile["account_id"].lower()
+        profile["database"] = str(UUID(profile["database"]))
+        if profile["api_token"]:
+            profile["display"] = profile["display"].replace(profile["api_token"], "[redacted]")
+    return deepcopy(document)
 
 
 def _settings(value: object) -> dict:
@@ -159,8 +141,7 @@ def _settings(value: object) -> dict:
         "panes": {"results": True, "sql": True, "history": True, "schema": True,
                   "agents": True, "ai": False},
         "pane_sizes": {"explorer": 36, "ai": 44, "editor": 22},
-        "source": "demo", "dialect": "duckdb",
-        "source_dialects": {},
+        "source": "postgres",
         "default_rows": 50,
         "value_cache_enabled": True,
         "value_cache_limit": 1000,
@@ -168,6 +149,7 @@ def _settings(value: object) -> dict:
         "ai_allow_sample_data": False,
         "ai_allow_schema_refreshes": True,
         "ai_test_queries": False,
+        "ai_completion": False,
         "ai": asdict(AIConfig()),
     }
     if not isinstance(value, dict) or not value.keys() <= defaults.keys():
@@ -183,7 +165,7 @@ def _settings(value: object) -> dict:
         raise ValueError("Choose a supported theme from Settings → Theme.")
     if type(document["ai_auto_accept"]) is not bool:
         raise ValueError("ai_auto_accept must be a boolean")
-    for field in ("ai_allow_sample_data", "ai_allow_schema_refreshes", "ai_test_queries"):
+    for field in ("ai_allow_sample_data", "ai_allow_schema_refreshes", "ai_test_queries", "ai_completion"):
         if type(document[field]) is not bool:
             raise ValueError(f"{field} must be a boolean")
     if type(document["value_cache_enabled"]) is not bool:
@@ -200,17 +182,8 @@ def _settings(value: object) -> dict:
     if any(type(size) is not int or not 1 <= size <= 1000 for size in document["pane_sizes"].values()):
         raise ValueError("Pane sizes must be integers between 1 and 1000 terminal cells.")
     _text(document["source"], "source", nonempty=True)
-    _text(document["dialect"], "dialect", nonempty=True)
-    if document["dialect"] not in DIALECT_BY_NAME:
-        raise ValueError("unsupported dialect")
-    remembered = document["source_dialects"]
-    if not isinstance(remembered, dict) or any(
-        not isinstance(name, str) or not name or dialect not in DIALECT_BY_NAME
-        for name, dialect in remembered.items()
-    ):
-        raise ValueError("source_dialects must map source names to supported dialects")
     if type(document["default_rows"]) is not int or not 0 <= document["default_rows"] <= 1_000_000:
-        raise ValueError("Default rows returned must be an integer between 0 and 1000000 (0 disables the default).")
+        raise ValueError("Default rows returned must be an integer between 0 and 1000000 (0 uses the preview cap).")
     ai = document["ai"]
     for field in ("base_url", "model", "api_key"):
         _text(ai[field], f"AI {field}")
@@ -226,62 +199,33 @@ def _reference(value: object) -> None:
         _text(value, "credential reference", nonempty=True)
 
 
-def _backend_metadata(profile: dict) -> dict:
-    public = {field.name for field in BACKENDS[profile["backend"]].fields if not field.secret}
-    return {"backend": profile["backend"], "display": profile["display"],
-            "options": {key: value for key, value in profile["options"].items() if key in public},
-            "connection_id": profile_id(profile)}
-
-
 def _memory_document(value: object) -> dict:
-    if not isinstance(value, dict) or value.get("version") != 2:
-        return _validate(value)
-    document = _record(value, {"version", "functions", "d1_profiles", "postgres_profiles", "backend_profiles"}, "memory")
-    if type(document["version"]) is not int:
-        raise ValueError("invalid memory version")
-    legacy = {**document, "version": 1, "backend_profiles": []}
-    for group, secret in (("d1_profiles", "api_token"), ("postgres_profiles", "password")):
+    if isinstance(value, dict):
+        value = {"d1_profiles": [], **value}
+    document = _record(value, {"version", "functions", "postgres_profiles", "d1_profiles"}, "memory")
+    if type(document["version"]) is not int or document["version"] != 2:
+        raise ValueError("unsupported saved memory version (expected 2)")
+    runtime = {"version": 1, "functions": document["functions"]}
+    for group, secret in (("postgres_profiles", "password"), ("d1_profiles", "api_token")):
         if not isinstance(document[group], list):
-            raise ValueError("invalid saved profiles")
-        legacy[group] = []
+            raise ValueError("invalid saved connection profiles")
+        profiles = []
         for profile in document[group]:
             if not isinstance(profile, dict) or "credential_ref" not in profile or secret in profile:
                 raise ValueError("invalid credential metadata")
             _reference(profile["credential_ref"])
-            legacy[group].append({**{key: value for key, value in profile.items() if key != "credential_ref"}, secret: ""})
-    _validate(legacy)
-    if not isinstance(document["backend_profiles"], list):
-        raise ValueError("invalid backend profiles")
-    identities = set()
-    for profile in document["backend_profiles"]:
-        _record(profile, {"backend", "display", "options", "connection_id", "credential_ref"}, "backend metadata")
-        backend = profile["backend"]
-        if not isinstance(backend, str) or backend not in BACKENDS:
-            raise ValueError("invalid saved backend")
-        _text(profile["display"], "backend display")
-        _reference(profile["credential_ref"])
-        identity = profile["connection_id"]
-        if not isinstance(identity, str) or len(identity) != 64 or any(c not in "0123456789abcdef" for c in identity):
-            raise ValueError("invalid backend identity")
-        if identity in identities:
-            raise ValueError("duplicate backend profile")
-        identities.add(identity)
-        public = {field.name for field in BACKENDS[backend].fields if not field.secret}
-        options = profile["options"]
-        if not isinstance(options, dict) or not options.keys() <= public:
-            raise ValueError("invalid public connection options")
-        if any(not isinstance(item, (str, int, bool)) for item in options.values()):
-            raise ValueError("invalid public connection option")
-        if any(field.required and field.name not in options for field in BACKENDS[backend].fields):
-            raise ValueError("missing public connection option")
+            profiles.append({**{key: item for key, item in profile.items() if key != "credential_ref"}, secret: ""})
+        runtime[group] = profiles
+    normalized = _validate(runtime)
+    document = deepcopy(document)
+    for stored, profile in zip(document["d1_profiles"], normalized["d1_profiles"]):
+        stored["account_id"], stored["database"] = profile["account_id"], profile["database"]
     return deepcopy(document)
 
 
 def _settings_document(value: object) -> dict:
-    if not isinstance(value, dict) or value.get("version") != 2:
-        return _settings(value)
-    if type(value["version"]) is not int:
-        raise ValueError("invalid settings version")
+    if not isinstance(value, dict) or type(value.get("version")) is not int or value["version"] != 2:
+        raise ValueError("unsupported saved settings version (expected 2)")
     ai = value.get("ai")
     if not isinstance(ai, dict) or "api_key_ref" not in ai or "api_key" in ai:
         raise ValueError("invalid AI credential metadata")
@@ -315,7 +259,7 @@ class _JSONStore:
         except (OSError, ValueError, RecursionError):
             self.error = (
                 f"Cannot load local {self._name} at {self.path}: invalid or unreadable file. "
-                "The original file is unchanged; repair it or move it aside, then restart D8R. "
+                "The original file is unchanged; repair it or move it aside, then restart PGTUI. "
                 "Local saves are disabled until restart."
             )
         self._sweep()
@@ -391,7 +335,7 @@ class _JSONStore:
             if self._read() != self._snapshot:
                 raise ValueError(
                     f"Local {self._name} changed outside this session at {self.path}; nothing was saved. "
-                    f"Copy your unsaved draft and restart D8R to load the latest {self._name}."
+                    f"Copy your unsaved draft and restart PGTUI to load the latest {self._name}."
                 )
             with tempfile.NamedTemporaryFile(
                 mode="wb", prefix=f".{self._name}-", suffix=".tmp", dir=self.path.parent, delete=False,
@@ -404,7 +348,7 @@ class _JSONStore:
             if self._read() != self._snapshot:
                 raise ValueError(
                     f"Local {self._name} changed outside this session at {self.path}; nothing was saved. "
-                    f"Copy your unsaved draft and restart D8R to load the latest {self._name}."
+                    f"Copy your unsaved draft and restart PGTUI to load the latest {self._name}."
                 )
             os.replace(temporary, self.path)
             temporary = None
@@ -483,13 +427,12 @@ class _CredentialStore(_JSONStore):
 
     @staticmethod
     def _references(document: dict) -> set[str]:
-        if document["version"] != 2:
-            return set()
         if "ai" in document:
             reference = document["ai"]["api_key_ref"]
             return {reference} if reference is not None else set()
-        return {profile["credential_ref"] for group in ("d1_profiles", "postgres_profiles", "backend_profiles")
-                for profile in document[group] if profile["credential_ref"] is not None}
+        return {profile["credential_ref"]
+                for group in ("postgres_profiles", "d1_profiles") for profile in document[group]
+                if profile["credential_ref"] is not None}
 
     def _commit(self, disk: dict, runtime: dict) -> None:
         previous = self._references(self._disk)
@@ -498,120 +441,83 @@ class _CredentialStore(_JSONStore):
         self.document = deepcopy(runtime)
         self._discard(previous - self._references(self._disk))
 
-    def _migrate(self, save) -> None:
-        try:
-            save()
-        except ValueError:
-            self._warn("Legacy credentials could not be moved to the OS vault. The original plaintext file is unchanged; unlock the vault and restart, or use session-only credentials. Existing external backups may also contain plaintext credentials.")
-        else:
-            self._warn("Legacy credentials were moved to the OS vault. Existing external backups may still contain plaintext credentials; remove or protect those backups yourself.")
-
 
 class MemoryStore(_CredentialStore):
-    """Functions and public connection metadata, with immutable vault references."""
+    """Source-scoped SQL functions and native connection metadata with vault references."""
 
     def __init__(self, data_dir: Path | None = None) -> None:
         super().__init__(data_dir, "memory", {
-            "version": 2, "functions": {}, "d1_profiles": [], "postgres_profiles": [], "backend_profiles": [],
+            "version": 2, "functions": {}, "postgres_profiles": [], "d1_profiles": [],
         }, _memory_document)
         self._credential_state()
-        if self.error:
-            return
-        if self.document["version"] == 1:
-            original = json.loads(self._snapshot) if self._snapshot else {}
-            has_credentials = (any("api_token" in profile for profile in original.get("d1_profiles", []))
-                               or bool(original.get("postgres_profiles")) or bool(original.get("backend_profiles")))
-            if has_credentials:
-                self._migrate(lambda: self.save(self.document["functions"], self.document["d1_profiles"]))
-            return
-        runtime = {**deepcopy(self.document), "version": 1}
-        for group, secret in (("d1_profiles", "api_token"), ("postgres_profiles", "password"), ("backend_profiles", None)):
-            profiles = []
-            for stored in self._disk[group]:
-                reference = stored["credential_ref"]
-                value = self._get(reference)
-                profile = {key: deepcopy(item) for key, item in stored.items() if key != "credential_ref"}
-                missing = reference is not None and value is None
-                if secret is not None:
+        runtime = {**deepcopy(self.document), "version": 1, "postgres_profiles": [], "d1_profiles": []}
+        if not self.error:
+            for group, secret in (("postgres_profiles", "password"), ("d1_profiles", "api_token")):
+                for stored in self._disk[group]:
+                    reference = stored["credential_ref"]
+                    value = self._get(reference)
+                    profile = {key: item for key, item in stored.items() if key != "credential_ref"}
                     profile[secret] = value if value is not None else ""
-                elif not missing:
-                    try:
-                        hidden = json.loads(value, object_pairs_hook=_object, parse_constant=_constant) if value is not None else {}
-                        if not isinstance(hidden, dict) or hidden.keys() & profile["options"].keys():
-                            raise ValueError("invalid saved options")
-                        hydrated = validate_profile({"backend": profile["backend"], "display": profile["display"],
-                                                     "options": {**profile["options"], **hidden}})
-                        if _backend_metadata(hydrated) != profile:
-                            raise ValueError("saved connection identity mismatch")
-                        profile = hydrated
-                    except (ValueError, TypeError, RecursionError):
-                        missing = True
-                if missing:
-                    profile["credentials_missing"] = True
-                    self._missing()
-                profiles.append(profile)
-            runtime[group] = profiles
+                    if value is None and (reference is not None or group == "d1_profiles"):
+                        profile["credentials_missing"] = True
+                        self._missing()
+                    runtime[group].append(profile)
         self.document = runtime
 
     @staticmethod
-    def _identity(group: str, profile: dict):
-        if group == "d1_profiles":
-            return profile["account_id"], profile["database"].lower()
-        if group == "postgres_profiles":
-            return tuple(profile[key] for key in ("host", "port", "database", "user", "schema", "sslmode"))
-        return profile.get("connection_id") or profile_id(profile)
+    def _identity(profile: dict) -> tuple[str, ...]:
+        keys = (("account_id", "database") if "account_id" in profile else
+                ("host", "port", "database", "user", "schema", "sslmode"))
+        return tuple(profile[key] for key in keys)
 
     @staticmethod
-    def validate_profile(group: str, profile: dict) -> dict:
-        document = {"version": 1, "functions": {}, "d1_profiles": [], "postgres_profiles": [], "backend_profiles": []}
-        document[group] = [profile]
-        return _validate(document)[group][0]
+    def validate_profile(profile: dict) -> dict:
+        return _validate({"version": 1, "functions": {}, "postgres_profiles": [profile]})["postgres_profiles"][0]
 
-    def save(self, functions: dict[str, list[dict]], profiles: list[dict[str, str]],
+    @staticmethod
+    def validate_d1_profile(profile: dict) -> dict:
+        validated = _validate({"version": 1, "functions": {}, "postgres_profiles": [],
+                               "d1_profiles": [profile]})["d1_profiles"][0]
+        _text(validated["api_token"], "D1 API token", nonempty=True)
+        return validated
+
+    def save(self, functions: dict[str, list[dict]],
              postgres_profiles: list[dict[str, str]] | None = None,
-             backend_profiles: list[dict] | None = None) -> None:
+             d1_profiles: list[dict[str, str]] | None = None) -> None:
         if self.error:
             raise ValueError(self.error)
-        supplied = {"d1_profiles": profiles,
-                    "postgres_profiles": self.document["postgres_profiles"] if postgres_profiles is None else postgres_profiles,
-                    "backend_profiles": self.document["backend_profiles"] if backend_profiles is None else backend_profiles}
-        # Validate the entire proposed document before writing any vault entries.
-        complete = {}
-        for group, items in supplied.items():
-            if not isinstance(items, list):
-                raise ValueError("invalid saved profiles")
+        supplied = {"postgres_profiles": self.document["postgres_profiles"] if postgres_profiles is None else postgres_profiles,
+                    "d1_profiles": self.document["d1_profiles"] if d1_profiles is None else d1_profiles}
+        complete = {"version": 1, "functions": functions}
+        # Validate both groups before creating any vault entries.
+        for group, profiles in supplied.items():
+            if not isinstance(profiles, list):
+                raise ValueError("invalid saved connection profiles")
             complete[group] = []
-            for profile in items:
+            for profile in profiles:
                 if isinstance(profile, dict) and profile.get("credentials_missing"):
                     if profile not in self.document[group]:
                         raise CredentialError("Re-enter missing credentials before changing this connection.")
+                    complete[group].append({key: value for key, value in profile.items() if key != "credentials_missing"})
                 else:
                     complete[group].append(profile)
-        normalized = _validate({"version": 1, "functions": functions, **complete})
-        runtime = {"version": 1, "functions": normalized["functions"]}
-        disk = {"version": 2, "functions": normalized["functions"]}
+        normalized = _validate(complete)
+        runtime = {"version": 1, "functions": normalized["functions"], "postgres_profiles": [], "d1_profiles": []}
+        disk = {**runtime, "version": 2, "postgres_profiles": [], "d1_profiles": []}
         pending = []
-        for group, items in supplied.items():
-            old = {self._identity(group, profile): profile for profile in self._disk[group]}
-            valid = iter(normalized[group])
-            runtime[group], disk[group] = [], []
-            for profile in items:
-                missing = profile.get("credentials_missing", False)
-                profile = deepcopy(profile) if missing else next(valid)
-                previous = old.get(self._identity(group, profile), {})
-                if missing:
+        for group, secret in (("postgres_profiles", "password"), ("d1_profiles", "api_token")):
+            old = {self._identity(profile): profile for profile in self._disk[group]}
+            for original, profile in zip(supplied[group], normalized[group]):
+                previous = old.get(self._identity(profile), {})
+                if original.get("credentials_missing"):
                     metadata = deepcopy(previous)
-                elif group == "backend_profiles":
-                    metadata = _backend_metadata(profile)
-                    hidden = {key: value for key, value in profile["options"].items() if key not in metadata["options"]}
-                    payload = json.dumps(hidden, sort_keys=True, ensure_ascii=False, separators=(",", ":")) if hidden else None
+                    profile["credentials_missing"] = True
                 else:
-                    secret = "api_token" if group == "d1_profiles" else "password"
+                    if group == "d1_profiles":
+                        _text(profile[secret], "D1 API token", nonempty=True)
                     metadata = {key: value for key, value in profile.items() if key != secret}
-                    payload = profile[secret]
-                if not missing:
                     metadata["credential_ref"] = None
-                    pending.append((metadata, payload, previous.get("credential_ref")))
+                    pending.append((metadata, profile[secret], previous.get("credential_ref")))
                 disk[group].append(metadata)
                 runtime[group].append(profile)
         _memory_document(disk)
@@ -623,7 +529,8 @@ class MemoryStore(_CredentialStore):
         except Exception:
             self._discard(created)
             raise
-        if not any(profile.get("credentials_missing") for group in supplied for profile in runtime[group]):
+        if not any(profile.get("credentials_missing")
+                   for group in ("postgres_profiles", "d1_profiles") for profile in runtime[group]):
             self._clear_missing()
 
 
@@ -631,14 +538,15 @@ class SettingsStore(_CredentialStore):
     """Editable preferences; provider API keys never enter the JSON snapshot."""
 
     def __init__(self, data_dir: Path | None = None) -> None:
-        super().__init__(data_dir, "settings", _settings({}), _settings_document)
+        default = _settings({})
+        default["version"] = 2
+        default["ai"].pop("api_key")
+        default["ai"]["api_key_ref"] = None
+        super().__init__(data_dir, "settings", default, _settings_document)
         self._credential_state()
         self.ai_credentials_missing = False
         if self.error:
-            return
-        if self.document["version"] == 1:
-            if self._snapshot is not None and any(self.document["ai"][key] for key in ("base_url", "model", "api_key")):
-                self._migrate(lambda: self.save(self.document))
+            self.document = _settings({})
             return
         reference = self.document["ai"]["api_key_ref"]
         value = self._get(reference)
@@ -651,7 +559,7 @@ class SettingsStore(_CredentialStore):
             raise ValueError(self.error)
         runtime = _settings(document)
         ai = runtime["ai"]
-        unchanged = not replace_ai and ai == self.document["ai"] and self._disk["version"] == 2
+        unchanged = not replace_ai and ai == self.document["ai"]
         public = {key: value for key, value in ai.items() if key != "api_key"}
         disk = {**runtime, "version": 2, "ai": {**public, "api_key_ref": None}}
         created: set[str] = set()
@@ -659,8 +567,8 @@ class SettingsStore(_CredentialStore):
             if unchanged:
                 disk["ai"]["api_key_ref"] = self._disk["ai"]["api_key_ref"]
             elif ai["base_url"] or ai["model"] or ai["api_key"]:
-                previous = self._disk["ai"].get("api_key_ref") if public == {
-                    key: value for key, value in self._disk["ai"].items() if key not in {"api_key_ref", "api_key"}
+                previous = self._disk["ai"]["api_key_ref"] if public == {
+                    key: value for key, value in self._disk["ai"].items() if key != "api_key_ref"
                 } else None
                 disk["ai"]["api_key_ref"] = self._reference_for(ai["api_key"], previous, created)
             self._commit(disk, runtime)
@@ -739,6 +647,10 @@ def _function_draft(draft: object) -> None:
     _cursor(draft["cursor"])
 
 
+def _d1_source_key(key: str) -> bool:
+    return re.fullmatch(r"d1:[0-9a-f]{32}:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", key) is not None
+
+
 def _workspace_document(value: object) -> dict:
     if isinstance(value, dict):
         value = {"pages": [], "explorer_tab": "schema", "source_workspaces": {}, **value}
@@ -752,7 +664,7 @@ def _workspace_document(value: object) -> dict:
         _text(document["document"], "workspace document")
     for name in ("document_id", "source", "dialect"):
         _text(document[name], f"workspace {name}")
-    if document["dialect"] and document["dialect"] not in DIALECT_BY_NAME:
+    if document["dialect"] and document["dialect"] not in {"postgres", "duckdb", "sqlite"}:
         raise ValueError("unsupported workspace dialect")
     if document["explorer_tab"] not in ("schema", "pages", "functions", "agents"):
         raise ValueError("invalid explorer tab")
@@ -768,7 +680,7 @@ def _workspace_document(value: object) -> dict:
         if page["id"] in page_ids:
             raise ValueError("duplicate query page identity")
         page_ids.add(page["id"])
-        if page["dialect"] and page["dialect"] not in DIALECT_BY_NAME:
+        if page["dialect"] and page["dialect"] not in {"postgres", "duckdb", "sqlite"}:
             raise ValueError("unsupported query page dialect")
         _cursor(page["cursor"])
     _cursor(document["cursor"])
@@ -781,6 +693,10 @@ def _workspace_document(value: object) -> dict:
         _record(source, {"id", "display", "kind", "path"}, "workspace source")
         for name, text in source.items():
             _text(text, f"workspace source {name}")
+        if source["kind"] not in {"postgres-live", "parquet", "d1-live", "disconnected"}:
+            raise ValueError("unsupported workspace source kind")
+        if source["kind"] == "d1-live" and (not _d1_source_key(key) or source["path"]):
+            raise ValueError("invalid D1 workspace source")
     _function_draft(document["function_draft"])
     if not isinstance(document["source_workspaces"], dict):
         raise ValueError("invalid source workspaces")
@@ -824,10 +740,19 @@ def _workspace_document(value: object) -> dict:
         _record(entry, {"at", "source", "dialect", "rows", "ms", "doc", "target"}, "query history entry")
         for field in ("at", "source", "dialect", "doc", "target"):
             _text(entry[field], f"history {field}")
+        if entry["dialect"] not in {"postgres", "duckdb", "sqlite"}:
+            raise ValueError("unsupported history dialect")
         if type(entry["rows"]) is not int or entry["rows"] < 0:
             raise ValueError("invalid history row count")
         if type(entry["ms"]) not in (int, float) or not 0 <= entry["ms"] < float("inf"):
             raise ValueError("invalid history duration")
+    for target, dialect in [(document["source"], document["dialect"]),
+                            *((page["source"], page["dialect"]) for page in document["pages"]),
+                            *((entry["target"], entry["dialect"]) for entry in document["history"])]:
+        source = document["sources"].get(target, {})
+        if dialect == "sqlite" and (not _d1_source_key(target)
+                                    or source.get("kind", "d1-live") not in {"d1-live", "disconnected"}):
+            raise ValueError("SQLite workspace metadata requires a D1 target")
     return document
 
 

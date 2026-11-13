@@ -8,7 +8,7 @@ from d8r.tui.session import Session
 
 def test_sparse_pane_sizes_survive_partial_updates_without_load_rewrite(sources, tmp_path):
     path = tmp_path / "settings.json"
-    original = b'{"pane_sizes":{"explorer":48},"panes":{"sql":false}}\n'
+    original = b'{"version":2,"ai":{"api_key_ref":null},"pane_sizes":{"explorer":48},"panes":{"sql":false}}\n'
     path.write_bytes(original)
     session = Session(sources, data_dir=tmp_path)
     assert not session.memory_error

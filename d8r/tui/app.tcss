@@ -245,6 +245,15 @@ Tabs Tab:disabled {
     min-width: 12;
 }
 
+#source-version {
+    width: 1fr;
+    height: 3;
+    padding: 1;
+    color: $text-muted;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
 #query-targets SelectCurrent {
     height: 3;
     padding: 0 1;
@@ -321,22 +330,6 @@ Tabs Tab:disabled {
 #schema-hint {
     height: 2;
     color: $text-muted;
-}
-
-#schema-index {
-    display: none;
-    height: auto;
-    color: $text-muted;
-}
-
-#schema-index-dots {
-    width: 4;
-    height: 1;
-}
-
-#schema-index-label {
-    width: 1fr;
-    height: auto;
 }
 
 #page-actions, #agents-actions {
@@ -488,8 +481,8 @@ CommandPalette {
     /* The palette re-places itself under the caret on every keystroke; these
        are only the values it starts from and the shape it keeps. */
     offset: 1 2;
-    width: 62;
-    max-height: 8;
+    width: 86;
+    max-height: 12;
     text-wrap: nowrap;
     text-overflow: ellipsis;
     display: none;
@@ -497,6 +490,19 @@ CommandPalette {
 
 CommandPalette.open {
     display: block;
+}
+
+.completion-details {
+    layer: overlay;
+    position: absolute;
+    display: none;
+    background: $surface;
+    color: $foreground;
+    border: round $primary 65%;
+    padding: 0 1;
+    max-height: 8;
+    overflow-y: auto;
+    text-wrap: wrap;
 }
 
 #history-preview {
@@ -626,7 +632,7 @@ AddSourceModal {
     padding: 0 0 1 0;
 }
 
-#d1-fields, #postgres-fields, #backend-fields, .backend-fields {
+#postgres-fields, #parquet-fields, #d1-fields {
     height: auto;
 }
 

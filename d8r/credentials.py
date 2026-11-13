@@ -1,6 +1,6 @@
 """Small adapter to python-keyring's native OS stores; never a file-based vault.
 
-The library discovers backends. D8R restricts that selection to its built-in
+The library discovers backends. PGTUI restricts that selection to its built-in
 native stores so an installed plaintext/third-party fallback cannot receive secrets.
 References are immutable and scoped to the configured data directory, allowing
 JSON storage to commit a new reference before retiring its predecessor.
@@ -29,7 +29,7 @@ _NATIVE_MODULES = frozenset({
 _UNAVAILABLE = (
     "Secure system keyring unavailable or locked. Unlock or configure your OS "
     "credential store, or turn off Remember to use credentials for this session only. "
-    "D8R never falls back to plaintext credential storage."
+    "PGTUI never falls back to plaintext credential storage."
 )
 
 
@@ -61,7 +61,7 @@ class CredentialVault:
 
     def __init__(self, data_dir: Path) -> None:
         canonical = os.path.normcase(str(Path(data_dir).expanduser().resolve()))
-        self._namespace = "d8r:" + hashlib.sha256(os.fsencode(canonical)).hexdigest()
+        self._namespace = "pgtui:" + hashlib.sha256(os.fsencode(canonical)).hexdigest()
         self._backend: KeyringBackend | None = None
 
     def _store(self) -> KeyringBackend:

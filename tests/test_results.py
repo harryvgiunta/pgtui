@@ -222,8 +222,6 @@ def test_export_selected_and_all_scopes_use_raw_values(tmp_path):
         assert isinstance(modal, ExportModal)
         summary = str(modal.query_one("#export-summary", Static).content)
         assert "2 selected row(s)" in summary
-        assert f"4 buffered of {result.total:,} total" in summary
-        assert f"Preview cap: {PREVIEW_ROW_CAP:,}" in summary
         selected_path = tmp_path / "selected.csv"
         modal.query_one("#export-path", Input).value = str(selected_path)
         await pilot.pause()

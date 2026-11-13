@@ -1,340 +1,404 @@
-"""Cloudflare D1 over its HTTP API — the "live D1" seam.
+"""Native Cloudflare D1 REST client; never a local SQLite connection.
 
-A D1 database *is* SQLite: Cloudflare runs a real SQLite engine and answers SQL
-through a small REST API (`/accounts/<id>/d1/database/<db>/query|raw`). So a
-remote D1 source reuses every piece of D8R's query machinery unchanged: the
-payload is built against *unbound* ibis tables carrying the D1 database's real
-schemas, compiled to the SQLite dialect, and the resulting SQL text is POSTed to
-the API — which runs it on the actual D1 engine and answers with the rows.
-
-This module owns the HTTPS round-trip and schema introspection. User queries
-come from `d8r.engine.expression`; discovery issues read-only SQLite SQL.
-
-The client holds the token in memory and uses it per request; it never persists
-or renders credentials. Explicit Add in the TUI saves credentials through the
-local storage layer, independently of this transport.
+Cloudflare documents /raw as positional columns/rows (including duplicate names).
+Normal Run sends authored SQL unchanged: its preview cap does not cap the remote
+response. HTTP bodies are bounded separately at 50 MB. Read tools prepare EXPLAIN
+before a bounded outer SELECT; this does not bound scan cost or provide a session
+transaction. Cancellation/deadlines discard late results, not remote effects.
 """
-
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from threading import RLock
-from urllib.parse import quote
+import json
+import math
+import re
+import threading
+from time import monotonic, perf_counter
 from uuid import UUID
 
 import httpx
-import ibis
 
-from d8r.query.schema import ForeignKey
+from d8r.sql import ColumnDef, ForeignKey, lex_sql, relation_name
+from .datasources import DataSource, EngineError
 
-D1_API_ROOT = "https://api.cloudflare.com/client/v4"
-
-
-class D1Error(Exception):
-    """A D1-side failure the user must see (bad token, unknown database, SQL error)."""
-
-
-# Declared-type (as D1/sqlite reports it) → ibis dtype. Unknown names fall back
-# to string; ibis only needs this to type the compiled SQL, and a wrong guess
-# never corrupts a read (D1 returns the stored value regardless).
-_TYPE_MAP: dict[tuple[str, ...], str] = {
-    ("INTEGER", "INT", "BIGINT", "TINYINT", "SMALLINT"): "int64",
-    ("REAL", "DOUBLE", "FLOAT", "NUMERIC", "DECIMAL"): "float64",
-    ("TEXT", "CLOB", "VARCHAR", "CHAR"): "string",
-    ("BLOB", "ANY"): "binary",
-    ("DATE",): "date",
-    ("DATETIME", "TIMESTAMP"): "timestamp",
-    ("BOOLEAN", "BOOL"): "boolean",
-}
-# Prefix rules ordered longest-key-first, so a longer name never loses to a
-# shorter prefix of itself (DATETIME must not match DATE, CHARACTER not CHAR).
-_TYPE_PREFIXES: tuple[tuple[str, str], ...] = tuple(
-    sorted(
-        ((key, dtype) for keys, dtype in _TYPE_MAP.items() for key in keys),
-        key=lambda pair: len(pair[0]),
-        reverse=True,
-    )
-)
+_API = "https://api.cloudflare.com/client/v4"
+MAX_RESPONSE_BYTES = 50_000_000
+MAX_OPERATION_SECONDS = 30.0
+_MAX_LIST_PAGES = 100
+_MAX_TABLES = 2000
+_UNCERTAIN = "Remote execution may have completed; cancellation does not roll back changes. Do not retry writes automatically."
+_UNSAFE_FUNCTIONS = frozenset({
+    "load_extension", "readfile", "writefile", "edit", "eval", "fts3_tokenizer",
+    "sqlite_rename_table", "sqlite_rename_column", "sqlite_drop_column",
+    "sqlite_dbpage", "sqlite_dbdata", "sqlite_dbptr", "zipfile", "fsdir",
+    "shell", "system", "exec", "http", "https", "curl", "set_config",
+})
+_UNSAFE_PREFIXES = ("http_", "https_", "fileio_", "sqlite_rename_", "sqlite_unsafe_", "pragma_")
+_CONTROL_OPCODES = frozenset({
+    "OpenWrite", "SetCookie", "CreateBtree", "Destroy", "Clear", "ParseSchema",
+    "LoadAnalysis", "DropTable", "DropIndex", "DropTrigger", "VCreate", "VDestroy",
+    "VUpdate", "VRename", "Vacuum", "IncrVacuum", "Checkpoint", "JournalMode",
+    "AutoCommit", "Savepoint", "SqlExec", "Expire", "Pagecount", "MaxPgcnt",
+})
 
 
-def _ibis_type(declared: str, notnull: int) -> str:
-    name = (declared or "").strip().upper().split("(")[0].strip()
-    for key, dtype in _TYPE_PREFIXES:
-        if name == key or name.startswith(key):
-            null = "!" if notnull else ""
-            return f"{null}{dtype}"
-    return "!string" if notnull else "string"
+def create_client() -> httpx.Client:
+    """Fixed-origin transport; no environment proxy, redirects, or retries."""
+    return httpx.Client(timeout=30.0, follow_redirects=False, trust_env=False,
+                        transport=httpx.HTTPTransport(retries=0))
 
 
-def _sqlite_objects(names: list[str] | None) -> str:
-    sql = (
-        "where m.type in ('table', 'view') "
-        "and substr(m.name, 1, 7) != 'sqlite_' and substr(m.name, 1, 4) != '_cf_' "
-    )
-    if names is not None:
-        literals = ", ".join("'" + name.replace("'", "''") + "'" for name in names)
-        sql += f"and m.name in ({literals}) "
-    return sql
+def _malformed():
+    return EngineError("Cloudflare D1 returned an invalid response")
 
 
-def sqlite_foreign_keys(
-    query: Callable[[str], Iterable[dict]], names: list[str] | None = None,
-) -> dict[str, tuple[ForeignKey, ...]]:
-    """Read only SQLite catalogs; resolve omitted targets by primary-key ordinal."""
-    if names is not None and not names:
-        return {}
-    sql = (
-        'select m.name as source_table, f.id as constraint_id, f.seq as position, '
-        'f."from" as source_column, f."table" as target_table, '
-        'coalesce(f."to", p.name) as target_column, '
-        'case when f."to" is null then '
-        '(select count(*) from pragma_table_info(f."table") where pk > 0) '
-        'end as target_pk_count '
-        'from sqlite_schema m join pragma_foreign_key_list(m.name) f '
-        'left join pragma_table_info(f."table") p on f."to" is null and p.pk = f.seq + 1 '
-    )
-    sql += _sqlite_objects(names) + "order by m.name, f.id, f.seq"
-    groups: dict[tuple[str, int], list[dict]] = {}
-    for row in query(sql):
-        groups.setdefault((row["source_table"], row["constraint_id"]), []).append(row)
-    tables: dict[str, list[ForeignKey]] = {}
-    for (table, _), rows in groups.items():
-        targets = tuple(row["target_column"] for row in rows)
-        if any(target is None for target in targets) or any(
-            row["target_pk_count"] is not None and row["target_pk_count"] != len(rows)
-            for row in rows
-        ):
-            targets = ()
-        tables.setdefault(table, []).append(ForeignKey(
-            tuple(row["source_column"] for row in rows), rows[0]["target_table"], targets,
-        ))
-    return {table: tuple(keys) for table, keys in tables.items()}
+def _uuid(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = str(UUID(value))
+    except ValueError:
+        return None
+    return parsed if value.lower() == parsed else None
 
 
-class _SchemaSnapshot(dict[str, dict[str, str]]):
-    """Column/FK metadata from one successful discovery, published together."""
+@dataclass
+class _Operation:
+    deadline: float
+    cancelled: threading.Event = field(default_factory=threading.Event)
 
-    def __init__(self, schemas: dict[str, dict[str, str]], foreign_keys: dict[str, tuple[ForeignKey, ...]]):
-        super().__init__(schemas)
-        self.foreign_keys = foreign_keys
+    def remaining(self):
+        if self.cancelled.is_set():
+            raise EngineError("Cloudflare D1 request cancelled. " + _UNCERTAIN)
+        remaining = self.deadline - monotonic()
+        if remaining <= 0:
+            raise EngineError("Cloudflare D1 deadline exceeded. " + _UNCERTAIN)
+        return remaining
 
 
 @dataclass
 class CloudflareD1:
-    """A live Cloudflare D1 connection with an in-memory token and database uuid.
-
-    `transport` lets tests inject an `httpx.MockTransport` so the real
-    request/response handling is exercised with no network.
-    """
-
     account_id: str
+    database: str
     api_token: str = field(repr=False)
-    database: str  # what the user typed: a database name or a uuid
-    database_uuid: str = ""  # resolved uuid (empty until `_resolve`)
-    _client: httpx.Client = field(default=None, repr=False, compare=False)
+    _client: httpx.Client = field(repr=False)
+    _active: _Operation | None = field(default=None, repr=False)
+    _state: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _closed: bool = field(default=False, repr=False)
 
-    def __post_init__(self) -> None:
-        for label, value in (("Account ID", self.account_id), ("API token", self.api_token), ("Database", self.database)):
-            if not (value or "").strip():
-                raise D1Error(f"{label} is required")
-        self.account_id = self.account_id.strip()
-        self.api_token = self.api_token.strip()
-        self.database = self.database.strip()
-        self._client = self._client or httpx.Client(timeout=30.0)
-
-    # -- transport --------------------------------------------------------
-    def _post(self, endpoint: str, sql: str) -> dict:
-        url = f"{D1_API_ROOT}/accounts/{quote(self.account_id, safe='')}/d1/database/{self._db()}/{endpoint}"
+    @contextmanager
+    def operation(self, timeout=MAX_OPERATION_SECONDS):
+        operation = _Operation(monotonic() + min(float(timeout), MAX_OPERATION_SECONDS))
+        with self._state:
+            if self._closed:
+                raise EngineError("Cloudflare D1 source is closed")
+            if self._active is not None:
+                raise EngineError("Cloudflare D1 source is busy")
+            self._active = operation
         try:
-            resp = self._client.post(url, headers=self._headers(), json={"sql": sql})
-        except httpx.HTTPError:
-            raise D1Error("Could not reach Cloudflare. Check your network connection and try again.") from None
-        return self._result(resp)
+            yield operation
+            operation.remaining()
+        finally:
+            with self._state:
+                self._active = None
 
-    def _get(self, path: str, params: dict) -> list[dict]:
-        url = f"{D1_API_ROOT}{path}"
+    def cancel(self):
+        # Never acquire the source execution lock or close a socket on the UI lane.
+        with self._state:
+            if self._active is not None:
+                self._active.cancelled.set()
+
+    def close(self):
+        self.cancel()
+        with self._state:
+            self._closed = True
         try:
-            resp = self._client.get(url, headers=self._headers(), params=params)
-        except httpx.HTTPError:
-            raise D1Error("Could not reach Cloudflare. Check your network connection and try again.") from None
-        result = self._envelope(resp).get("result")
-        if not isinstance(result, list) or any(not isinstance(row, dict) for row in result):
-            raise D1Error("Cloudflare D1 returned an invalid database list")
-        return result
+            self._client.close()
+        except Exception:
+            raise EngineError("Cloudflare D1 connection close failed") from None
+        finally:
+            self.api_token = ""
 
-    def _headers(self) -> dict:
-        return {"Authorization": f"Bearer {self.api_token}"}
-
-    def _db(self) -> str:
-        return self.database_uuid or self.resolve()
-
-    def _envelope(self, resp: httpx.Response) -> dict:
+    def _request(self, operation, method, suffix="", *, params=None, body=None):
+        url = f"{_API}/accounts/{self.account_id}/d1/database{suffix}"
         try:
-            body = resp.json()
-        except ValueError as exc:
-            raise D1Error(f"invalid response from Cloudflare (HTTP {resp.status_code})") from exc
-        if not isinstance(body, dict):
-            raise D1Error(f"invalid response from Cloudflare (HTTP {resp.status_code})")
-        if resp.status_code != 200 or body.get("success") is not True:
-            raise D1Error(self._safe_error(body, resp.status_code))
-        return body
+            remaining = operation.remaining()
+            with self._client.stream(method, url, params=params, json=body,
+                                     headers={"Authorization": f"Bearer {self.api_token}",
+                                              "Accept-Encoding": "identity"},
+                                     follow_redirects=False, timeout=remaining) as response:
+                operation.remaining()
+                if response.status_code < 200 or response.status_code >= 300:
+                    raise EngineError(f"Cloudflare D1 request failed (HTTP {response.status_code}). " + _UNCERTAIN)
+                if response.headers.get("content-encoding", "identity").lower() != "identity":
+                    raise EngineError("Cloudflare D1 returned an unsupported compressed response")
+                length = response.headers.get("content-length")
+                if length is not None and (not length.isascii() or not length.isdigit()):
+                    raise _malformed()
+                if length is not None and int(length) > MAX_RESPONSE_BYTES:
+                    raise EngineError("Cloudflare D1 response exceeds the 50 MB safety limit. " + _UNCERTAIN)
+                data = bytearray()
+                for chunk in response.iter_bytes():
+                    operation.remaining()
+                    if len(data) + len(chunk) > MAX_RESPONSE_BYTES:
+                        raise EngineError("Cloudflare D1 response exceeds the 50 MB safety limit. " + _UNCERTAIN)
+                    data.extend(chunk)
+                operation.remaining()
+                payload = json.loads(data)
+            if not isinstance(payload, dict):
+                raise _malformed()
+            if "errors" in payload and not isinstance(payload["errors"], list):
+                raise _malformed()
+            if payload.get("success") is not True or payload.get("errors"):
+                raise EngineError("Cloudflare D1 rejected the request. " + _UNCERTAIN)
+            if not isinstance(payload.get("result"), list):
+                raise _malformed()
+            operation.remaining()
+            return payload
+        except EngineError:
+            raise
+        except httpx.TimeoutException:
+            raise EngineError("Cloudflare D1 deadline exceeded. " + _UNCERTAIN) from None
+        except (ValueError, TypeError, UnicodeError, RecursionError):
+            raise _malformed() from None
+        except Exception:
+            raise EngineError("Cloudflare D1 request failed. " + _UNCERTAIN) from None
 
-    def _result(self, resp: httpx.Response) -> dict:
-        body = self._envelope(resp)
-        items = body.get("result")
-        if not isinstance(items, list) or not items:
-            raise D1Error("Cloudflare D1 returned no result")
-        item = items[0]
-        if not isinstance(item, dict):
-            raise D1Error("Cloudflare D1 returned an invalid result")
-        if item.get("success") is False:
-            raise D1Error(self._safe_error(item, resp.status_code))
-        return item
-
-    def _safe_error(self, node: dict, status: int) -> str:
-        return _api_error(node, status).replace(self.api_token, "[redacted]")
-
-    # -- statements -------------------------------------------------------
-    def query(self, sql: str) -> list[dict]:
-        """Run SQL, returning each row as an object (for introspection)."""
-        results = self._post("query", sql).get("results") or []
-        return [row for row in results if isinstance(row, dict)]
-
-    def raw(self, sql: str) -> tuple[list[str], list[list]]:
-        """Run SQL, returning ordered columns + row arrays (for result pages)."""
-        results = self._post("raw", sql).get("results") or {}
-        columns = [str(c) for c in (results.get("columns") or [])]
-        rows = [list(r) for r in (results.get("rows") or [])]
-        return columns, rows
-
-    def check_connection(self) -> None:
-        """Authenticate against the resolved database without discovering its schema."""
-        self.query("SELECT 1")
-
-    # -- introspection ----------------------------------------------------
-    def resolve(self) -> str:
-        """Resolve a database name to a UUID; a binding is not an API identifier."""
-        if _looks_like_uuid(self.database):
-            self.database_uuid = str(UUID(self.database))
-            return self.database_uuid
-        page = 1
-        while True:
-            rows = self._get(
-                f"/accounts/{quote(self.account_id, safe='')}/d1/database",
-                {"name": self.database, "page": page, "per_page": 1000},
-            )
+    def resolve(self, name, operation):
+        direct = _uuid(name)
+        if direct is not None:
+            self.database = direct
+            return
+        matches = set()
+        for page in range(1, _MAX_LIST_PAGES + 1):
+            payload = self._request(operation, "GET", params={"name": name, "page": page, "per_page": 1000})
+            rows = payload["result"]
             for row in rows:
-                if row.get("name") == self.database:
-                    uuid = str(row.get("uuid") or "")
-                    if not _looks_like_uuid(uuid):
-                        raise D1Error("Cloudflare returned a database without a valid UUID")
-                    self.database_uuid = str(UUID(uuid))
-                    return self.database_uuid
-            if len(rows) < 1000:
+                if not isinstance(row, dict) or not isinstance(row.get("name"), str):
+                    raise _malformed()
+                if row["name"] == name:
+                    target = _uuid(row.get("uuid"))
+                    if target is None:
+                        raise _malformed()
+                    matches.add(target)
+            info = payload.get("result_info", {})
+            if not isinstance(info, dict):
+                raise _malformed()
+            per_page = info.get("per_page", 1000)
+            reported_page = info.get("page", page)
+            if type(per_page) is not int or not 1 <= per_page <= 10000 or reported_page != page:
+                raise _malformed()
+            total_pages = info.get("total_pages")
+            if total_pages is not None and (type(total_pages) is not int or total_pages < 0):
+                raise _malformed()
+            if not rows or len(rows) < per_page or (total_pages is not None and page >= total_pages):
                 break
-            page += 1
-        raise D1Error(
-            "No D1 database matched that name in this account. Check the Account ID "
-            "and database name, or paste the database UUID from Workers & Pages → D1."
-        )
+        else:
+            raise EngineError("Cloudflare D1 database lookup exceeded its page limit; use the database UUID")
+        if len(matches) != 1:
+            raise EngineError("Cloudflare D1 database name is missing or ambiguous; use the exact database UUID")
+        self.database = matches.pop()
 
-    def schemas(self, names: list[str] | None = None) -> dict[str, dict[str, str]]:
-        """Return ordered column types for all or only the named user tables/views.
+    def raw(self, sql, operation):
+        if len(sql.encode("utf-8")) > 100_000:
+            raise EngineError("Cloudflare D1 SQL exceeds the 100 KB statement limit")
+        payload = self._request(operation, "POST", f"/{self.database}/raw", body={"sql": sql})
+        results = payload["result"]
+        if len(results) != 1 or not isinstance(results[0], dict):
+            raise _malformed()
+        result = results[0]
+        if "errors" in result and not isinstance(result["errors"], list):
+            raise _malformed()
+        if result.get("success") is not True or result.get("error") or result.get("errors"):
+            raise EngineError("Cloudflare D1 statement failed. " + _UNCERTAIN)
+        raw = result.get("results")
+        if not isinstance(raw, dict):
+            raise _malformed()
+        columns, rows = raw.get("columns"), raw.get("rows")
+        if not isinstance(columns, list) or any(not isinstance(name, str) for name in columns):
+            raise _malformed()
+        if not isinstance(rows, list):
+            raise _malformed()
+        for row in rows:
+            if not isinstance(row, list) or len(row) != len(columns):
+                raise _malformed()
+            for value in row:
+                scalar = value is None or isinstance(value, (str, int, bool)) or (isinstance(value, float) and math.isfinite(value))
+                blob = isinstance(value, list) and all(type(byte) is int and 0 <= byte <= 255 for byte in value)
+                if not scalar and not blob:
+                    raise _malformed()
+        meta = result.get("meta", {})
+        if not isinstance(meta, dict):
+            raise _malformed()
+        changes = meta.get("changes", 0)
+        if type(changes) is not int or changes < 0:
+            raise _malformed()
+        operation.remaining()
+        return columns, rows, changes
 
-        Filter `sqlite_schema` before the correlated `pragma_table_info(m.name)`
-        introspection. D1's authorizer rejects internal `sqlite_*`/`_cf_*`
-        objects; a named lookup must also leave unrelated user objects alone.
-        """
-        if names is not None and not names:
-            return {}
-        sql = (
-            'select m.name as source_table, p.cid as cid, p.name as name, p.type as type, p."notnull" as "notnull" '
-            "from sqlite_schema m join pragma_table_info(m.name) p "
-        )
-        sql += _sqlite_objects(names) + "order by m.name, p.cid"
-        tables: dict[str, dict[str, str]] = {}
-        for row in self.query(sql):
-            table = row.get("source_table")
-            column = row.get("name")
-            if not table or not column:
+    def schema(self, operation):
+        _, tables, _ = self.raw("SELECT name, type FROM sqlite_schema WHERE type IN ('table', 'view') ORDER BY name", operation)
+        if len(tables) > _MAX_TABLES:
+            raise EngineError("Cloudflare D1 schema exceeds the metadata discovery limit")
+        datasets, primary_keys, pending = {}, {}, {}
+        for row in tables:
+            if len(row) != 2 or not isinstance(row[0], str):
+                raise _malformed()
+            name, kind = row
+            if name.lower().startswith(("sqlite_", "_cf_")):
                 continue
-            cols = tables.setdefault(table, {})
-            cols[str(column)] = _ibis_type(str(row.get("type") or ""), int(row.get("notnull") or 0))
-        return _SchemaSnapshot(tables, sqlite_foreign_keys(self.query, list(tables)))
+            key = relation_name(name)
+            literal = "'" + name.replace("'", "''") + "'"
+            names, columns, _ = self.raw(f"PRAGMA table_xinfo({literal})", operation)
+            required = {"cid", "name", "type", "pk", "hidden"}
+            if not required.issubset(names):
+                raise _malformed()
+            entries = [dict(zip(names, column)) for column in columns]
+            entries.sort(key=lambda column: column["cid"])
+            if any(not isinstance(column["name"], str) or not isinstance(column["type"], str) for column in entries):
+                raise _malformed()
+            datasets[key] = {"columns": tuple(ColumnDef(column["name"], column["type"]) for column in entries if column["hidden"] != 1),
+                             "doc": "", "rows": None, "foreign_keys": (), "temp": False}
+            primary_keys[name] = tuple(column["name"] for column in sorted(entries, key=lambda column: column["pk"]) if column["pk"])
+            if kind == "table":
+                names, keys, _ = self.raw(f"PRAGMA foreign_key_list({literal})", operation)
+                if not {"id", "seq", "table", "from", "to"}.issubset(names):
+                    raise _malformed()
+                pending[key] = [dict(zip(names, entry)) for entry in keys]
+        for key, entries in pending.items():
+            grouped = {}
+            for entry in sorted(entries, key=lambda entry: (entry["id"], entry["seq"])):
+                grouped.setdefault(entry["id"], []).append(entry)
+            fks = []
+            for group in grouped.values():
+                target = group[0]["table"]
+                target_columns = tuple(entry["to"] for entry in group)
+                if all(column is None for column in target_columns):
+                    target_columns = primary_keys.get(target, ())
+                if len(target_columns) != len(group) or any(not isinstance(column, str) for column in target_columns):
+                    continue
+                fks.append(ForeignKey(tuple(entry["from"] for entry in group), relation_name(target), target_columns))
+            datasets[key]["foreign_keys"] = tuple(fks)
+        operation.remaining()
+        return datasets
 
-    def close(self) -> None:
-        self._client.close()
 
-
-def _looks_like_uuid(text: str) -> bool:
+def add_d1_source(source_id, *, account_id, database, api_token, display=None):
+    if not isinstance(account_id, str) or re.fullmatch(r"[0-9a-fA-F]{32}", account_id.strip()) is None:
+        raise EngineError("A Cloudflare account ID must contain 32 hexadecimal characters")
+    if (not isinstance(api_token, str) or not api_token or api_token != api_token.strip()
+            or not api_token.isascii() or any(ord(char) < 33 or ord(char) == 127 for char in api_token)
+            or set(api_token) <= {"*"}):
+        raise EngineError("A nonempty, unmasked Cloudflare API token is required")
+    if not isinstance(database, str) or not database.strip() or any(ord(char) < 32 for char in database):
+        raise EngineError("A Cloudflare D1 database name or UUID is required")
+    if display is not None and not isinstance(display, str):
+        raise EngineError("A valid Cloudflare D1 display name is required")
+    con = None
     try:
-        UUID(text)
-    except ValueError:
-        return False
-    return True
+        con = CloudflareD1(account_id.strip().lower(), "", api_token, create_client())
+        with con.operation() as operation:
+            con.resolve(database.strip(), operation)
+            _, rows, _ = con.raw("SELECT sqlite_version()", operation)
+            if len(rows) != 1 or len(rows[0]) != 1 or not isinstance(rows[0][0], str) or re.fullmatch(r"\d+\.\d+\.\d+(?:\.\d+)?", rows[0][0]) is None:
+                raise _malformed()
+            source = DataSource(str(source_id).replace(api_token, "[redacted]"),
+                                (display or f"Cloudflare D1 · {database.strip()}").replace(api_token, "[redacted]"),
+                                "Cloudflare D1 · native SQLite over HTTPS", "d1-live", "sqlite", con=con,
+                                d1={"account_id": con.account_id, "database": con.database},
+                                connection_key=f"d1:{con.account_id}:{con.database}", server_version=rows[0][0])
+            source.datasets = con.schema(operation)
+        return source
+    except Exception as exc:
+        if con is not None:
+            try:
+                con.close()
+            except Exception:
+                pass
+        if isinstance(exc, EngineError):
+            raise
+        raise EngineError("Cloudflare D1 connection failed") from None
 
 
-def _api_error(node: dict, status: int) -> str:
-    """Pull a human message out of a Cloudflare error envelope (errors[] or detail)."""
-    errors = node.get("errors")
-    if isinstance(errors, list) and errors and isinstance(errors[0], dict):
-        message = errors[0].get("message")
-        if message:
-            return f"Cloudflare D1: {message}"
-    for key in ("detail", "error", "message"):
-        value = node.get(key)
-        if isinstance(value, str) and value:
-            return f"Cloudflare D1: {value}"
-    return f"Cloudflare D1 request failed (HTTP {status})"
+def _function_name(token):
+    text = token.text
+    if token.kind == "quoted_identifier":
+        if text.startswith("["):
+            return text[1:-1].lower()
+        return text[1:-1].replace(text[0] * 2, text[0]).lower()
+    return text.lower()
 
 
-def schema_connection(schemas: dict[str, dict[str, str]], *, d1: CloudflareD1 | None = None):
-    """A read-only ibis connection with optional on-demand D1 table metadata.
-
-    With no `d1`, the connection stays entirely offline. Supplying a client
-    loads only missing tables, while `.seed()` accepts separately indexed
-    metadata without performing network requests.
-    """
-    return _UnboundCon(schemas, d1=d1)
+def _unsafe_function(name):
+    return name in _UNSAFE_FUNCTIONS or name.startswith(_UNSAFE_PREFIXES)
 
 
-class _UnboundCon:
-    def __init__(self, schemas: dict[str, dict[str, str]], *, d1: CloudflareD1 | None = None) -> None:
-        self._schemas: dict[str, dict[str, str]] = {}
-        self._foreign_keys: dict[str, tuple[ForeignKey, ...]] = {}
-        self._d1 = d1
-        self._lock = RLock()
-        self.seed(schemas)
+def _guard_readonly(con, sql, tokens, operation):
+    for index, token in enumerate(tokens[:-1]):
+        if token.kind in {"word", "quoted_identifier"} and tokens[index + 1].text == "(" and _unsafe_function(_function_name(token)):
+            raise EngineError("Read-only D1 tools cannot call file, network, extension or mutation functions")
+    names, rows, _ = con.raw("EXPLAIN " + sql, operation)
+    required = {"addr", "opcode", "p1", "p2", "p3", "p4", "p5"}
+    if not required.issubset(names) or len(set(names)) != len(names) or not rows:
+        raise EngineError("Cloudflare D1 did not return a usable EXPLAIN program")
+    program = [dict(zip(names, row)) for row in rows]
+    if (any(type(instruction["addr"]) is not int or instruction["addr"] != index
+            for index, instruction in enumerate(program))
+            or program[0]["opcode"] != "Init"
+            or type(program[0]["p2"]) is not int
+            or not 0 <= program[0]["p2"] < len(program)
+            or not any(instruction["opcode"] == "Halt" for instruction in program)
+            or program[-1]["opcode"] not in {"Goto", "Halt"}):
+        raise EngineError("Cloudflare D1 returned an incomplete EXPLAIN program")
+    ephemeral = set()
+    for instruction in program:
+        opcode, p1, p2, p4 = (instruction[name] for name in ("opcode", "p1", "p2", "p4"))
+        if (not isinstance(opcode, str)
+                or any(type(instruction[name]) is not int for name in ("p1", "p2", "p3", "p5"))
+                or (p4 is not None and not isinstance(p4, str))):
+            raise _malformed()
+        if opcode in _CONTROL_OPCODES or (opcode == "Transaction" and p2 != 0):
+            raise EngineError("Read-only D1 EXPLAIN rejected a write or session-control operation")
+        if opcode in {"OpenEphemeral", "OpenAutoindex", "SorterOpen"}:
+            ephemeral.add(p1)
+        elif opcode == "OpenDup" and p2 in ephemeral:
+            ephemeral.add(p1)
+        elif opcode in {"OpenRead", "OpenPseudo", "Close"}:
+            ephemeral.discard(p1)
+        if opcode in {"Insert", "Delete", "IdxInsert", "IdxDelete", "SorterInsert"} and p1 not in ephemeral:
+            raise EngineError("Read-only D1 EXPLAIN rejected a persistent write")
+        if opcode in {"Function", "PureFunc", "AggStep", "AggStep1", "AggFinal", "AggValue", "AggInverse"}:
+            if not isinstance(p4, str) or _unsafe_function(p4.split("(", 1)[0].lower()):
+                raise EngineError("Read-only D1 EXPLAIN rejected an unsafe function")
 
-    def table(self, name: str):
-        if name.startswith(("sqlite_", "_cf_")):
-            raise KeyError(name)
-        with self._lock:
-            schema = self._schemas.get(name)
-        if schema is None and self._d1 is not None:
-            # Never hold the cache lock across HTTP: another table's lookup or
-            # the application's background index must not gate this request.
-            self.seed(self._d1.schemas([name]))
-            with self._lock:
-                schema = self._schemas.get(name)
-        if schema is None:
-            raise KeyError(name)
-        return ibis.table(name=name, schema=ibis.schema(schema))
 
-    def seed(self, schemas: dict[str, dict[str, str]]) -> None:
-        snapshot = {name: dict(columns) for name, columns in schemas.items()}
-        foreign_keys = getattr(schemas, "foreign_keys", {})
-        with self._lock:
-            self._schemas.update(snapshot)
-            for name in snapshot:
-                self._foreign_keys[name] = tuple(foreign_keys.get(name, ()))
-
-    def list_tables(self) -> list[str]:
-        with self._lock:
-            return list(self._schemas)
-
-    def foreign_keys(self, name: str) -> tuple[ForeignKey, ...]:
-        """Return cached constraints only; never discover metadata from the UI."""
-        with self._lock:
-            return self._foreign_keys.get(name, ())
+def execute_d1(source, sql, statement, *, cap, readonly, timeout):
+    tokens = [token for token in lex_sql(statement, dialect="sqlite") if token.kind not in {"whitespace", "comment"}]
+    words = [token.text.upper() for token in tokens if token.kind == "word"]
+    first = words[0] if words else ""
+    if first in {"BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE", "ABORT", "START"}:
+        raise EngineError("Cloudflare D1 does not support session transactions across HTTP requests")
+    if first == "CREATE" and len(words) > 1 and words[1] in {"TEMP", "TEMPORARY"}:
+        raise EngineError("Cloudflare D1 does not support session TEMP/TEMPORARY objects")
+    if first in {"ATTACH", "DETACH"} or (first == "CREATE" and any(_function_name(tokens[index]) == "temp" and tokens[index + 1].text == "." for index in range(len(tokens) - 1))):
+        raise EngineError("Cloudflare D1 does not support attached or temporary session databases")
+    if readonly and first not in {"SELECT", "WITH", "VALUES"}:
+        raise EngineError("Read-only D1 tools accept one SELECT, WITH or VALUES query")
+    with source._lock:
+        con = source.con
+        if con is None:
+            raise EngineError("Source is disconnected")
+        started = perf_counter()
+        with con.operation(timeout) as operation:
+            native = sql
+            if readonly:
+                _guard_readonly(con, statement, tokens, operation)
+                # The newline protects the closing wrapper from a trailing line comment.
+                native = f"SELECT * FROM (\n{statement}\n) AS _pgtui_read LIMIT {cap + 1}"
+            columns, rows, changes = con.raw(native, operation)
+            total = min(len(rows), cap + 1) if columns else changes
+            result = {"columns": columns, "dtypes": ["" for _ in columns], "rows": rows[:cap],
+                      "total": total, "ms": (perf_counter() - started) * 1000, "sql": sql,
+                      "status": first or "OK", "schema_changed": not readonly and first in {"CREATE", "ALTER", "DROP", "REINDEX"}}
+        return result

@@ -16,8 +16,7 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import Button, LoadingIndicator, Static
 
 from d8r.credentials import CredentialError
-from d8r.engine import DataSource
-from d8r.engine.connectors import BackendConnectionError, close_backend_connection, profile_secrets
+from d8r.engine import DataSource, EngineError, close_source
 
 if TYPE_CHECKING:
     from d8r.tui.session import Session
@@ -29,12 +28,7 @@ CONNECTION_TIMEOUT = 30.0
 def release_source(source: DataSource) -> None:
     """Dispose an unregistered source, without exposing driver errors/secrets."""
     try:
-        if source.d1 is not None:
-            source.d1.close()
-        elif source.kind == "ibis":
-            close_backend_connection(source.con)
-        elif source.con is not None:
-            source.con.disconnect()
+        close_source(source)
     except Exception:
         # Cleanup must not resurrect a cancelled operation or crash the UI.
         pass
@@ -74,7 +68,7 @@ async def build_connection(
     # exception so it cannot leak credentials via an unhandled-task diagnostic.
     pending.add_done_callback(lambda future: None if future.cancelled() else future.exception())
     deadline = monotonic() + timeout
-    Thread(target=construct, name="d8r-source-connect", daemon=True).start()
+    Thread(target=construct, name="pgtui-source-connect", daemon=True).start()
     try:
         source = await asyncio.wait_for(asyncio.shield(pending), timeout)
         if monotonic() >= deadline:
@@ -90,49 +84,38 @@ async def build_connection(
         raise
 
 
-def build_saved_source(
-    session: Session, *, profile: dict | None = None,
-    snapshot_path: str | None = None,
-) -> DataSource:
+def build_saved_source(session: Session, *, profile: dict | None = None) -> DataSource:
     """Build only; callers own registration and stale-target checks."""
-    if profile is not None and profile.get("credentials_missing"):
-        raise CredentialError("Saved credentials are unavailable. Re-enter them before connecting.")
-    if snapshot_path:
-        return session.build_sqlite_source(snapshot_path)
     if profile is None:
         raise ValueError("Connection details are required.")
+    if profile.get("credentials_missing"):
+        raise CredentialError("Saved credentials are unavailable. Re-enter them before connecting.")
     if profile.get("kind") == "parquet":
         return session.build_parquet_source(profile["path"], profile.get("display", ""))
-    if profile.get("kind") == "ibis":
-        return session.build_backend_source({key: value for key, value in profile.items() if key != "kind"})
+    if profile.get("kind") == "d1-live":
+        if not profile.get("api_token"):
+            raise CredentialError("Re-enter the missing D1 API token before connecting.")
+        return session.build_d1_source(
+            account_id=profile["account_id"], database=profile["database"],
+            api_token=profile["api_token"], display=profile.get("display", ""),
+        )
     if profile.get("kind") == "postgres-live":
         return session.build_postgres_source(
             host=profile["host"], port=int(profile["port"]), database=profile["database"],
             user=profile["user"], password=profile["password"], schema=profile["schema"],
             sslmode=profile["sslmode"], display=profile.get("display"),
         )
-    return session.build_live_source(
-        profile["account_id"], profile["api_token"], profile["database"], profile.get("display", ""),
-    )
+    raise ValueError("Only PostgreSQL, Cloudflare D1 and local Parquet sources are supported.")
 
 
-def saved_source_label(
-    *, profile: dict | None = None, snapshot_path: str | None = None,
-) -> str:
+def saved_source_label(*, profile: dict | None = None) -> str:
     """A database label, never a DSN or credential-bearing exception."""
-    if snapshot_path:
-        return Path(snapshot_path).name
     if profile is None:
         return "data source"
     if profile.get("kind") == "parquet":
         return profile.get("display") or Path(profile["path"]).name
-    if profile.get("kind") == "ibis" or "backend" in profile:
-        label = profile.get("display") or profile.get("backend") or "data source"
-        secrets = profile_secrets(profile)
-    else:
-        label = profile.get("database", "data source")
-        secrets = [profile.get(key, "") for key in ("password", "api_token")]
-    for secret in secrets:
+    label = profile.get("display") or profile.get("database", "PostgreSQL")
+    for secret in (profile.get("password"), profile.get("api_token")):
         if secret:
             label = label.replace(secret, "[redacted]")
     return label
@@ -218,7 +201,7 @@ class ConnectionProgress(ConnectionStatus):
                 self._failed(f"Connection timed out after {self._timeout:g}s. Retry to connect.")
         except asyncio.CancelledError:
             raise
-        except BackendConnectionError as exc:
+        except (EngineError, CredentialError) as exc:
             if not self._cancelled and self.is_mounted and self._valid():
                 self._failed(str(exc))
         except Exception:

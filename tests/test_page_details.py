@@ -18,7 +18,7 @@ def test_details_generation_saves_metadata_without_changing_or_running_query(tmp
     def respond(request):
         payload = json.loads(request.content)
         assert "tools" not in payload
-        assert json.loads(payload["messages"][-1]["content"])["document"] == "\\from events\n\\limit 3"
+        assert json.loads(payload["messages"][-1]["content"])["document"] == "SELECT * FROM events LIMIT 3"
         return stream_response(completed(json.dumps({"title": "Event preview", "description": "The first three events."})))
 
     monkeypatch.setattr(client, "create_client", lambda config: httpx.AsyncClient(transport=httpx.MockTransport(respond)))
@@ -29,14 +29,14 @@ def test_details_generation_saves_metadata_without_changing_or_running_query(tmp
     async def scenario():
         async with app.run_test(size=(150, 48)) as pilot:
             await pilot.pause()
-            app.editor.load_text("\\from events\n\\limit 3")
+            app.editor.load_text("SELECT * FROM events LIMIT 3")
             await pilot.click("#page-details-toggle")
             await pilot.click("#page-details-generate")
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert app.query_one("#page-name", Input).value == "Event preview"
             assert app.query_one("#page-description", TextArea).text == "The first three events."
-            assert app.editor.text == "\\from events\n\\limit 3"
+            assert app.editor.text == "SELECT * FROM events LIMIT 3"
             assert not session.history
             # A page switch before debounced messages dispatch must keep both fields.
             app.query_one("#page-description", TextArea).load_text("Edited description")
@@ -68,6 +68,7 @@ def test_inflight_metadata_never_overwrites_changed_or_cancelled_target(tmp_path
         app = D8RApp(session)
         async with app.run_test(size=(150, 48)) as pilot:
             await pilot.pause()
+            app.editor.load_text("SELECT * FROM events LIMIT 3")
             await pilot.click("#page-details-toggle")
             app.query_one("#page-name", Input).value = "Keep this"
             await pilot.click("#page-details-generate")
@@ -98,4 +99,4 @@ def test_invalid_metadata_response_is_rejected_atomically(monkeypatch):
         transport=httpx.MockTransport(lambda request: stream_response(completed(
             json.dumps({"title": "Valid title", "description": ["not a string"]}))))))
     with pytest.raises(client.AIError, match="invalid page details"):
-        asyncio.run(generate_details(CONFIG, "\\from events"))
+        asyncio.run(generate_details(CONFIG, "SELECT * FROM events"))

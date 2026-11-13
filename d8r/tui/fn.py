@@ -1,13 +1,9 @@
 """Function explorer and form components for the shared workspace.
 
-A table-valued function here is a named D8R document with a positional
-signature: the body is an ordinary query whose `@params` are filled with the
-arguments of each call (the engine sees literals; ibis never learns a function
-exists). The explorer occupies the workspace's left slot; the form occupies
-the same middle slot as the query editor, with the shared AI panel on the right.
-The form lists name, description, parameter signature, and trial-call arguments,
-then the body. `Run preview` saves, then calls it through the same path a
-document's `\\from name(args)` takes, so the grid shows what the editor gets.
+A table-valued function here is a named native SQL query with positional
+arguments bound to unquoted @parameters. Calls expand locally; no server
+function is installed. The explorer and form share the query workspace and
+AI panel. Run preview saves and executes SELECT * FROM name(arguments).
 
 Definitions are saved locally through `Session` and restored on the next launch.
 Draft edits and AI Apply are autosaved separately; only Save or Run preview changes definitions.
@@ -15,6 +11,7 @@ Draft edits and AI Apply are autosaved separately; only Save or Run preview chan
 
 from __future__ import annotations
 
+import asyncio
 import json
 from time import monotonic
 
@@ -29,7 +26,7 @@ from textual.widgets import Button, DataTable, Input, OptionList, Select, Static
 from textual.widgets.option_list import Option
 
 from d8r.ai.context import AIProposal
-from d8r.query import is_identifier
+from d8r.sql import is_identifier
 
 from .ai import AIPanel, AITarget
 
@@ -41,37 +38,32 @@ if TYPE_CHECKING:
 
 NEW = "＋ New function…"
 
-HINT = "select a function · ctrl+r preview · ctrl+d delete · escape intellisense · ctrl+c copy · ctrl+q back"
+HINT = "select a function · ctrl+r preview · ctrl+d delete · ctrl+space complete · F4 AI complete · escape intellisense · ctrl+q back"
 
-PARAMETER_GUIDE = r"""1. Declare names, not values
-Parameters: min_amount
+PARAMETER_GUIDE = """1. Declare names, not values
+Parameters: min_id
 No @, types or defaults here.
 Names must be unique identifiers.
 
-2. Use @name in the body
-Keep placeholders unquoted:
-\from events
-\where amount > @min_amount
-\select user_id, amount
+2. Write one native SQL query
+SELECT id, label FROM data
+WHERE id > @min_id
 
-3. Try it (Source target: demo)
-Name: events_above
-Preview arguments: 10
+Keep @parameters unquoted.
+Save checks placeholders and
+expansion, not server grammar.
+
+3. Try it on the selected source
+Name: rows_above
+Preview arguments: 1
 Run preview saves, then runs it.
 
-4. Call it from a document
-\from events_above(10)
-\select *
+4. Call it from a SQL document
+SELECT * FROM rows_above(1)
 
-Multiple parameters use order:
-min_amount, event_kind
-Arguments: 10, "purchase"
-10 binds @min_amount;
-"purchase" binds @event_kind.
-
-Quote text values, not numbers.
-Supply one value per parameter;
-use values only, not name=value.
+Arguments are SQL expressions
+in parameter order. Quote text
+with single quotes: 'alpha'.
 No parameters? Leave both fields
 blank and call name()."""
 
@@ -149,10 +141,11 @@ class FnEditor(Vertical):
                 yield Static("Parameters")
                 yield Input(self._initial_fields["parameters"], placeholder="min_amount (names in order, no @)", id="fn-params")
             with Horizontal(classes="fn-field"):
-                yield Static("Preview values")
-                yield Input(self._initial_fields["arguments"], placeholder='10 (quote text; values in parameter order)', id="fn-args")
+                yield Static("Preview arguments")
+                yield Input(self._initial_fields["arguments"], placeholder="1, 'alpha' (SQL expressions in parameter order)", id="fn-args")
             with FnBodyPane(id="fn-body-pane"):
-                yield QueryTextArea(self._initial_fields["body"], id="fn-body", show_line_numbers=True)
+                yield QueryTextArea(self._initial_fields["body"], id="fn-body", show_line_numbers=True,
+                                    dialect=self.session.sources[self.source_id].dialect)
                 yield CommandPalette(
                     self.session, source_id=self.source_id, workspace_actions=False,
                     parameters=self._parameter_names, id="fn-palette", markup=False,
@@ -167,7 +160,7 @@ class FnEditor(Vertical):
         self.preview_grid.cursor_type = "cell"
         self.query_one("#fn-reconnect").display = not self.session.source_connected(self.source_id)
         self._draft_body = self.query_one("#fn-body", TextArea)
-        self._draft_body.border_title = "Body · @param binds an argument"
+        self._draft_body.border_title = "SQL body · @param binds an expression"
         self._draft_inputs = {
             key: self.query_one(selector, Input) for key, selector in (
                 ("name", "#fn-name"), ("description", "#fn-doc"),
@@ -206,6 +199,7 @@ class FnEditor(Vertical):
             self._draft_timer.stop()
             self._draft_timer = None
         self.source_id = self.session.active_id
+        self.query_one("#fn-body", QueryTextArea).dialect = self.session.sources[self.source_id].dialect
         self.selected = draft["selected"] if draft else ""
         self._draft_identity = draft["identity"] if draft else str(uuid4())
         self._draft_snapshot = {}
@@ -289,6 +283,7 @@ class FnEditor(Vertical):
     def _select_target(self, source_id: str) -> None:
         self.ide._cancel_connection()
         self.source_id = source_id
+        self.query_one("#fn-body", QueryTextArea).dialect = self.session.sources[self.source_id].dialect
         self.query_one("#fn-reconnect", Button).disabled = self.session.source_connected(source_id)
         self.query_one("#fn-reconnect").display = not self.session.source_connected(source_id)
         self._target_changed()
@@ -335,6 +330,7 @@ class FnEditor(Vertical):
 
     @on(Input.Changed, "#fn-params")
     def _parameters_changed(self) -> None:
+        self.query_one(CommandPalette).close()
         self.query_one(CommandPalette).sync()
 
 
@@ -490,8 +486,36 @@ class FnEditor(Vertical):
             return
         name = self.query_one("#fn-name", Input).value.strip()
         args_text = self.query_one("#fn-args", Input).value
-        with self.session.target_source(self.source_id):
-            outcome = self.session.fn_preview(name, args_text)
+        source_id = self.source_id
+        identity = self._draft_identity
+        self.session.busy = "Function preview running"
+        self._status("Running SQL preview…")
+        self.run_worker(self._preview(name, args_text, source_id, identity),
+                        group="function-preview", exit_on_error=False)
+
+    async def _preview(self, name: str, arguments: str, source_id: str, identity: str) -> None:
+        task = asyncio.create_task(asyncio.to_thread(
+            self.session.fn_preview, name, arguments, source_id=source_id,
+        ))
+        task.add_done_callback(lambda done: self._preview_finished(done, source_id, identity))
+        try:
+            await asyncio.shield(task)
+        except Exception:
+            pass  # The callback reports safe errors and releases the connection.
+
+    def _preview_finished(self, task, source_id: str, identity: str) -> None:
+        self.session.busy = ""
+        if task.cancelled():
+            return
+        try:
+            outcome = task.result()
+        except Exception as exc:
+            if self.is_mounted and not self.ide._closing:
+                self._status(self.session.execution_error(exc, source=self.session.sources.get(source_id)), error=True)
+            return
+        if (not self.is_mounted or self.ide._closing or source_id != self.source_id
+                or identity != self._draft_identity):
+            return
         grid = self.preview_grid
         grid.clear(columns=True)
         if outcome.error:
