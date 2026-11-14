@@ -1,15 +1,40 @@
 # PGTUI
 
-A keyboard-first PostgreSQL SQL workspace in the terminal, forked from anyql/D8R,
-with Cloudflare D1 support. DuckDB is retained only for querying a user-selected
-local Parquet file. No other backend adapters, bundled datasets, sample queries,
-expression compiler, or SQL dialect translator are included.
+A keyboard-first SQL workspace for people who already live in a terminal multiplexer.
+Keep your data-engineering work in a pane alongside tools such as **oh-my-pi** or
+**OpenCode**, instead of opening a separate desktop database client. Whether your
+multiplexer is Herdr or something else, the goal is to stay in your terminal.
+
+This is an **early-alpha, AI-built project**—"AI slop," affectionately. It has rough
+edges, and people trying it, reporting bugs, and contributing are very welcome.
+
+**Free forever. Open source. MIT-licensed.** There is no paid PGTUI tier. AI is
+optional; ordinary SQL editing and execution do not require an AI provider.
+External AI providers and hosted database services may have their own charges.
+
+The current scope is **PostgreSQL, local Parquet through DuckDB, and Cloudflare D1**:
+the three sources the maintainer uses daily. No custom query language or SQL
+translation layer, and no browser application.
+
+Already available:
+- Native SQL editing with alias completion, foreign-key JOIN suggestions, and full
+  GROUP BY proposals from known projections.
+- Schema browsing, source-scoped query pages and reusable SQL functions, results
+  selection, and CSV export.
+- Optional AI chat and inline SQL proposals, with explicit acceptance controls.
+
+Forked from anyql/D8R; original MIT attribution is retained.
+
+**Want to help?** Try it on your workflow, [report a bug](https://github.com/harryvgiunta/pgtui/issues),
+or read the [contributing guide](CONTRIBUTING.md). Small, focused improvements count.
 
 ## Run
 
 Requires Python 3.13+ and [uv](https://docs.astral.sh/uv/).
 
-```powershell
+```sh
+git clone https://github.com/harryvgiunta/pgtui.git
+cd pgtui
 uv sync --locked
 uv run pgtui
 ```
@@ -27,6 +52,10 @@ PostgreSQL passwords and D1 API tokens in the native OS keyring; turning it off
 keeps credentials session-only. Metadata discovery reads catalogs, not table row counts. Startup
 reconnects only the selected saved target, without executing or changing its draft.
 Missing credentials leave the target disconnected.
+
+Run it with a restricted database role while trying the alpha. Manual Run sends
+native SQL with your role's permissions, including writes and DDL; it is not a
+read-only sandbox. Do not paste credentials or private data into public bug reports.
 
 ## Native SQL
 

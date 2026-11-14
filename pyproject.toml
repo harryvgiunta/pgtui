@@ -20,6 +20,11 @@ dependencies = [
     "keyring==25.7.0",
 ]
 
+[project.urls]
+Repository = "https://github.com/harryvgiunta/pgtui"
+Issues = "https://github.com/harryvgiunta/pgtui/issues"
+Contributing = "https://github.com/harryvgiunta/pgtui/blob/main/CONTRIBUTING.md"
+
 [project.scripts]
 pgtui = "d8r.tui.app:main"
 
