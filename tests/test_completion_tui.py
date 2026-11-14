@@ -12,7 +12,7 @@ from d8r.ai import sql_completion
 from d8r.ai.client import AIConfig
 from d8r.ai.sql_completion import AICompletion
 from d8r.tui.app import D8RApp
-from d8r.tui.palette import CommandPalette, view_for
+from d8r.tui.palette import CommandPalette
 from d8r.tui.session import Session
 from tests.test_native_engine import postgres_source
 

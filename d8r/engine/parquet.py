@@ -44,7 +44,7 @@ def add_parquet_source(path, display="") -> DataSource:
         identity = hashlib.sha256(os.path.normcase(str(resolved)).encode()).hexdigest()[:20]
         source = DataSource(f"parquet:{identity}", display or resolved.name,
                             "Local Parquet · lazy data view", "parquet", "duckdb",
-                            dir=resolved.parent, con=con, connection_key=str(resolved),
+                            con=con, connection_key=str(resolved),
                             default_schema="main", server_version=duckdb.__version__)
         refresh_source_schema(source)
         return source

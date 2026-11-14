@@ -213,7 +213,7 @@ class Session:
                     "cursor": [0, 0], "source": identity[1], "dialect": entry.dialect,
                 })
         if self.workspace["source"]:
-            self.restore_source(self.workspace["source"], self.workspace["dialect"] or None)
+            self.restore_source(self.workspace["source"])
         else:
             selected = settings["source"]
             if (selected in self.sources or any(self.source_key(name) == selected for name in self.sources)
@@ -408,10 +408,6 @@ class Session:
         if default_rows is not None:
             self.default_rows = default_rows
 
-    @property
-    def workspace_path(self) -> Path:
-        return self._workspace.path
-
     def save_workspace(self, **changes) -> None:
         """Merge owned fields under one lock; failures preserve the live draft."""
         with self._workspace_lock:
@@ -515,7 +511,7 @@ class Session:
         return source is not None and source.con is not None
 
 
-    def restore_source(self, key: str, dialect: str | None = None, *, activate: bool = True) -> str:
+    def restore_source(self, key: str, *, activate: bool = True) -> str:
         """Restore saved target identity without opening a file or connection."""
         key = self.source_key(key)
         source_id = next((name for name in self.sources if self.source_key(name) == key), None)
@@ -531,7 +527,7 @@ class Session:
             self.sources[key] = DataSource(
                 id=key, display=f"{label} · disconnected", doc="Reconnect explicitly to use this target.",
                 kind="disconnected", dialect="sqlite" if is_d1 else "duckdb" if is_parquet else "postgres",
-                dir=Path(saved.get("path") or "."), connection_key=key,
+                connection_key=key,
             )
         if activate:
             self.set_active(source_id)
@@ -918,7 +914,7 @@ class Session:
         cancel_source(self.sources[self.active_id if source_id is None else source_id])
 
     def execution_error(
-        self, exc: Exception, *, source: DataSource | None = None, operation: str = "Query",
+        self, exc: Exception, *, operation: str = "Query",
     ) -> str:
         """Only safe engine/SQL errors may cross the driver/UI boundary."""
         if isinstance(exc, (EngineError, SqlError, CredentialError)):
@@ -981,7 +977,7 @@ class Session:
         try:
             result = execute_sql(source, sql, max_rows=min(self.default_rows or PREVIEW_ROW_CAP, PREVIEW_ROW_CAP))
         except Exception as exc:
-            message = self.execution_error(exc, source=source)
+            message = self.execution_error(exc)
             return RunOutcome(status=message, error=message, source=source.id,
                               dialect=source.dialect, sql=sql, doc=doc)
         self.clear_value_cache(source.id)
@@ -995,7 +991,7 @@ class Session:
                 # The SQL already succeeded; a metadata failure must not invite
                 # retrying a write or conceal its successful result/history.
                 schema_warning = "schema not refreshed: " + self.execution_error(
-                    exc, source=source, operation="Schema refresh",
+                    exc, operation="Schema refresh",
                 )
         outcome = RunOutcome(
             ok=True, source=source.id, dialect=source.dialect,

@@ -74,11 +74,6 @@ class View:
     def labels(self) -> list[str]:
         return [entry.label for entry in self.entries]
 
-    def highlighted_is_typed(self, index: int) -> bool:
-        entry = self.entries[index]
-        return (self.phase != "ai" and not entry.action and not entry.replace_document
-                and entry.insert.strip().lstrip("\\") == self.token.strip())
-
 
 def prompt(label: str, detail: str = "") -> Content:
     return Content.assemble(label, ("  " + detail, "dim")) if detail else Content(label)
@@ -298,7 +293,7 @@ class CommandPalette(OptionList):
         if self._sync_pending:
             self.sync()
 
-    def sync(self, *, respect_dismissal: bool = False, manual: bool = False) -> None:
+    def sync(self, *, manual: bool = False) -> None:
         self._sync_pending = False
         self._guard_ai()
         editor = self.editor
@@ -577,19 +572,19 @@ class CommandPalette(OptionList):
             self.highlighted = (self.highlighted + delta) % self.option_count if self.highlighted is not None else 0
             self.scroll_to_highlight()
 
-    def accept_highlighted(self, *, newline: bool = False) -> bool:
+    def accept_highlighted(self) -> bool:
         self._guard_ai()
         if self._sync_pending or (self._view is not None and self._view.phase != "ai"):
-            self.sync(respect_dismissal=True)
-        return self._accept(self.highlighted, newline=newline) if self.highlighted is not None else False
+            self.sync()
+        return self._accept(self.highlighted) if self.highlighted is not None else False
 
-    def accept(self, index: int, *, newline: bool = False) -> bool:
+    def accept(self, index: int) -> bool:
         self._guard_ai()
         if self._sync_pending or (self._view is not None and self._view.phase != "ai"):
-            self.sync(respect_dismissal=True)
-        return self._accept(index, newline=newline)
+            self.sync()
+        return self._accept(index)
 
-    def _accept(self, index: int, *, newline: bool = False) -> bool:
+    def _accept(self, index: int) -> bool:
         view, editor = self._view, self.editor
         if view is None or not self._eligible() or not 0 <= index < len(view.entries):
             return False
@@ -714,7 +709,7 @@ class EditorPane(Vertical):
             self.editor.action_cursor_down()
 
     def action_palette_enter(self) -> None:
-        if self.palette.accept_highlighted(newline=True):
+        if self.palette.accept_highlighted():
             return
         self.palette.close()
         if not self.editor.read_only:

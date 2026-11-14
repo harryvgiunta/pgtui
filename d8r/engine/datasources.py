@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 import re
 import threading
 
@@ -22,7 +21,6 @@ class DataSource:
     doc: str
     kind: str
     dialect: str
-    dir: Path = field(default_factory=lambda: Path("."))
     con: object = field(default=None, repr=False)
     datasets: dict[str, dict] = field(default_factory=dict)
     postgres: dict = field(default_factory=dict, repr=False)

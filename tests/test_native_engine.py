@@ -3,14 +3,13 @@ from __future__ import annotations
 
 import hashlib
 import os
-from pathlib import Path
 import threading
 
 import duckdb
 import pytest
 
 from d8r.engine import (
-    POSTGRES_VERSION, DataSource, EngineError, add_parquet_source, add_postgres_source,
+    POSTGRES_VERSION, EngineError, add_parquet_source, add_postgres_source,
     cancel_source, close_source, column_values, execute_sql, load,
     refresh_source_schema, sample_rows, transaction_open,
 )

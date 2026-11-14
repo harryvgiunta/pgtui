@@ -14,11 +14,6 @@ from d8r.sql import relation_name
 from tests.d1_support import ACCOUNT_ID, API_TOKEN, DATABASE_ID, DATABASE_NAME
 
 
-def _source(**kwargs):
-    return add_d1_source("d1-test", account_id=ACCOUNT_ID, database=DATABASE_ID,
-                         api_token=API_TOKEN, **kwargs)
-
-
 def _queries(harness):
     return [json.loads(request.content)["sql"] for request in harness.requests if request.method == "POST"]
 

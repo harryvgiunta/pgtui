@@ -518,7 +518,7 @@ class FnEditor(Vertical):
             outcome = task.result()
         except Exception as exc:
             if self.is_mounted and not self.ide._closing:
-                self._status(self.session.execution_error(exc, source=self.session.sources.get(source_id)), error=True)
+                self._status(self.session.execution_error(exc), error=True)
             return
         if (not self.is_mounted or self.ide._closing or source_id != self.source_id
                 or identity != self._draft_identity):

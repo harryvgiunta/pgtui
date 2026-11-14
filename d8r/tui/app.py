@@ -663,7 +663,7 @@ class D8RApp(App):
         changed_source = page["source"] != self._workspace_key
         if changed_source:
             self._prepare_workspace_switch()
-        self.session.restore_source(page["source"], page["dialect"])
+        self.session.restore_source(page["source"])
         if changed_source:
             self._load_source_workspace(page)
         else:
@@ -1125,7 +1125,7 @@ class D8RApp(App):
         if self.refuse_busy("Run"):
             return
         self.palette.cancel_ai()
-        self.palette.sync(respect_dismissal=True)
+        self.palette.sync()
         self.run_busy = True
         self.session.busy = "Query running"
         self._set_status(f"running · {self.session.active_id} · {self.session.dialect} · cached SQL completion remains available")
@@ -1155,7 +1155,7 @@ class D8RApp(App):
         try:
             outcomes = task.result()
         except Exception as exc:
-            message = self.session.execution_error(exc, source=source)
+            message = self.session.execution_error(exc)
             outcomes = [RunOutcome(status=message, error=message)]
         if self._closing or not self.is_running:
             return
@@ -1393,7 +1393,7 @@ class D8RApp(App):
         self.save_workspace(active_view="workspace")
         self.query_one("#keymap", Static).update(KEY_HINTS)
         self.editor.focus()
-        self.palette.sync(respect_dismissal=True)
+        self.palette.sync()
 
     @on(OptionList.OptionSelected, "#fn-list")
     def _function_selected(self, event: OptionList.OptionSelected) -> None:
@@ -1753,7 +1753,7 @@ class D8RApp(App):
             entry = self.session.history[event.cursor_row]
             self._prepare_workspace_switch()
             self._cancel_connection()
-            self.session.restore_source(entry.target or entry.source, entry.dialect)
+            self.session.restore_source(entry.target or entry.source)
             if self.session.source_key() != self._workspace_key:
                 self._load_source_workspace()
             with self.prevent(Select.Changed):
