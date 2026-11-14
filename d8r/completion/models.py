@@ -57,6 +57,12 @@ class Context:
     statement_end: int = 0
     # Visible aliases include CTE aliases and explicit query aliases; avoid collisions.
     identifiers: tuple[str, ...] = ()
+    # Completion-only projection edits; None preserves older snapshot callers.
+    group_outputs: tuple[Field, ...] | None = None
+    group_expressions: tuple[str, ...] = ()
+    group_prefix: str = ""
+    group_slot: bool = False
+    relation_transition: bool = False
 
 
 @dataclass(frozen=True)

@@ -59,6 +59,8 @@ class AIDiagnosticsScreen(ModalScreen):
         self.diagnostics = diagnostics
 
     def compose(self) -> ComposeResult:
+        from .settings import binding_tooltip
+
         with Vertical(id="ai-log-screen"):
             yield Static("AI diagnostics · current chat", classes="pane-title")
             yield Static("In memory only. May contain query text and data values; review before sharing.\n"
@@ -69,7 +71,7 @@ class AIDiagnosticsScreen(ModalScreen):
             with Horizontal(id="ai-log-buttons"):
                 yield Button("Copy logs", id="ai-log-copy")
                 yield Button("Refresh", id="ai-log-refresh")
-                yield Button("Close", id="ai-log-close")
+                yield Button("Close", id="ai-log-close", tooltip=binding_tooltip(self.BINDINGS, "close"))
 
     def on_mount(self) -> None:
         self._refresh_log()
@@ -794,12 +796,15 @@ class AgentsPane(Vertical):
     }
 
     def compose(self) -> ComposeResult:
+        from .settings import binding_tooltip
+
         yield Static("Agents", classes="pane-title", markup=False)
         yield Static("", id="agents-summary", markup=False)
         yield Static("No agents yet.\nOpen Ask AI to start a chat.", id="agents-empty", markup=False)
         yield DeleteOptionList(id="agents-list")
         with Horizontal(id="agents-actions"):
-            yield Button("Delete", id="agent-delete", compact=True, disabled=True)
+            yield Button("Delete", id="agent-delete", compact=True, disabled=True,
+                         tooltip=binding_tooltip(DeleteOptionList.BINDINGS, "delete_selected", context="Agents list focused"))
         yield Static("↑/↓ select · Enter open · Delete remove", id="agents-hint", markup=False)
 
     def on_mount(self) -> None:
@@ -952,6 +957,8 @@ class AIPanel(Vertical):
         return self.chat.messages if self.chat is not None else []
 
     def compose(self) -> ComposeResult:
+        from .settings import binding_tooltip
+
         yield Static("AI assistant", classes="pane-title", id="ai-title", markup=False)
         yield Static("Document, schema, samples, functions and history may be sent to your configured provider. "
                      "Query proposals require Apply unless Auto accept is enabled. Explicitly requested function saves may persist directly. "
@@ -979,12 +986,14 @@ class AIPanel(Vertical):
         composer.border_subtitle = "Shift+Enter: newline · Enter: send"
         yield composer
         with Horizontal(classes="ai-buttons"):
-            yield Button("Send", id="ai-send", variant="primary", compact=True)
+            yield Button("Send", id="ai-send", variant="primary", compact=True,
+                         tooltip=binding_tooltip(self.BINDINGS, "send", context="AI pane focused"))
             yield Button("Cancel", id="ai-cancel", disabled=True, compact=True)
             yield Button("Apply", id="ai-apply", disabled=True, variant="success", compact=True)
         with Horizontal(classes="ai-buttons"):
             yield Button("New chat", id="ai-clear", compact=True)
-            yield Button("Agents", id="ai-agents", compact=True)
+            yield Button("Agents", id="ai-agents", compact=True,
+                         tooltip=binding_tooltip(self.app.BINDINGS, "agents"))
         with Horizontal(classes="ai-buttons"):
             yield Button("Settings", id="ai-settings", compact=True)
             yield Button("Logs", id="ai-logs", compact=True)

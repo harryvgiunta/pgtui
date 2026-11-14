@@ -36,11 +36,14 @@ class AddSourceModal(ModalScreen):
         self._generation = 0
         self._connection_form_closed = False
         self._busy = False
+        self._busy_focus = None
         self._observed_fields: tuple[str, ...] = ()
         self._reconnect_fields: tuple[str, ...] | None = None
         self._credentials_missing = False
 
     def compose(self) -> ComposeResult:
+        from .settings import binding_tooltip
+
         with VerticalScroll(id="add-source"):
             yield Label("Connect saved data source" if self._initial_profile else "Add a data source", id="add-source-title")
             yield Static("Connect PostgreSQL, Cloudflare D1 or one local Parquet file. Remember stores credentials "
@@ -96,12 +99,15 @@ class AddSourceModal(ModalScreen):
             with Horizontal(id="add-source-buttons"):
                 yield Button("Test connection", id="test")
                 yield Button("Connect" if self._initial_profile else "Add", variant="primary", id="add")
-                yield Button("Cancel", id="cancel")
+                yield Button("Cancel", id="cancel", tooltip=binding_tooltip(self.BINDINGS, "cancel"))
         progress = ConnectionStatus(id="source-connection-progress")
         progress.display = False
         yield progress
 
     def on_mount(self) -> None:
+        from .settings import binding_tooltip
+
+        self.query_one(ConnectionStatus).query_one(Button).tooltip = binding_tooltip(self.BINDINGS, "cancel")
         if self._initial_profile:
             with self.prevent(Input.Changed, Select.Changed):
                 if self._initial_profile.get("kind") == "parquet":
@@ -112,7 +118,7 @@ class AddSourceModal(ModalScreen):
                 else:
                     self._fill_postgres_profile(self._initial_profile)
             self._reconnect_fields = None if self._credentials_missing else self._fields()
-        self._show_backend()
+        self._show_backend(focus=True)
         self._observed_fields = self._fields()
         if self._credentials_missing:
             d1 = self.query_one("#source-backend", Select).value == "d1"
@@ -120,13 +126,14 @@ class AddSourceModal(ModalScreen):
                           "Saved credentials are unavailable. Re-enter the password to connect.", error=True)
             self.query_one("#d1-token" if d1 else "#postgres-password", Input).focus()
 
-    def _show_backend(self) -> None:
+    def _show_backend(self, *, focus: bool = False) -> None:
         backend = self.query_one("#source-backend", Select).value
         for name in ("parquet", "postgres", "d1"):
             self.query_one(f"#{name}-fields").display = backend == name
         self.query_one("#remember-credentials").display = backend != "parquet"
-        field = {"parquet": "parquet-path", "postgres": "postgres-host", "d1": "d1-account"}[backend]
-        self.query_one(f"#{field}", Input).focus()
+        if focus:
+            field = {"parquet": "parquet-path", "postgres": "postgres-host", "d1": "d1-account"}[backend]
+            self.query_one(f"#{field}", Input).focus()
 
     def _fields(self) -> tuple[str, ...]:
         # Keep PostgreSQL indexes (including Remember at 10) unchanged.
@@ -181,6 +188,11 @@ class AddSourceModal(ModalScreen):
         widget.set_class(error, "error")
 
     def _set_busy(self, busy: bool) -> None:
+        if busy == self._busy:
+            return
+        focused = self.focused
+        if busy:
+            self._busy_focus = focused
         self._busy = busy
         for name in ("test", "add"):
             self.query_one(f"#{name}", Button).disabled = busy
@@ -196,7 +208,21 @@ class AddSourceModal(ModalScreen):
             progress.start(target or "data source")
             progress.query_one(Button).focus()
         else:
-            self.query_one("#add", Button).focus()
+            if focused is None or focused is progress or progress in focused.ancestors:
+                restore = self._busy_focus
+                if restore is not None and restore.is_mounted and not restore.disabled:
+                    selection = restore.selection if isinstance(restore, Input) else None
+                    self.set_focus(restore)
+                    if selection is not None:
+                        def restore_selection() -> None:
+                            if self.focused is restore and not self._busy and not self._connection_form_closed:
+                                restore.selection = selection
+                        # Run after Input's Focus event, which otherwise selects
+                        # the entire field and makes the next key overwrite it.
+                        restore.call_later(restore_selection)
+                else:
+                    self.query_one("#add", Button).focus()
+            self._busy_focus = None
 
     def _invalidate(self) -> None:
         self._generation += 1

@@ -38,6 +38,11 @@ Statements execute in document order and stop at the first failure. PostgreSQL a
 DuckDB support explicit transactions; D1 does not keep transactions across HTTP
 requests. A failed statement does not undo earlier committed work.
 
+SQL failures include actionable hints for syntax, ambiguous references, missing
+objects, grouping, and type/function mismatches. PostgreSQL diagnostics retain a
+validated SQLSTATE and character position when available. Hints explain repairs
+without displaying raw driver messages, server DETAIL/HINT, or secret-bearing SQL.
+
 **Ctrl+K** previews SQL after expanding local saved functions, without connecting
 or executing. Offline checks cover lexical boundaries and template expansion only;
 the database remains the authority for SQL grammar, names and types. Semicolons
@@ -113,15 +118,22 @@ Incomplete quoted identifiers and unrelated unfinished SQL no longer disable the
 whole list. Unknown derived names/types stay unknown rather than being invented.
 
 - Prefix, word-boundary and abbreviation matches lead; typo/subsequence matches
-  are fallbacks. Relevant types/scope lead source-specific successful-query history.
-- Qualified names stay in their scope. Ambiguous columns are qualified; table
-  alternatives can insert short collision-free aliases without duplicating an
-  alias already present. Mid-token edits preserve the surrounding SQL and undo once.
+  are fallbacks. Legal clause continuations outrank unrelated routines: `inn` after
+  a relation proposes `INNER JOIN`. A changed prefix selects the new best match.
+- Qualified names stay in their scope. Ambiguous columns are qualified. Accepting
+  a FROM/JOIN table inserts a short collision-free alias by default, without duplicating
+  an existing alias or adding one to DML/DDL targets. Mid-token edits undo once.
   Explorer insertions use the same caret scope, rather than an alias from an earlier
   statement; schema-qualified table selections preserve their namespace.
-- Declared foreign keys supply JOIN predicates in both directions, including all
-  composite-key pairs. USING offers common columns. Projection stars can expand
-  into explicit fields without confusing COUNT(*) or multiplication with a wildcard.
+  Typing an alias prefix offers the relation and its qualified fields; a dot narrows
+  completion to that relation without duplicating the dot or surrounding quotes.
+- Declared foreign keys supply JOIN predicates while choosing a joined table and
+  entering ON, in both directions and with every composite-key pair. USING offers
+  common columns. Projection stars expand without confusing COUNT(*) or multiplication.
+- GROUP BY offers the full nonaggregate projection, expanding known `*`/`alias.*`
+  fields and retaining complex expressions and unaggregated dependencies of mixed
+  aggregate/window expressions. Already-grouped expressions, aliases and ordinals
+  are deduplicated. Unresolved stars are not advertised as a complete grouping list.
 - INSERT/UPDATE column lists, output aliases in ordering/grouping, native casts,
   window functions and SQL snippets are contextual rather than a global word list.
 - PostgreSQL and DuckDB routine catalogs provide real signatures, return types and
@@ -134,8 +146,10 @@ whole list. Unknown derived names/types stay unknown rather than being invented.
 
 The popup shows kind, type, provenance and documentation. Long details and AI edit
 previews scroll with Alt+Up/Down while keyboard focus stays in the editor. Local
-completion remains available during a running query. These are editor suggestions,
-not server grammar validation or a guarantee that a query will run.
+completion remains available during a running query. Typing refreshes are coalesced;
+catalog-name decoding, source snapshots and popup layout are reused. Tab flushes
+pending local work before accepting an edit. These are editor suggestions, not server
+grammar validation or a guarantee that a query will run.
 
 ### AI completion
 
@@ -165,11 +179,14 @@ existing workspace layout. Local IntelliSense is offline; optional inline AI fol
 the explicit controls above. Pages,
 functions, history and chats are isolated by connection identity. Pane resizing,
 result selection, clipboard copying and CSV export remain available.
+Hover a button to see its bound keyboard shortcut. New Query preserves the current
+draft; connection forms retain field focus and selection across edits and connection work.
 
 | Keys | Action |
 |---|---|
 | Ctrl+Enter / F5 | Run native SQL |
 | Ctrl+K / F6 | Preview expanded SQL, execute nothing |
+| Ctrl+N | New blank query; preserve current query/function/chat drafts |
 | Ctrl+O | Add PostgreSQL, Cloudflare D1 or local Parquet |
 | Ctrl+, | Settings |
 | Ctrl+J | AI agent/chat roster |

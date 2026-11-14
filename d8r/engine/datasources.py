@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 import threading
 
 from d8r.sql import ColumnDef, ForeignKey, RoutineDef, quote_identifier, relation_name
@@ -38,22 +39,80 @@ def load() -> dict[str, DataSource]:
     return {"postgres": DataSource("postgres", "PostgreSQL", "Connect to PostgreSQL or Cloudflare D1, or open a local Parquet file.", "disconnected", "postgres")}
 
 
+# These are application-authored messages, never server DETAIL/HINT or identifiers.
+_SQL_ERRORS = {
+    "42601": ("SQL syntax error", "Check clause order, commas between expressions, and matching parentheses near the error position."),
+    "42P01": ("Relation does not exist", "Check the table or CTE name, schema qualification, and aliases visible in this query scope."),
+    "42703": ("Column does not exist", "Check the column spelling and quoted case against the schema; use alias.column from a visible relation."),
+    "42702": ("Ambiguous column reference", "Qualify the reference as alias.column using the intended table or subquery alias."),
+    "42P09": ("Ambiguous relation reference", "Give each relation a distinct alias and qualify column references as alias.column."),
+    "42803": ("Invalid grouping", "Include every nonaggregate SELECT expression in GROUP BY, including all columns expanded by * or alias.*; aggregate expressions stay out of GROUP BY. Check HAVING and ORDER BY references too."),
+    "42883": ("Function or operator does not exist for these types", "Check the function or operator name, argument count and argument types; use explicit casts where appropriate."),
+    "42725": ("Ambiguous function call", "Use explicit argument casts and schema qualification to select the intended function signature."),
+    "42804": ("SQL type mismatch", "Check expression, operator and target column types; use compatible values or explicit casts."),
+    "42846": ("Unsupported type conversion", "Check the source and destination types and choose a supported conversion."),
+    "22P02": ("Invalid input for the requested type", "Check the input format and the target type of explicit or implicit casts."),
+    "22007": ("Invalid date or time format", "Use a date or time value in a format accepted by the target type."),
+    "22008": ("Date or time value out of range", "Check date and time fields and the supported range of the target type."),
+    "22003": ("Numeric value out of range", "Check numeric values and arithmetic against the range of the target type."),
+    "22012": ("Division by zero", "Check the divisor; use NULLIF with zero if a NULL result is intended."),
+    "42501": ("Permission denied", "Check privileges for the requested operation."),
+    "25006": ("Read-only execution rejected a write", "Use ordinary Run only if the write is intended."),
+    "57014": ("Query cancelled or deadline exceeded", ""),
+    "25P02": ("Transaction is aborted; issue ROLLBACK", ""),
+    "23505": ("Unique constraint violation", "Check for duplicate values in a unique or primary key."),
+    "23503": ("Foreign key constraint violation", "Check that referenced rows exist and are not still referenced when deleting or updating them."),
+    "28P01": ("Authentication failed", "Check the selected source credentials."),
+}
+
+
+def _sql_error_message(state: str, suffix: str = "") -> str:
+    label, hint = _SQL_ERRORS[state]
+    return label + suffix + (". Hint: " + hint if hint else "")
+
+
+_DUCK_ERROR_PATTERNS = tuple((re.compile(pattern), state) for pattern, state in (
+    (r'Binder Error: Ambiguous reference to column name ', "42702"),
+    (r'Binder Error: (?:column .{1,512} must appear in the GROUP BY clause|GROUP BY clause cannot contain aggregates|Aggregates cannot be present in a GROUP BY clause|Cannot mix aggregates with non-aggregated columns|aggregate function calls cannot be nested)', "42803"),
+    (r'Binder Error: (?:Referenced column .{1,512} not found in FROM clause|Values list .{1,512} does not have a column named)', "42703"),
+    (r'(?:Catalog Error: Table with name .{1,512} does not exist|Binder Error: Referenced table .{1,512} not found)', "42P01"),
+    (r'(?:Catalog Error: (?:Scalar|Aggregate|Table) Function with name .{1,512} does not exist|Binder Error: No function matches the given name and argument types)', "42883"),
+    (r'Binder Error: (?:Cannot mix values of type|Cannot compare values of type|Cannot combine types|Cannot concatenate types)', "42804"),
+))
+
+
 def _safe_error(exc: Exception, operation: str = "SQL execution") -> EngineError:
-    # Driver messages may contain a password, URL, query literal, or server DETAIL.
-    # Only structured, strictly validated diagnostics cross this boundary.
-    state = getattr(exc, "sqlstate", None)
-    suffix = f" [SQLSTATE {state}]" if isinstance(state, str) and len(state) == 5 and state.isascii() and state.isalnum() else ""
-    position = getattr(getattr(exc, "diag", None), "statement_position", None)
-    if position is not None and str(position).isascii() and str(position).isdigit():
-        suffix += f" at character {position}"
-    categories = {
-        "42601": "SQL syntax error", "42P01": "Relation does not exist",
-        "42703": "Column does not exist", "42501": "Permission denied",
-        "25006": "Read-only execution rejected a write", "57014": "Query cancelled or deadline exceeded",
-        "25P02": "Transaction is aborted; issue ROLLBACK", "23505": "Unique constraint violation",
-        "23503": "Foreign key constraint violation", "28P01": "Authentication failed",
-    }
-    return EngineError(categories.get(state, f"{operation} failed") + suffix)
+    # Only real driver diagnostics qualify. Arbitrary exceptions are never read
+    # or stringified; DuckDB has no SQLSTATE, so classify bounded known formats.
+    import duckdb
+    import psycopg
+
+    if isinstance(exc, psycopg.Error):
+        state = exc.sqlstate
+        valid_state = isinstance(state, str) and re.fullmatch(r"[0-9A-Z]{5}", state) is not None
+        suffix = f" [SQLSTATE {state}]" if valid_state else ""
+        position = exc.diag.statement_position
+        if isinstance(position, str) and re.fullmatch(r"[0-9]{1,10}", position) and 0 < int(position) <= 2147483647:
+            suffix += f" at character {int(position)}"
+        if valid_state and state in _SQL_ERRORS:
+            return EngineError(_sql_error_message(state, suffix))
+        return EngineError(f"{operation} failed" + suffix)
+    if isinstance(exc, duckdb.Error):
+        state = None
+        if isinstance(exc, duckdb.ParserException):
+            state = "42601"
+        elif isinstance(exc, duckdb.ConversionException):
+            state = "22P02"
+        elif isinstance(exc, duckdb.OutOfRangeException):
+            state = "22003"
+        elif isinstance(exc, duckdb.InterruptException):
+            state = "57014"
+        elif isinstance(exc, (duckdb.BinderException, duckdb.CatalogException)):
+            message = str(exc)[:2048].split("\n", 1)[0]
+            state = next((code for pattern, code in _DUCK_ERROR_PATTERNS if pattern.match(message)), None)
+        if state is not None:
+            return EngineError(_sql_error_message(state))
+    return EngineError(f"{operation} failed")
 
 
 def add_postgres_source(source_id, *, host, port=5432, database, user, password,

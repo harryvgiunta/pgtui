@@ -183,6 +183,9 @@ class CommandPalette(OptionList):
         self._preview_document: str | None = None
         self._sync_pending = False
         self._sync_scheduled = False
+        self._placement_scheduled = False
+        self._detail_layout: tuple[str, int] | None = None
+        self._detail_lines = 0
         self._generation = 0
         self._ai_task: asyncio.Task | None = None
         self._ai_snapshot: tuple | None = None
@@ -220,13 +223,10 @@ class CommandPalette(OptionList):
 
     def _snapshot(self) -> tuple:
         editor = self.editor
-        temporary_target = self.source_id is not None and self.source_id != self.session.active_id
         with self.session.target_source(self.source_id):
             source = self.session.source
             schema = self.session.schema
-            # Temporary source scopes rebuild equal schemas; compare their cached
-            # metadata identities instead. Retain references against identity reuse.
-            schema_identity = (id(source.datasets), id(source.routines)) if temporary_target else id(schema)
+            schema_identity = id(schema)
             return (editor.text, editor.cursor_location, source, id(source), schema, schema_identity,
                     tuple(schema.fns), self._parameters(), self.session.ai_config,
                     getattr(self.app, "_document_identity", None),
@@ -287,7 +287,8 @@ class CommandPalette(OptionList):
         self._sync_pending = True
         if not self._sync_scheduled:
             self._sync_scheduled = True
-            self.call_later(self._flush_queued_sync)
+            # Coalesce key-repeat and selection messages without delaying Tab.
+            self.set_timer(0.025, self._flush_queued_sync)
 
     def _flush_queued_sync(self) -> None:
         self._sync_scheduled = False
@@ -336,16 +337,14 @@ class CommandPalette(OptionList):
             view = view_for(self.session, editor.text, editor.document[row], column,
                             parameters=self._parameters(), row=row, query_history=False)
         choices = [] if view is None else [index for index, entry in enumerate(view.entries)
-                                          if entry.table == table]
+                                          if entry.table == table and entry.kind == "table"]
         if not choices:
             return False
         self.cancel_ai()
         self.screen.set_focus(editor)
         editor.scroll_cursor_visible()
         self._show(view)
-        # The explicit alias alternative follows the plain table; an existing
-        # alias suppresses that alternative in the proposal engine.
-        return self._accept(choices[-1])
+        return self._accept(choices[0])
 
     def manual_local(self) -> None:
         self.cancel_ai()
@@ -425,7 +424,9 @@ class CommandPalette(OptionList):
 
     def _show(self, view: View) -> None:
         identity = None
-        if self._view and self.highlighted is not None and self.highlighted < len(self._view.entries):
+        if (self._view is not None
+                and (self._view.start, self._view.token, self._view.phase) == (view.start, view.token, view.phase)
+                and self.highlighted is not None and self.highlighted < len(self._view.entries)):
             identity = self._view.entries[self.highlighted].identity
         previous = self._view
         self._view = view
@@ -435,14 +436,23 @@ class CommandPalette(OptionList):
                        for entry in view.entries]
             self._preferred_width = min(86, max(40, max((item.cell_length for item in prompts), default=40) + 5))
             self.add_options(Option(item, id=f"opt-{index}") for index, item in enumerate(prompts))
-            self.highlighted = next((i for i, entry in enumerate(view.entries)
-                                     if entry.identity == identity), 0) if view.entries else None
+        self.highlighted = next((i for i, entry in enumerate(view.entries)
+                                 if entry.identity == identity), 0) if view.entries else None
         if view.entries:
             self.add_class("open")
         else:
             self.remove_class("open")
         self.reposition()
-        self.call_after_refresh(self.reposition)
+        self.queue_reposition()
+
+    def queue_reposition(self) -> None:
+        if not self._placement_scheduled:
+            self._placement_scheduled = True
+            self.call_after_refresh(self._flush_reposition)
+
+    def _flush_reposition(self) -> None:
+        self._placement_scheduled = False
+        self.reposition()
 
     def _detail_content(self) -> Content:
         parts: list = []
@@ -472,11 +482,11 @@ class CommandPalette(OptionList):
     def _render_details(self) -> None:
         if self.details is not None:
             content = self._detail_content()
-            self.details.update(content)
-            self.details.display = bool(content.plain.strip())
-            self._place()
+            if content != self.details.content:
+                self.details.update(content)
+            self.styles.visibility = "visible" if self._place(content) else "hidden"
 
-    def _place(self) -> bool:
+    def _place(self, detail: Content) -> bool:
         pane, editor = self.parent, self.editor
         if editor is None or pane is None:
             return False
@@ -489,10 +499,13 @@ class CommandPalette(OptionList):
         below, above = visible.bottom - caret.y - 1, caret.y - visible.y
         below_caret = below >= min(self.option_count, 8) + 5 or below >= above
         available = below if below_caret else above
-        detail = self._detail_content()
         detail_width = min(86, max((cell_len(line) for line in detail.plain.splitlines()), default=0) + 6)
         width = min(max(self._preferred_width, detail_width), visible.width)
-        detail_lines = len(Text(detail.plain).wrap(self.app.console, max(1, width - 6)))
+        layout = (detail.plain, width)
+        if layout != self._detail_layout:
+            self._detail_layout = layout
+            self._detail_lines = len(Text(detail.plain).wrap(self.app.console, max(1, width - 6)))
+        detail_lines = self._detail_lines
         detail_height = min(8, max(3, detail_lines + 2), max(0, available - 3)) if detail.plain.strip() else 0
         height = min(min(self.option_count, 10) + 2, available - detail_height) if self.option_count and self.is_open else 0
         if height < 3:
@@ -513,7 +526,6 @@ class CommandPalette(OptionList):
 
     def reposition(self) -> None:
         self._render_details()
-        self.styles.visibility = "visible" if self._place() else "hidden"
         self._publish_history_preview()
 
     def _hide(self) -> None:
@@ -566,16 +578,14 @@ class CommandPalette(OptionList):
             self.scroll_to_highlight()
 
     def accept_highlighted(self, *, newline: bool = False) -> bool:
-        self.flush_sync()
         self._guard_ai()
-        if self._view is not None and self._view.phase != "ai":
+        if self._sync_pending or (self._view is not None and self._view.phase != "ai"):
             self.sync(respect_dismissal=True)
         return self._accept(self.highlighted, newline=newline) if self.highlighted is not None else False
 
     def accept(self, index: int, *, newline: bool = False) -> bool:
-        self.flush_sync()
         self._guard_ai()
-        if self._view is not None and self._view.phase != "ai":
+        if self._sync_pending or (self._view is not None and self._view.phase != "ai"):
             self.sync(respect_dismissal=True)
         return self._accept(index, newline=newline)
 
@@ -659,7 +669,7 @@ class EditorPane(Vertical):
         self.watch(self.editor, "scroll_y", self._queue_palette_placement, init=False)
 
     def _queue_palette_placement(self) -> None:
-        self.call_after_refresh(self.palette.reposition)
+        self.palette.queue_reposition()
 
     def on_resize(self) -> None:
         self.call_after_refresh(self._resize_palette)

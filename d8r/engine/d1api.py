@@ -20,7 +20,7 @@ from uuid import UUID
 import httpx
 
 from d8r.sql import ColumnDef, ForeignKey, lex_sql, relation_name
-from .datasources import DataSource, EngineError
+from .datasources import DataSource, EngineError, _sql_error_message
 
 _API = "https://api.cloudflare.com/client/v4"
 MAX_RESPONSE_BYTES = 50_000_000
@@ -41,6 +41,35 @@ _CONTROL_OPCODES = frozenset({
     "VUpdate", "VRename", "Vacuum", "IncrVacuum", "Checkpoint", "JournalMode",
     "AutoCommit", "Savepoint", "SqlExec", "Expire", "Pagecount", "MaxPgcnt",
 })
+
+# Cloudflare/SQLite expose text rather than PostgreSQL diagnostics. Match only
+# bounded, anchored native error formats, then discard every remote character.
+_D1_ERROR_PATTERNS = tuple((re.compile(pattern), state) for pattern, state in (
+    (r'(?:near ".{0,512}": syntax error|incomplete input|unrecognized token:)', "42601"),
+    (r'ambiguous column name:', "42702"),
+    (r'no such table:', "42P01"),
+    (r'(?:no such column:|table .{1,512} has no column named)', "42703"),
+    (r'(?:no such function:|wrong number of arguments to function)', "42883"),
+    (r'(?:misuse of aggregate(?: function)?|aggregate functions are not allowed in the GROUP BY clause|HAVING clause on a non-aggregate query)', "42803"),
+    (r'(?:datatype mismatch|cannot store .{1,512} value in .{1,512} column)', "42804"),
+    (r'UNIQUE constraint failed:', "23505"),
+    (r'FOREIGN KEY constraint failed', "23503"),
+))
+
+
+def _d1_error(payload, fallback):
+    errors = payload.get("errors", [])
+    messages = [payload.get("error")]
+    if isinstance(errors, list):
+        messages.extend(error.get("message") for error in errors[:8] if isinstance(error, dict))
+    for message in messages:
+        if not isinstance(message, str):
+            continue
+        message = message[:2048].removeprefix("D1_ERROR: ")
+        for pattern, state in _D1_ERROR_PATTERNS:
+            if pattern.match(message):
+                return EngineError("Cloudflare D1: " + _sql_error_message(state) + " " + _UNCERTAIN)
+    return EngineError(fallback + " " + _UNCERTAIN)
 
 
 def create_client() -> httpx.Client:
@@ -129,7 +158,9 @@ class CloudflareD1:
                                               "Accept-Encoding": "identity"},
                                      follow_redirects=False, timeout=remaining) as response:
                 operation.remaining()
-                if response.status_code < 200 or response.status_code >= 300:
+                http_failed = response.status_code < 200 or response.status_code >= 300
+                sql_request = method == "POST" and suffix.endswith("/raw")
+                if http_failed and not (sql_request and response.status_code == 400):
                     raise EngineError(f"Cloudflare D1 request failed (HTTP {response.status_code}). " + _UNCERTAIN)
                 if response.headers.get("content-encoding", "identity").lower() != "identity":
                     raise EngineError("Cloudflare D1 returned an unsupported compressed response")
@@ -150,8 +181,13 @@ class CloudflareD1:
                 raise _malformed()
             if "errors" in payload and not isinstance(payload["errors"], list):
                 raise _malformed()
+            if http_failed:
+                raise _d1_error(payload, f"Cloudflare D1 request failed (HTTP {response.status_code}).")
             if payload.get("success") is not True or payload.get("errors"):
-                raise EngineError("Cloudflare D1 rejected the request. " + _UNCERTAIN)
+                fallback = "Cloudflare D1 rejected the request."
+                if sql_request:
+                    raise _d1_error(payload, fallback)
+                raise EngineError(fallback + " " + _UNCERTAIN)
             if not isinstance(payload.get("result"), list):
                 raise _malformed()
             operation.remaining()
@@ -211,7 +247,7 @@ class CloudflareD1:
         if "errors" in result and not isinstance(result["errors"], list):
             raise _malformed()
         if result.get("success") is not True or result.get("error") or result.get("errors"):
-            raise EngineError("Cloudflare D1 statement failed. " + _UNCERTAIN)
+            raise _d1_error(result, "Cloudflare D1 statement failed.")
         raw = result.get("results")
         if not isinstance(raw, dict):
             raise _malformed()

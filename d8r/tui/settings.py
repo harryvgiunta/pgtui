@@ -53,6 +53,17 @@ class Row:
     value: str = ""
 
 
+def binding_tooltip(bindings: list[Binding], action: str, *, context: str = "") -> str:
+    """Describe an actual binding, with its focus scope when it is local."""
+    matches = [binding for binding in bindings if binding.action == action]
+    keys = " / ".join(
+        binding.key_display or "+".join(part.title() for part in binding.key.split(",")[0].split("+"))
+        for binding in matches
+    )
+    description = matches[0].description if matches else ""
+    return f"{description} · {keys}" + (f" · {context}" if context else "") if matches else ""
+
+
 def binding_rows() -> list[Row]:
     """Every key the IDE answers to, read from the classes that declare them.
 
@@ -64,6 +75,8 @@ def binding_rows() -> list[Row]:
     from .app import D8RApp
     from .results import ResultsTable
     from .palette import EditorPane
+    from .ai import AIDiagnosticsScreen, AIPanel, DeleteOptionList
+    from .results import ExportModal
 
     groups = (
         ("app", D8RApp.BINDINGS),
@@ -71,6 +84,13 @@ def binding_rows() -> list[Row]:
         ("results", ResultsTable.BINDINGS),
         ("settings", SettingsScreen.BINDINGS),
         ("add source", AddSourceModal.BINDINGS),
+        ("AI", AIPanel.BINDINGS),
+        ("AI logs", AIDiagnosticsScreen.BINDINGS),
+        ("page / agent lists", DeleteOptionList.BINDINGS),
+        ("export", ExportModal.BINDINGS),
+        ("default rows", DefaultRowsScreen.BINDINGS),
+        ("value cache limit", ValueCacheLimitScreen.BINDINGS),
+        ("AI provider", AIProviderScreen.BINDINGS),
         # Only what the framework still answers to: `IdeScreen` drops Textual's
         # tab/shift+tab focus keys, so listing them would be a lie.
         ("textual", TextualApp.BINDINGS),
@@ -382,7 +402,7 @@ class DefaultRowsScreen(ModalScreen[None]):
             yield Static("", id="rows-settings-error", markup=False)
             with Horizontal(id="rows-settings-buttons"):
                 yield Button("Save", id="rows-settings-save", variant="primary")
-                yield Button("Cancel", id="rows-settings-cancel")
+                yield Button("Cancel", id="rows-settings-cancel", tooltip=binding_tooltip(self.BINDINGS, "cancel"))
 
     def on_mount(self) -> None:
         self.query_one("#default-rows", Input).focus()
@@ -442,7 +462,7 @@ class ValueCacheLimitScreen(ModalScreen[None]):
             yield Static("", id="value-cache-settings-error", markup=False)
             with Horizontal(id="value-cache-settings-buttons"):
                 yield Button("Save", id="value-cache-settings-save", variant="primary")
-                yield Button("Cancel", id="value-cache-settings-cancel")
+                yield Button("Cancel", id="value-cache-settings-cancel", tooltip=binding_tooltip(self.BINDINGS, "cancel"))
 
     def on_mount(self) -> None:
         self.query_one("#value-cache-limit", Input).focus()
@@ -534,7 +554,7 @@ class AIProviderScreen(ModalScreen[None]):
             with Horizontal(id="ai-settings-buttons"):
                 yield Button("Save", id="ai-settings-save", variant="primary")
                 yield Button("Import yolo key", id="ai-settings-import")
-                yield Button("Cancel", id="ai-settings-cancel")
+                yield Button("Cancel", id="ai-settings-cancel", tooltip=binding_tooltip(self.BINDINGS, "cancel"))
 
     def on_mount(self) -> None:
         self.query_one(f"#{self.focus_field}", Input).focus()

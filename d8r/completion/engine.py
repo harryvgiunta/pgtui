@@ -10,6 +10,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import replace
 from datetime import date, datetime, time
 from decimal import Decimal
+from functools import lru_cache
 from itertools import chain
 import math
 import re
@@ -27,8 +28,15 @@ Usage = Mapping[tuple[str, str, str], int]
 Values = Callable[[str, str], tuple[list[object], bool] | None]
 
 
-def _parts(name: str, dialect: str) -> tuple[str, ...]:
+def _decode_parts(name: str, dialect: str) -> tuple[str, ...]:
     return relation_parts(name, dialect=dialect) or (name,)
+
+
+_cached_parts = lru_cache(maxsize=8192)(_decode_parts)
+
+
+def _parts(name: str, dialect: str) -> tuple[str, ...]:
+    return (_cached_parts if len(name) <= 512 else _decode_parts)(name, dialect)
 
 
 def _identifier(name: str, dialect: str, quote: str = "") -> str:
@@ -187,7 +195,7 @@ def _field_relevance(field: Field, expected: str, outer: bool = False) -> int:
     return int(outer) * 2 + (int(_type_family(field.type) != target) if target else 0)
 
 
-def _columns(context: Context, offers: _Offers, dialect: str, expected: str) -> None:
+def _columns(context: Context, offers: _Offers, dialect: str, expected: str, following_dot: bool = False) -> None:
     relations = context.relations
     if context.qualifier:
         qualifier = _parts(context.qualifier, dialect)
@@ -205,6 +213,14 @@ def _columns(context: Context, offers: _Offers, dialect: str, expected: str) -> 
         intersection = {field.name for field in context.join_target.fields}
         intersection &= {field.name for relation in context.join_left for field in relation.fields}
     for relation in relations:
+        alias_match = (not context.qualifier and bool(context.token)
+                       and context.clause not in _COLUMN_CLAUSES
+                       and _parts(relation.reference, dialect)[-1].casefold().startswith(context.token.casefold()))
+        if alias_match:
+            reference = (_identifier(_parts(relation.reference, dialect)[-1], dialect, context.quote)
+                         if context.quote else relation.reference)
+            offers.add(Suggestion(reference, reference, "relation alias", "alias"),
+                       name=_parts(reference, dialect)[-1], relevance=-1)
         for field in relation.fields:
             if context.clause in _COLUMN_CLAUSES and field.name in used:
                 continue
@@ -221,12 +237,26 @@ def _columns(context: Context, offers: _Offers, dialect: str, expected: str) -> 
             offers.add(item, name=field.name, relevance=_field_relevance(field, expected, relation.outer),
                        category="column", table=field.table or relation.table or "",
                        usage_name=field.column or field.name)
+            if alias_match and not following_dot:
+                reference = relation.reference
+                # The current quote belongs to the alias component, not its fields.
+                if context.quote:
+                    reference = _identifier(_parts(reference, dialect)[-1], dialect, context.quote)
+                qualified_insert = reference + "." + _identifier(field.name, dialect)
+                offers.add(Suggestion(relation.reference + "." + field.name, qualified_insert,
+                                      detail, "column", field.doc),
+                           name=_parts(relation.reference, dialect)[-1],
+                           relevance=_field_relevance(field, expected, relation.outer),
+                           category="column", table=field.table or relation.table or "",
+                           usage_name=field.column or field.name)
             if context.clause in {"update_set", "set"}:
                 offers.add(Suggestion(label + " =", insert + " = ", detail, "assignment", field.doc),
                            name=field.name, relevance=1, category="column",
                            table=field.table or relation.table or "", usage_name=field.column or field.name)
     if context.clause in {"group", "group_by", "order", "order_by", "qualify"} and not context.qualifier:
-        for field in context.outputs:
+        outputs = (context.group_outputs if context.clause in {"group", "group_by"}
+                   and context.group_outputs is not None else context.outputs)
+        for field in outputs:
             offers.add(Suggestion(field.name, _identifier(field.name, dialect, context.quote),
                                   field.type or "output alias", "alias", field.doc),
                        name=field.name, relevance=0)
@@ -284,33 +314,67 @@ def _has_following_alias(document: str, end: int) -> bool:
                 and match.group(1).upper() not in keywords_for("duckdb"))
 
 
+def _following_alias(document: str, end: int) -> tuple[str, int] | None:
+    if not _has_following_alias(document, end):
+        return None
+    suffix = _following(document, end)
+    if re.match(r"AS\b", suffix, re.I):
+        suffix = _following(document, len(document) - len(suffix) + 2)
+    match = re.match(r'([A-Za-z_][A-Za-z_0-9$]*|"(?:[^"]|"")+"|`(?:[^`]|``)+`|\[[^\]]+\])', suffix)
+    if match:
+        return match.group(), len(document) - len(suffix) + match.end()
+    return None
+
+
 def _tables(document: str, context: Context, schema: SchemaContext, offers: _Offers, dialect: str) -> None:
     qualifier = _parts(context.qualifier, dialect) if context.qualifier else ()
+    following_dot = _following(document, context.end).startswith(".")
+    following_alias = _following_alias(document, context.end)
+    alias_allowed = (context.clause in {"from", "join"}
+                     and not _has_following_alias(document, context.end)
+                     and not _following(document, context.end).startswith((".", "(")))
     for relation in context.ctes:
-        if qualifier:
+        if qualifier or following_dot:
             continue
-        offers.add(Suggestion(relation.name, _identifier(relation.name, dialect, context.quote),
-                              relation.doc or "common table expression", "cte"),
-                   name=relation.name, relevance=0)
+        name = _parts(relation.name, dialect)[-1]
+        insert = _identifier(name, dialect, context.quote)
+        if alias_allowed:
+            insert += " AS " + _identifier(_alias(name, context), dialect)
+        offers.add(Suggestion(relation.name, insert, relation.doc or "common table expression", "cte"),
+                   name=name, relevance=0)
     for table in schema.tables:
         parts = _parts(table.name, dialect)
-        if qualifier and parts[:-1] != qualifier:
+        if following_dot or (qualifier and parts[:-1] != qualifier):
+            continue
+        if _match(context.token, parts[-1]) is None:
             continue
         insert = (_identifier(parts[-1], dialect, context.quote) if qualifier or len(parts) == 1
                   else _qualified(table.name, dialect))
         label = parts[-1] if qualifier else table.name
+        alias = _identifier(_alias(parts[-1], context), dialect) if alias_allowed else ""
+        if alias:
+            insert += " AS " + alias
         offers.add(Suggestion(label, insert, table.doc or "table", "table", table.doc, table=table.name),
                    name=parts[-1], relevance=1, category="dataset", usage_name=table.name)
-        if context.clause in {"from", "join"} and not context.quote and not _has_following_alias(document, context.end):
-            alias = _alias(parts[-1], context)
-            offers.add(Suggestion(label + " AS " + alias, insert + " AS " + alias,
-                                  "table with unused alias", "table", table.doc, table=table.name),
-                       name=parts[-1], relevance=2, category="dataset", usage_name=table.name)
+        reference = alias or (following_alias[0] if following_alias else "")
+        join_end = following_alias[1] if following_alias else context.end
+        if (context.clause == "join" and reference
+                and not re.match(r"(?:ON|USING)\b", _following(document, join_end), re.I)):
+            target = Relation(table.name, reference,
+                              tuple(Field(c.name, c.type, table.name, c.name) for c in table.columns),
+                              table.name, foreign_keys=table.foreign_keys)
+            for left in context.join_left:
+                for source, other in ((left, target), (target, left)):
+                    for condition in _fk_conditions(source, other, dialect):
+                        join_insert = insert + (document[context.end:join_end] if following_alias else "")
+                        offers.add(Suggestion(label + " ON " + condition, join_insert + " ON " + condition,
+                                              "table and foreign-key join", "join", end=join_end, table=table.name),
+                                   name=parts[-1], relevance=0)
     if not qualifier:
         schemas = {_parts(table.name, dialect)[0] for table in schema.tables
                    if len(_parts(table.name, dialect)) > 1}
         for name in schemas:
-            offers.add(Suggestion(name + ".", _identifier(name, dialect, context.quote) + ".",
+            offers.add(Suggestion(name + ".", _identifier(name, dialect, context.quote) + ("" if following_dot else "."),
                                   "schema", "schema"), name=name, relevance=3)
 
 
@@ -321,12 +385,13 @@ def _functions(document: str, context: Context, schema: SchemaContext,
     has_paren = following.startswith("(")
     call_end = len(document) - len(following) + 1 if has_paren else None
     call_suffix = document[context.end:call_end] if has_paren else "()"
+    available = _routines(schema, dialect)
+    entries = [(routine, _parts(routine.name, dialect)) for routine in available]
     namespaces: dict[str, set[tuple[str, ...]]] = {}
     if not qualifier:
-        for routine in _routines(schema, dialect):
-            parts = _parts(routine.name, dialect)
+        for routine, parts in entries:
             namespaces.setdefault(parts[-1], set()).add(parts)
-    for routine in _routines(schema, dialect):
+    for routine, parts in entries:
         if routine.kind == "syntax":
             continue
         if context.clause == "call" and context.call is None:
@@ -338,8 +403,9 @@ def _functions(document: str, context: Context, schema: SchemaContext,
                 continue
         elif routine.kind in {"table", "procedure"}:
             continue
-        parts = _parts(routine.name, dialect)
         if qualifier and parts[:-1] != qualifier:
+            continue
+        if _match(context.token, parts[-1]) is None:
             continue
         implicit = (len(parts) > 1 and parts[0] in {"pg_catalog", schema.default_schema}
                     and len(namespaces.get(parts[-1], ())) <= 1)
@@ -380,7 +446,7 @@ def _fk_conditions(source: Relation, target: Relation, dialect: str) -> Iterable
             yield " AND ".join(pairs)
 
 
-def _joins(context: Context, offers: _Offers, dialect: str) -> None:
+def _joins(document: str, context: Context, offers: _Offers, dialect: str) -> None:
     if context.join_target is None or context.clause not in {"on", "join_condition", "join"}:
         return
     if context.qualifier and not any(_same_name(relation.reference, context.qualifier, dialect)
@@ -394,10 +460,13 @@ def _joins(context: Context, offers: _Offers, dialect: str) -> None:
                 # prefixes must be replaced too or they would be duplicated.
                 start = context.start
                 if context.qualifier:
-                    start -= len(context.qualifier) + 1
+                    prefix = document[context.statement_start:context.start]
+                    match = re.search(re.escape(context.qualifier) + r"\s*\.\s*$", prefix)
+                    start = context.statement_start + match.start() if match else start - len(context.qualifier) - 1
                 offers.add(Suggestion(insert, insert, "foreign-key join", "join",
                                       start=max(context.statement_start, start), end=context.end),
-                           name=condition, relevance=0, force=not context.token)
+                           name=insert, relevance=-1,
+                           force=not context.token or (context.clause == "join" and "on".startswith(context.token.casefold())))
 
 
 def _star(document: str, context: Context, offers: _Offers, dialect: str) -> None:
@@ -530,9 +599,28 @@ _CLAUSE_KEYWORDS = {
 
 def _syntax(document: str, context: Context, offers: _Offers, dialect: str) -> None:
     native = keywords_for(dialect)
-    for word in _CLAUSE_KEYWORDS.get(context.clause, "AND OR NOT NULL CASE").split():
-        if word in native:
+    words = _CLAUSE_KEYWORDS.get(context.clause, "AND OR NOT NULL CASE").split()
+    if context.clause == "from" and not context.relation_transition:
+        words = ["LATERAL"]
+    for word in words:
+        if word in native and word not in {"LEFT", "RIGHT", "INNER", "FULL", "CROSS"}:
             offers.add(Suggestion(word, word, "native SQL keyword", "keyword"), relevance=4)
+    if context.relation_transition and context.clause in {"from", "on"}:
+        for word in ("INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL"):
+            if word in native:
+                label = word + " JOIN"
+                offers.add(Suggestion(label, label + " ", "native join clause", "snippet"), relevance=-2)
+        for label in ("WHERE", "GROUP BY", "ORDER BY", "LIMIT"):
+            offers.add(Suggestion(label, label + " ", "native query clause", "keyword"), relevance=3)
+    if context.group_expressions:
+        in_group = context.clause in {"group", "group_by"}
+        prefix = context.group_prefix if in_group else "GROUP BY "
+        eligible = (context.group_slot if in_group else not context.token or "group by".startswith(context.token.casefold()))
+        if eligible:
+            offers.add(Suggestion("GROUP BY all nonaggregate SELECT expressions",
+                                  prefix + ", ".join(context.group_expressions),
+                                  "complete nonaggregate projection; known stars expanded", "snippet"),
+                       force=True, relevance=-2)
     snippets: list[tuple[str, str, int, str]] = []
     if context.clause in {"select", "where", "having", "on", "update_set", "set", "returning"}:
         snippets.extend((("CASE WHEN", "CASE WHEN  THEN  ELSE  END", 16, "conditional expression"),
@@ -549,9 +637,10 @@ def _syntax(document: str, context: Context, offers: _Offers, dialect: str) -> N
                          ("IN", "IN ()", 1, "membership predicate")))
     if context.clause in {"select", "window"}:
         snippets.append(("OVER", "OVER (PARTITION BY  ORDER BY )", 11, "window specification"))
-    if context.clause in {"from", "where", "group", "group_by", "having", "order", "order_by"}:
-        snippets.extend((("GROUP BY", "GROUP BY ", 0, "group rows"),
-                         ("ORDER BY", "ORDER BY ", 0, "sort rows")))
+    if context.clause in {"from", "where", "on", "having"}:
+        snippets.append(("GROUP BY", "GROUP BY ", 0, "group rows"))
+    if context.clause in {"from", "where", "on", "group", "group_by", "having"}:
+        snippets.append(("ORDER BY", "ORDER BY ", 0, "sort rows"))
     if context.clause == "select" and not context.token:
         for relation in context.relations:
             if relation.outer or not relation.fields:
@@ -612,10 +701,12 @@ def complete(document: str, offset: int, schema: SchemaContext, *, dialect: str 
     if context.token == "*":
         return Completion(context, offers.result(), signature)
     relation_only = context.clause in _RELATION_CLAUSES and context.call is None
+    transition = context.relation_transition and context.call is None
     if relation_only:
-        _tables(document, context, schema, offers, dialect)
+        if not transition:
+            _tables(document, context, schema, offers, dialect)
     elif context.clause != "call" or context.call is not None:
-        _columns(context, offers, dialect, expected)
+        _columns(context, offers, dialect, expected, _following(document, context.end).startswith("."))
         if not context.relations and not context.qualifier and context.clause in {"select", "statement"}:
             # SchemaContext owns this precomputed pool; never build global columns
             # for a query whose visible relations already determine its fields.
@@ -626,14 +717,14 @@ def complete(document: str, offset: int, schema: SchemaContext, *, dialect: str 
                                       field.type + " · " + ", ".join(field.tables), "column", field.doc),
                            name=field.name, relevance=3, category="column",
                            table=table)
-    if context.clause not in _COLUMN_CLAUSES:
+    if context.clause not in _COLUMN_CLAUSES and not transition:
         # A qualifier belonging to a relation resolves columns only, not global
         # functions. Unknown qualifiers can resolve a real native routine schema.
         relation_qualifier = context.qualifier and any(
             _same_name(relation.reference, context.qualifier, dialect) for relation in context.relations)
         if not relation_qualifier:
             _functions(document, context, schema, offers, dialect, relation_only)
-    _joins(context, offers, dialect)
+    _joins(document, context, offers, dialect)
     _values(context, offers, dialect, values)
     if not context.qualifier and not context.quote:
         syntax_context = (replace(context, clause="select")

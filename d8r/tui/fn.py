@@ -119,12 +119,15 @@ class FnEditor(Vertical):
         return self.ide.session
 
     def compose(self) -> ComposeResult:
+        from .settings import binding_tooltip
+
         with Horizontal(id="fn-actions", classes="pane-controls"):
             yield Static("Function", classes="pane-title")
             yield Button("Ask AI", id="fn-ai", compact=True)
-            yield Button("Query", id="fn-back", compact=True)
+            yield Button("Query", id="fn-back", compact=True,
+                         tooltip=binding_tooltip(self.ide.BINDINGS, "back_or_quit", context="Preserve function draft"))
             yield Button(Text("[x]"), id="fn-close", classes="pane-close", compact=True,
-                         tooltip="Return to query · preserve function draft")
+                         tooltip=binding_tooltip(self.ide.BINDINGS, "back_or_quit", context="Preserve function draft"))
         with VerticalScroll(id="fn-editor"):
             yield Select(
                 self.session.source_options(),
@@ -152,8 +155,12 @@ class FnEditor(Vertical):
                 )
         with Horizontal(id="fn-buttons"):
             yield Button("Save", id="fn-save", variant="primary", compact=True)
-            yield Button("Run preview", id="fn-preview", compact=True)
-            yield Button("Delete", id="fn-delete", variant="error", compact=True)
+            yield Button("Run preview", id="fn-preview", compact=True,
+                         tooltip=binding_tooltip(self.ide.BINDINGS, "preview_function") + " · "
+                         + binding_tooltip(self.ide.BINDINGS, "run_or_chat") + " / "
+                         + binding_tooltip(self.ide.BINDINGS, "run") + " · Function editor focused; saves then runs")
+            yield Button("Delete", id="fn-delete", variant="error", compact=True,
+                         tooltip=binding_tooltip(self.ide.BINDINGS, "delete_function", context="Function editor focused"))
         yield Static("", id="fn-status", markup=False)
 
     def on_mount(self) -> None:

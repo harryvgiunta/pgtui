@@ -6,7 +6,7 @@ from dataclasses import replace
 from functools import wraps
 
 import pytest
-from textual.widgets import Input, Tree
+from textual.widgets import Input, Static, Tree
 
 from d8r.ai import sql_completion
 from d8r.ai.client import AIConfig
@@ -465,3 +465,76 @@ async def test_explorer_qualified_postgres_table_keeps_schema_prefix(postgres_so
         await select_tree_node(app, pilot, node)
         result = session.run(app.editor.text, record=False)
         assert result.ok and result.rows == [[42]]
+
+
+@async_test
+async def test_typed_join_keyword_and_default_alias_acceptance(parquet_source):
+    app = D8RApp(configured(parquet_source))
+    document = "SELECT * FROM data d "
+    async with app.run_test(size=(140, 45)) as pilot:
+        await load_editor(app, pilot, document, (0, len(document)))
+        await pilot.press("i", "n", "n", "tab", "d", "a", "tab")
+        assert app.editor.text == document + "INNER JOIN data AS d2"
+        app.editor.insert(" ON d.id = d2.id")
+        result = app.session.run(app.editor.text, record=False)
+        assert result.ok and len(result.rows) == 3
+
+
+@async_test
+async def test_alias_prefix_offers_all_fields_and_undoes_once(parquet_source):
+    app = D8RApp(configured(parquet_source))
+    document = "SELECT c FROM data c"
+    async with app.run_test(size=(140, 45)) as pilot:
+        await load_editor(app, pilot, document, (0, len("SELECT c")))
+        await pilot.press("ctrl+space")
+        entries = app.palette.view.entries
+        assert {"c.id", "c.label"} <= {entry.insert for entry in entries}
+        app.palette.highlighted = next(i for i, entry in enumerate(entries) if entry.insert == "c.label")
+        await pilot.press("tab")
+        assert app.editor.text == "SELECT c.label FROM data c"
+        assert app.session.run(app.editor.text, record=False).rows == [["alpha"], ["beta"], [None]]
+        await pilot.press("ctrl+z")
+        assert app.editor.text == document
+
+
+@async_test
+async def test_grouping_hint_and_full_qualified_star_group_acceptance(parquet_source):
+    app = D8RApp(configured(parquet_source))
+    document = "SELECT d.*, count(*) AS n FROM data d"
+    async with app.run_test(size=(140, 45)) as pilot:
+        await load_editor(app, pilot, document, (0, len(document)))
+        await pilot.press("ctrl+enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert "GROUP BY" in str(app.query_one("#results-error", Static).content)
+        app.editor.insert(" GROUP BY ")
+        await pilot.press("ctrl+space", "tab", "ctrl+enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert "GROUP BY d.id, d.label" in app.editor.text
+        assert app._main_outcome.ok
+        assert sorted(app._main_outcome.rows, key=lambda row: row[0]) == [
+            [1, "alpha", 1], [2, "beta", 1], [3, None, 1]]
+
+
+@async_test
+async def test_sql_colors_refresh_on_edit_undo_redo_and_load(parquet_source):
+    app = D8RApp(configured(parquet_source))
+    async with app.run_test(size=(140, 45)) as pilot:
+        await load_editor(app, pilot, "SELECT 1", (0, 6))
+
+        def color():
+            return app.editor.get_line(0).get_style_at_offset(app.console, 1)
+
+        keyword = color()
+        app.editor.history.checkpoint()
+        app.editor.replace("custom", (0, 0), (0, 6))
+        app.editor.history.checkpoint()
+        identifier = color()
+        assert identifier != keyword
+        app.editor.undo()
+        assert color() == keyword
+        app.editor.redo()
+        assert color() == identifier
+        app.editor.load_text("SELECT 2")
+        assert color() == keyword

@@ -423,3 +423,64 @@ def test_metadata_failure_keeps_previous_schema(d1_source):
         with pytest.raises(EngineError):
             refresh_source_schema(d1_source)
     assert d1_source.datasets is previous
+
+
+@pytest.mark.parametrize("sql,hint", [
+    ("SELECT FROM records", "commas"),
+    ("SELECT id FROM records AS a JOIN records AS b ON a.id = b.id", "alias.column"),
+    (f'SELECT * FROM "{API_TOKEN}"', "schema qualification"),
+    (f'SELECT "{API_TOKEN}".missing FROM records', "column spelling"),
+    ("SELECT private_missing_function(id) FROM records", "argument count"),
+    ("SELECT sum(count(*)) FROM records", "GROUP BY"),
+])
+def test_native_sqlite_errors_offer_safe_hints(d1_source, d1_harness, sql, hint):
+    d1_harness.requests.clear()
+    with pytest.raises(EngineError) as error:
+        execute_sql(d1_source, sql)
+    message = str(error.value)
+    assert hint in message
+    assert API_TOKEN not in message
+    assert "private_missing_function" not in message
+    assert "Do not retry writes automatically" in message
+    assert _queries(d1_harness) == [sql]
+    assert execute_sql(d1_source, "SELECT 42")["rows"] == [[42]]
+
+
+@pytest.mark.parametrize("status,nested", [(200, False), (400, False), (200, True)])
+def test_remote_sql_error_envelopes_use_curated_hints_only(d1_source, status, nested):
+    remote = f'D1_ERROR: near "{API_TOKEN}": syntax error at offset 7: SQLITE_ERROR'
+    result = {"success": False, "error": remote}
+    payload = ({"success": True, "errors": [], "result": [result]} if nested else
+               {"success": False, "errors": [{"code": 7500, "message": remote}], "result": []})
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(status, json=payload)
+
+    with _transport(d1_source, handler):
+        with pytest.raises(EngineError) as error:
+            execute_sql(d1_source, "SELECT 1")
+    message = str(error.value)
+    assert "SQL syntax error" in message
+    assert "commas" in message
+    assert API_TOKEN not in message
+    assert "offset 7" not in message
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("remote", [
+    API_TOKEN + ' near "private": syntax error',
+    "x" * 2048 + ' near "private": syntax error',
+    {"message": API_TOKEN}, None,
+])
+def test_remote_error_classification_is_bounded_and_allowlisted(d1_source, remote):
+    payload = {"success": False, "errors": [{"message": remote}], "result": []}
+    with _transport(d1_source, lambda request: httpx.Response(400, json=payload)):
+        with pytest.raises(EngineError) as error:
+            execute_sql(d1_source, "SELECT 1")
+    message = str(error.value)
+    assert "HTTP 400" in message
+    assert "Hint:" not in message
+    assert API_TOKEN not in message
+    assert "private" not in message

@@ -350,6 +350,8 @@ class ExportModal(ModalScreen):
         self._busy = False
 
     def compose(self) -> ComposeResult:
+        from .settings import binding_tooltip
+
         with Vertical(id="export-dialog"):
             yield Static("Export buffered results to CSV", id="export-title")
             with VerticalScroll(id="export-form"):
@@ -365,7 +367,7 @@ class ExportModal(ModalScreen):
             with Horizontal(id="export-buttons"):
                 yield Button("Export CSV", variant="primary", id="export-save")
                 yield Button("Overwrite file", variant="error", id="export-overwrite")
-                yield Button("Cancel", id="export-cancel")
+                yield Button("Cancel", id="export-cancel", tooltip=binding_tooltip(self.BINDINGS, "cancel"))
 
     def on_mount(self) -> None:
         self._update_summary()

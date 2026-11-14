@@ -53,6 +53,7 @@ class QueryTextArea(TextArea):
         self.programmatic_edit_serial = 0
         self.document_load_serial = 0
         self.selection_revision = 0
+        self._syntax_revision = 0
         super().__init__(*args, **kwargs)
         self.dialect = dialect
 
@@ -127,11 +128,17 @@ class QueryTextArea(TextArea):
             *names, partial=partial or names == ("text-area--cursor-line",), default=default,
         )
 
+    def _build_highlight_map(self) -> None:
+        # TextArea invokes this after loads, edits, undo and redo. A revision
+        # avoids joining the entire document again for every visible line.
+        self._syntax_revision += 1
+        super()._build_highlight_map()
+
     def get_line(self, line_index: int) -> Text:
         line = super().get_line(line_index)
-        text = self.text
-        syntax_key = (text, self.dialect)
+        syntax_key = (self._syntax_revision, self.dialect)
         if getattr(self, "_syntax_key", None) != syntax_key:
+            text = self.text
             self._syntax_key = syntax_key
             self._syntax_lines: dict[int, list[tuple[int, int, str]]] = {}
             starts = [0]

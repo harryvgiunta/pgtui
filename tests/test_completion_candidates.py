@@ -128,7 +128,7 @@ def test_schema_qualification_replaces_component_only(monkeypatch):
     schema = SchemaContext((TableDef('"Sales Data"."Order Items"'), TableDef("public.other")))
     context = Context(25, 29, "Ord", '"Sales Data"', quote='"', clause="from")
     item = by_label(candidates(monkeypatch, context, schema), "Order Items")
-    assert item.insert == '"Order Items"'
+    assert item.insert == '"Order Items" AS oi'
     assert not any(item.label == "other" for item in candidates(monkeypatch, context, schema).items)
 
 
@@ -142,9 +142,9 @@ def test_identifier_quote_style_preserved(monkeypatch, quote, expected):
 def test_alias_insertions_avoid_collisions_and_existing_suffix(monkeypatch, schema):
     context = Context(14, 16, "us", clause="from", identifiers=("u", "u2"))
     result = candidates(monkeypatch, context, schema, "SELECT * FROM us")
-    assert by_label(result, "users AS u3").insert == "users AS u3"
+    assert by_label(result, "users").insert == "users AS u3"
     result = candidates(monkeypatch, context, schema, "SELECT * FROM us AS chosen")
-    assert not any(" AS " in item.label for item in result.items)
+    assert by_label(result, "users").insert == "users"
 
 
 def test_cte_relation_candidates(monkeypatch, schema):
@@ -362,7 +362,7 @@ def test_call_and_alias_suffixes_ignore_comments(monkeypatch, schema):
     assert item.cursor_back == 0
     context = Context(14, 16, "us", clause="from")
     result = candidates(monkeypatch, context, schema, "SELECT * FROM us /* note */ AS u")
-    assert not any(" AS " in item.label for item in result.items)
+    assert by_label(result, "users").insert == "users"
 
 
 def test_quoted_identifier_has_no_bare_keywords(monkeypatch, schema):
@@ -509,3 +509,195 @@ def test_null_safe_comparisons_keep_expression_scope(schema, operator):
     assert result.context.clause == "where"
     assert any(item.label == "u.display_name" for item in result.items)
     assert not any(item.kind == "table" for item in result.items)
+
+
+def complete_marked(marked, schema, **options):
+    offset = marked.index("|")
+    document = marked.replace("|", "", 1)
+    return engine.complete(document, offset, schema, **options), document
+
+
+def apply_completion(result, document, item):
+    start = result.context.start if item.start is None else item.start
+    end = result.context.end if item.end is None else item.end
+    return document[:start] + item.insert + document[end:]
+
+
+@pytest.mark.parametrize("marked,insert", [
+    ("SELECT * FROM us|", "users AS u"),
+    ("SELECT * FROM users u JOIN us|", "users AS u2"),
+    ("SELECT * FROM users u JOIN us| JOIN users u2 ON true", "users AS u3"),
+    ('SELECT * FROM "us|ers"', '"users" AS u'),
+    ("SELECT * FROM us| AS chosen", "users"),
+    ("SELECT * FROM us| /* note */ chosen", "users"),
+    ("SELECT * FROM users u, us|", "users AS u2"),
+])
+def test_primary_table_acceptance_autoaliases_only_when_needed(schema, marked, insert):
+    result, document = complete_marked(marked, schema)
+    item = by_label(result, "users")
+    assert item.insert == insert
+    assert apply_completion(result, document, item).endswith(document[result.context.end:])
+    assert sum(item.kind == "table" and item.table == "users" for item in result.items) == 1
+
+
+@pytest.mark.parametrize("prefix", ["INSERT INTO", "UPDATE", "DELETE FROM", "ALTER TABLE", "DROP TABLE", "CREATE TABLE",
+                                    "WITH q AS (SELECT 1) DELETE FROM"])
+def test_write_and_ddl_targets_never_gain_aliases(schema, prefix):
+    result, _ = complete_marked(prefix + " us|", schema)
+    assert by_label(result, "users").insert == "users"
+
+
+@pytest.mark.parametrize("dialect", ["postgres", "duckdb", "d1"])
+@pytest.mark.parametrize("marked", [
+    "SELECT * FROM users u inn|",
+    "SELECT * FROM users u JOIN orders o ON o.user_id = u.id inn|",
+])
+def test_inner_join_prefix_wins_at_real_clause_transitions(schema, dialect, marked):
+    result, document = complete_marked(marked, schema, dialect=dialect)
+    assert result.items[0].label == "INNER JOIN"
+    assert apply_completion(result, document, result.items[0]).endswith("INNER JOIN ")
+    assert not any(item.label == "unnest" for item in result.items)
+
+
+@pytest.mark.parametrize("prefix", ["", "O", "ON"])
+def test_foreign_key_predicate_is_discoverable_while_typing_on(schema, prefix):
+    result, document = complete_marked("SELECT * FROM users u JOIN orders o " + prefix + "|", schema)
+    item = by_label(result, "ON o.user_id = u.id")
+    assert result.items[0] == item
+    assert apply_completion(result, document, item) == "SELECT * FROM users u JOIN orders o ON o.user_id = u.id"
+
+
+@pytest.mark.parametrize("suffix,reference", [("", "o"), (" /* alias */ AS chosen", "chosen")])
+def test_joined_table_completion_includes_native_fk_edit(schema, suffix, reference):
+    result, document = complete_marked("SELECT * FROM users u JOIN ord|" + suffix, schema)
+    item = by_label(result, "orders ON " + reference + ".user_id = u.id")
+    expected = "orders AS o" if not suffix else "orders" + suffix
+    assert apply_completion(result, document, item) == "SELECT * FROM users u JOIN " + expected + " ON " + reference + ".user_id = u.id"
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_real_composite_join_preserves_every_pair_and_actual_alias(reverse):
+    schema = SchemaContext((
+        TableDef("parent", columns=(ColumnDef("tenant_id", "integer"), ColumnDef("id", "integer"))),
+        TableDef("child", columns=(ColumnDef("tenant_id", "integer"), ColumnDef("parent_id", "integer")),
+                 foreign_keys=(ForeignKey(("tenant_id", "parent_id"), "parent", ("tenant_id", "id")),)),
+    ))
+    sources = 'child "Child" JOIN parent p' if reverse else 'parent p JOIN child "Child"'
+    result, document = complete_marked("SELECT * FROM " + sources + " ON |", schema)
+    joins = [item for item in result.items if item.kind == "join"]
+    assert len(joins) == 1
+    assert joins[0].insert == '"Child".tenant_id = p.tenant_id AND "Child".parent_id = p.id'
+    assert apply_completion(result, document, joins[0]).endswith("ON " + joins[0].insert)
+    incomplete = replace(schema, tables=(replace(schema.tables[0], columns=(ColumnDef("id", "integer"),)), schema.tables[1]))
+    result, _ = complete_marked("SELECT * FROM " + sources + " ON |", incomplete)
+    assert not any(item.kind == "join" for item in result.items)
+
+
+@pytest.mark.parametrize("marked,expected", [
+    ("SELECT c| FROM users c", "SELECT c.display_name FROM users c"),
+    ("SELECT cust|omer FROM users customer", "SELECT customer.display_name FROM users customer"),
+    ('SELECT "c|" FROM users c', 'SELECT "c".display_name FROM users c'),
+])
+def test_alias_prefix_offers_qualified_fields_and_preserves_suffix(schema, marked, expected):
+    result, document = complete_marked(marked, schema)
+    reference = "customer" if "customer" in document else "c"
+    assert any(item.kind == "alias" for item in result.items)
+    item = by_label(result, reference + ".display_name")
+    assert apply_completion(result, document, item) == expected
+
+
+def test_alias_prefix_does_not_duplicate_existing_dot(schema):
+    result, document = complete_marked("SELECT c|.display_name FROM users customer", schema)
+    item = by_label(result, "customer")
+    assert apply_completion(result, document, item) == "SELECT customer.display_name FROM users customer"
+    assert not any(item.insert == "customer.display_name" for item in result.items)
+
+
+@pytest.mark.parametrize("projection,expected", [
+    ("u.id, lower(u.display_name) AS label, count(*) AS total", "u.id, lower(u.display_name)"),
+    ("u.*, count(*) AS total", "u.id, u.display_name, u.email, u.active"),
+    ("*, count(*) AS total", "u.id, u.display_name, u.email, u.active"),
+    ("u.id, 1 + 2 AS constant, 'fixed' AS fixed, count(*) AS total", "u.id"),
+    ("CASE WHEN u.active THEN lower(u.email) ELSE u.display_name END AS label, count(*)", "CASE WHEN u.active THEN lower(u.email) ELSE u.display_name END"),
+    ("sum(u.id) + u.active AS mixed, count(*)", "u.active"),
+    ("u.id, row_number() OVER (PARTITION BY u.active ORDER BY u.email) AS rownum, count(*)", "u.id, u.active, u.email"),
+    ("u.id, sum(u.id) FILTER (WHERE u.active) AS total", "u.id"),
+])
+def test_top_group_by_is_complete_nonaggregate_projection(schema, projection, expected):
+    result, document = complete_marked("SELECT " + projection + " FROM users u GROUP BY |", schema)
+    item = result.items[0]
+    assert item.label == "GROUP BY all nonaggregate SELECT expressions"
+    assert item.insert == expected
+    assert apply_completion(result, document, item).endswith("GROUP BY " + expected)
+    assert not any(item.kind == "alias" and item.label in {"total", "rownum", "mixed", "constant", "fixed"} for item in result.items)
+
+
+@pytest.mark.parametrize("tail,expected", [
+    ("gro|", "GROUP BY u.id, lower(u.email)"),
+    ("GROUP |", "BY u.id, lower(u.email)"),
+    ("GROUP B|", "BY u.id, lower(u.email)"),
+    ("GROUP BY id, |", "lower(u.email)"),
+    ("GROUP BY LOWER (u.email), |", "u.id"),
+    ("GROUP BY label, |", "u.id"),
+])
+def test_group_by_prefixes_and_existing_keys(schema, tail, expected):
+    result, _ = complete_marked("SELECT u.id, lower(u.email) AS label, count(*) AS total FROM users u " + tail, schema)
+    assert result.items[0].insert == expected
+
+
+def test_group_by_expands_cte_fields_not_hidden_sources(schema):
+    result, _ = complete_marked("WITH q AS (SELECT id, email AS address FROM users) "
+                                "SELECT c.*, count(*) AS n FROM q c GROUP BY |", schema)
+    assert result.items[0].insert == "c.id, c.address"
+    assert "display_name" not in result.items[0].insert
+
+
+def test_group_by_respects_native_custom_routine_kinds(schema):
+    schema = replace(schema, routines=(RoutineDef("app.rollup", kind="aggregate"),
+                                      RoutineDef("app.sum", kind="scalar")))
+    result, _ = complete_marked("SELECT app.sum(u.id) AS detail, app.rollup(u.email) AS summary "
+                                "FROM users u GROUP BY |", schema)
+    assert result.items[0].insert == "app.sum(u.id)"
+    assert not any(item.kind == "alias" and item.label == "summary" for item in result.items)
+
+
+def test_group_by_does_not_repeat_fully_grouped_projection(schema):
+    result, _ = complete_marked("SELECT u.id, count(*) FROM users u GROUP BY id, |", schema)
+    assert not any(item.label == "GROUP BY all nonaggregate SELECT expressions" for item in result.items)
+
+
+def test_group_by_ordinal_and_duplicate_projection_do_not_repeat_keys(schema):
+    result, _ = complete_marked("SELECT u.id, u.id, lower(u.email), count(*) FROM users u GROUP BY 2, |", schema)
+    assert result.items[0].insert == "lower(u.email)"
+
+
+def test_group_by_can_use_sources_later_in_incomplete_document(schema):
+    result, document = complete_marked("SELECT u.id, lower(u.email), count(*) GROUP BY | FROM users u", schema)
+    assert result.items[0].insert == "u.id, lower(u.email)"
+    assert apply_completion(result, document, result.items[0]).endswith("GROUP BY u.id, lower(u.email) FROM users u")
+
+
+def test_group_by_before_from_retains_explicit_expressions_without_inventing_stars():
+    result, _ = complete_marked("SELECT customer_id, lower(email), CURRENT_DATE, count(*) GROUP BY |", SchemaContext())
+    assert result.items[0].insert == "customer_id, lower(email)"
+    result, _ = complete_marked("SELECT c.*, count(*) FROM missing c GROUP BY |", SchemaContext())
+    assert not any(item.label == "GROUP BY all nonaggregate SELECT expressions" for item in result.items)
+
+
+def test_quoted_cte_completion_preserves_relation_name_and_alias(schema):
+    result, document = complete_marked('WITH "Recent People" AS (SELECT id FROM users) SELECT * FROM "Rec|"', schema)
+    item = by_label(result, '"Recent People"')
+    assert apply_completion(result, document, item).endswith('FROM "Recent People" AS rp')
+
+
+def test_schema_prefix_preserves_existing_dot():
+    schema = SchemaContext((TableDef("public.users", columns=(ColumnDef("id", "integer"),)),))
+    result, document = complete_marked("SELECT * FROM pub|.users", schema)
+    item = by_label(result, "public.")
+    assert apply_completion(result, document, item) == "SELECT * FROM public.users"
+    assert not any(item.kind == "table" for item in result.items)
+
+
+def test_incomplete_grouping_keeps_oversized_ordinal_bounded(schema):
+    result, _ = complete_marked("SELECT id, count(*) FROM users GROUP BY " + "9" * 5000 + ", |", schema)
+    assert result.items[0].insert == "id"

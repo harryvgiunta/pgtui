@@ -196,6 +196,7 @@ class Session:
                 self._source_history.setdefault(entry.target, []).append(entry)
         self.workspace["history"] = [asdict(entry) for entry in self._history]
         self._completion_usage: dict[str, tuple[int, tuple[TableDef, ...], dict[tuple[str, str, str], int]]] = {}
+        self._schema_snapshots: dict[str, tuple[DataSource, dict, SchemaContext]] = {}
         if not self.workspace["pages"]:
             seen: set[tuple[str, str, str]] = set()
             for entry in reversed(self._history):
@@ -680,11 +681,13 @@ class Session:
             return
         active_id, dialect = self.active_id, self.dialect
         try:
-            self.set_active(source_id)
+            self.active_id = source_id
+            self.dialect = self.source.dialect
+            self._restore_schema_snapshot()
             yield
         finally:
             self.active_id, self.dialect = active_id, dialect
-            self.refresh_schema()
+            self._restore_schema_snapshot()
 
     def register(self, source: DataSource, activate: bool = True) -> None:
         """Register an explicitly built source, replacing its disconnected target."""
@@ -717,6 +720,19 @@ class Session:
             default_schema=source.default_schema or source.postgres.get("schema"),
             routines=source.routines,
         )
+        self._schema_snapshots[source.id] = (source, source.datasets, self.schema)
+
+    def _restore_schema_snapshot(self) -> None:
+        """Switch completion targets without rebuilding unchanged catalog metadata."""
+        source = self.source
+        cached = self._schema_snapshots.get(source.id)
+        if (cached is not None and cached[0] is source and cached[1] is source.datasets
+                and cached[2].routines is source.routines
+                and cached[2].fns == tuple(self.fns.values())
+                and cached[2].default_schema == (source.default_schema or source.postgres.get("schema"))):
+            self.schema = cached[2]
+        else:
+            self.refresh_schema()
 
 
     # -- palette data -------------------------------------------------------

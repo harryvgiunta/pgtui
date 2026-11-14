@@ -371,3 +371,29 @@ def test_recovery_ignores_unfinished_identifier_away_from_caret(schema):
     context = at('SELECT o.| FROM orders o; SELECT "tot FROM users u', schema)
     assert set(refs(context)) == {"o"}
     assert context.quote == ""
+
+
+def test_grouping_uses_active_subquery_projection_and_known_local_star(schema):
+    from d8r.completion.engine import complete
+
+    marked = "SELECT (SELECT o.*, count(*) FROM orders o GROUP BY |) FROM users u"
+    offset = marked.index("|")
+    result = complete(marked.replace("|", "", 1), offset, schema)
+    assert result.items[0].insert == "o.id, o.user_id, o.total"
+    assert result.context.group_expressions == ("o.id", "o.user_id", "o.total")
+    assert not any(expression.startswith("u.") for expression in result.context.group_expressions)
+
+
+def test_grouping_can_group_aggregate_outputs_of_derived_relation(schema):
+    from d8r.completion.engine import complete
+
+    marked = ("SELECT d.*, count(*) FROM (SELECT user_id, sum(total) AS gross "
+              "FROM orders GROUP BY user_id) d GROUP BY |")
+    result = complete(marked.replace("|", "", 1), marked.index("|"), schema)
+    assert result.items[0].insert == "d.user_id, d.gross"
+
+
+def test_join_transition_ignores_incomplete_next_source(schema):
+    assert at("SELECT * FROM users u inn|", schema).relation_transition
+    assert not at("SELECT * FROM users u, ord|", schema).relation_transition
+    assert not at("SELECT * FROM users u JOIN ord|", schema).relation_transition

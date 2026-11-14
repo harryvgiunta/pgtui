@@ -6,10 +6,12 @@ Unknown expression names/types stay unknown rather than becoming schema facts.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 import re
 
-from d8r.sql import SchemaContext, SqlError, Token, lex_sql
+from d8r.sql import RoutineDef, SchemaContext, SqlError, Token, lex_sql
 from .models import Call, Context, Field, Relation
+from .catalog import functions_for, keywords_for
 
 _MAX_CHARS = 200_000
 _MAX_TOKENS = 24_000
@@ -103,9 +105,17 @@ def _name(token: Token) -> str:
     return value.lower()
 
 
-def _key(text: str, dialect: str) -> tuple[str, ...]:
+def _decode_key(text: str, dialect: str) -> tuple[str, ...]:
     parts = tuple(_name(t) for t in _scan(text, dialect) if t.kind in _IDS)
     return parts if dialect == "postgres" else tuple(part.lower() for part in parts)
+
+
+_cached_key = lru_cache(maxsize=8192)(_decode_key)
+
+
+def _key(text: str, dialect: str) -> tuple[str, ...]:
+    # Cache only short names, not arbitrarily large unfinished SQL fragments.
+    return (_cached_key if len(text) <= 512 else _decode_key)(text, dialect)
 
 
 def _merge(local: tuple[Relation, ...], outer: tuple[Relation, ...], dialect: str) -> tuple[Relation, ...]:
@@ -126,6 +136,7 @@ class _Scope:
     # Relation source positions make JOIN ON/USING visibility left-to-right.
     sources: list[tuple[int, Relation]] = field(default_factory=list)
     insert_open: int | None = None
+    projection_span: tuple[int, int] | None = None
 
 
 class _Model:
@@ -134,6 +145,7 @@ class _Model:
                  budget: list[int] | None = None):
         self.text, self.tokens, self.schema, self.dialect = text, tokens, schema, dialect
         self.depth, self.bindings = depth, bindings or {}
+        self.native_routines: dict[tuple[str, ...], RoutineDef] | None = None
         self.pairs: dict[int, int] = {}
         stack: list[int] = []
         for i, token in enumerate(tokens):
@@ -195,6 +207,13 @@ class _Model:
         matches = local or [column for _, column in candidates]
         return matches[0] if len(matches) == 1 else None
 
+    def native(self, name: str) -> RoutineDef | None:
+        if self.native_routines is None:
+            self.native_routines = {}
+            for routine in self.schema.routines:
+                self.native_routines.setdefault(_key(routine.name, self.dialect), routine)
+        return self.native_routines.get(_key(name, self.dialect))
+
     def expression(self, lo: int, hi: int, relations: tuple[Relation, ...]) -> Field | None:
         if lo >= hi:
             return None
@@ -227,7 +246,7 @@ class _Model:
                 return Field("", "boolean")
         name, end = self.identifier(lo, hi)
         if name and end < hi and self.tokens[end].text == "(":
-            routine = next((r for r in self.schema.routines if _key(r.name, self.dialect) == _key(name, self.dialect)), None)
+            routine = self.native(name)
             if routine:
                 return Field("", routine.return_type)
             if name.lower() == "count":
@@ -239,8 +258,7 @@ class _Model:
                     return Field("", original.type)
         return None
 
-    def projection(self, lo: int, hi: int, relations: tuple[Relation, ...]) -> tuple[Field, ...]:
-        result: list[Field] = []
+    def projection_parts(self, lo: int, hi: int):
         for start, end in self.split(lo, hi):
             if start >= end:
                 continue
@@ -249,10 +267,16 @@ class _Model:
             as_at = next((i for i in reversed(top) if self.upper(i) == "AS"), None)
             if as_at is not None and as_at + 1 < end and self.tokens[as_at + 1].kind in _IDS:
                 alias, end = _name(self.tokens[as_at + 1]), as_at
-            elif end - start > 1 and self.tokens[end - 1].kind in _IDS and self.upper(end - 1) not in _STOP:
+            elif (end - start > 1 and self.tokens[end - 1].kind in _IDS
+                  and self.upper(end - 1) not in _STOP and self.upper(end - 1) not in keywords_for(self.dialect)):
                 previous = self.tokens[end - 2]
                 if previous.text not in {".", "::", ":", "+", "-", "*", "/", "=", "||"} and previous.end < self.tokens[end - 1].start:
                     alias, end = _name(self.tokens[end - 1]), end - 1
+            yield start, end, alias
+
+    def projection(self, lo: int, hi: int, relations: tuple[Relation, ...]) -> tuple[Field, ...]:
+        result: list[Field] = []
+        for start, end, alias in self.projection_parts(lo, hi):
             if end <= start:
                 continue
             if self.tokens[end - 1].text == "*":
@@ -269,6 +293,145 @@ class _Model:
             elif value is not None and value.name:
                 result.append(value)
         return tuple(result)
+
+    def grouping(self, scope: _Scope, start: int, end: int, clause: str, anchor: int):
+        """Retain SQL expressions, not output names, for a complete GROUP BY edit."""
+        if scope.projection_span is None:
+            return (), (), "", False
+        native = keywords_for(self.dialect)
+        routines = self.schema.routines or functions_for(self.dialect)
+        kinds: dict[tuple[str, ...], set[str]] = {}
+        for routine in routines:
+            if routine.kind not in {"aggregate", "window"}:
+                continue
+            name = _key(routine.name, self.dialect)
+            kinds.setdefault(name, set()).add(routine.kind)
+            kinds.setdefault(name[-1:], set()).add(routine.kind)
+
+        def quoted(name: str) -> str:
+            if re.fullmatch(r"[a-z_][a-z_0-9$]*", name) and name.upper() not in native:
+                return name
+            return '"' + name.replace('"', '""') + '"'
+
+        def expression_key(a: int, b: int) -> tuple:
+            while a < b and self.tokens[a].text == "(" and self.pairs.get(a) == b - 1:
+                a, b = a + 1, b - 1
+            name, after = self.identifier(a, b)
+            if name and after == b and self.resolve(a, b, scope.relations) is not None:
+                parts = _key(name, self.dialect)
+                matches = [(r, f) for r in scope.relations for f in r.fields
+                           if (f.name if self.dialect == "postgres" else f.name.lower()) == parts[-1]
+                           and (len(parts) == 1 or _key(r.reference, self.dialect) == parts[:-1])]
+                local = [(r, f) for r, f in matches if not r.outer]
+                relation, column = (local or matches)[0]
+                return ("field", _key(relation.reference, self.dialect), column.name)
+            return tuple((t.kind, t.text.lower() if t.kind == "word" else t.text) for t in self.tokens[a:b])
+
+        pending: dict[tuple, str] = {}
+        aliases: dict[str, tuple] = {}
+        outputs: list[Field] = []
+        ordinals: list[tuple | None] = []
+        unknown_star = False
+        for a, b, alias in self.projection_parts(*scope.projection_span):
+            if a >= b:
+                continue
+            star = self.tokens[b - 1].text == "*" and (b == a + 1 or self.tokens[b - 2].text == ".")
+            if star:
+                qualifier = self.text[self.tokens[a].start:self.tokens[b - 2].start] if b > a + 1 else ""
+                sources = [r for r in scope.relations if not r.outer
+                           and (not qualifier or _key(r.reference, self.dialect) == _key(qualifier, self.dialect))]
+                unknown_star |= not sources or any(not r.fields for r in sources)
+                for relation in sources:
+                    for column in relation.fields:
+                        key = ("field", _key(relation.reference, self.dialect), column.name)
+                        pending.setdefault(key, relation.reference + "." + quoted(column.name))
+                        outputs.append(column)
+                        ordinals.append(key)
+                continue
+            ordinals.append(None)
+            row_expression, excluded = False, False
+            references: list[tuple[int, int]] = []
+            i = a
+            while i < b:
+                word = self.upper(i)
+                if word == "SELECT":
+                    # A subquery owns a different grouping scope.
+                    references.clear()
+                    excluded = True
+                    break
+                if word == "OVER":
+                    excluded = True
+                if self.tokens[i].kind not in _IDS:
+                    i += 1
+                    continue
+                name, after = self.identifier(i, b)
+                if after < b and self.tokens[after].text == "(":
+                    routine_kinds = kinds.get(_key(name, self.dialect), set())
+                    if routine_kinds & {"aggregate", "window"}:
+                        excluded = True
+                        close = min(self.pairs.get(after, b), b)
+                        tail = close + 1
+                        if self.upper(tail) == "WITHIN" and self.upper(tail + 1) == "GROUP":
+                            tail = min(self.pairs.get(tail + 2, b), b) + 1
+                        if self.upper(tail) == "FILTER":
+                            tail = min(self.pairs.get(tail + 1, b), b) + 1
+                        if "aggregate" in routine_kinds and self.upper(tail) != "OVER":
+                            # Aggregate inputs (including FILTER/ordered-set keys)
+                            # do not become grouping keys. Window inputs do.
+                            i = tail
+                            continue
+                elif self.resolve(i, after, scope.relations) is not None:
+                    row_expression = True
+                    references.append((i, after))
+                elif (not any(r.fields for r in scope.relations) and word not in native
+                      and word not in {"NULL", "TRUE", "FALSE", "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP",
+                                       "LOCALTIME", "LOCALTIMESTAMP", "CURRENT_USER", "SESSION_USER", "SYSTEM_USER", "CURRENT_ROLE", "CURRENT_SCHEMA"}
+                      and self.tokens[i].kind != "parameter"
+                      and (i == a or self.tokens[i - 1].text not in {"::", ":"}) and self.upper(i - 1) != "AS"):
+                    # Before FROM is written, retain explicit unknown field references.
+                    row_expression = True
+                    references.append((i, after))
+                i = after
+            if excluded:
+                for first, last in references:
+                    pending.setdefault(expression_key(first, last),
+                                       self.text[self.tokens[first].start:self.tokens[last - 1].end])
+                continue
+            if not row_expression:
+                continue
+            key = expression_key(a, b)
+            ordinals[-1] = key
+            pending.setdefault(key, self.text[self.tokens[a].start:self.tokens[b - 1].end])
+            value = self.expression(a, b, scope.relations)
+            if alias is not None:
+                aliases[alias if self.dialect == "postgres" else alias.lower()] = key
+                outputs.append(replace(value, name=alias) if value else Field(alias))
+            elif value is not None and value.name:
+                outputs.append(value)
+
+        prefix, slot = "", False
+        if clause == "group":
+            begin = anchor + 1
+            if self.upper(begin) == "BY" and self.tokens[begin].end <= start:
+                begin += 1
+                finish = next((i for i in self.top(begin, scope.hi)
+                               if self.upper(i) in {"FROM", "HAVING", "ORDER", "LIMIT", "OFFSET", "WINDOW", "QUALIFY"}), scope.hi)
+                for a, b in self.split(begin, finish):
+                    if a == b or (self.tokens[a].start >= start and self.tokens[a].start <= end):
+                        slot = True
+                        continue
+                    key = expression_key(a, b)
+                    if b == a + 1 and self.tokens[a].kind in _IDS:
+                        key = aliases.get(_name(self.tokens[a]), key)
+                    elif b == a + 1 and self.tokens[a].kind == "number" and self.tokens[a].text.isdigit():
+                        digits = self.tokens[a].text.lstrip("0") or "0"
+                        ordinal = int(digits) if len(digits) <= len(str(len(ordinals))) else 0
+                        if not unknown_star and 0 < ordinal <= len(ordinals):
+                            key = ordinals[ordinal - 1]
+                    pending.pop(key, None)
+            else:
+                prefix, slot = "BY ", True
+        return (() if unknown_star else tuple(pending.values())), tuple(outputs), prefix, slot
 
     def renamed(self, relation: Relation, opening: int, hi: int) -> tuple[Relation, int]:
         close = min(self.pairs.get(opening, hi), hi)
@@ -435,6 +598,7 @@ class _Model:
                     begin = self.pairs.get(begin + 1, hi) + 1
             stop = next((i for i in top if i > projection and self.upper(i) in {"FROM", "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "WINDOW", "QUALIFY", "INTO"}), hi)
             scope.outputs = self.projection(begin, stop, scope.relations)
+            scope.projection_span = (begin, stop)
         # Scalar/EXISTS subqueries correlate; ordinary expression parentheses do not make scopes.
         def children(a: int, b: int, level: int) -> None:
             if level >= _MAX_DEPTH:
@@ -489,7 +653,10 @@ class _Model:
                 break
             word = self.upper(i)
             if word in names and not (word in {"ON", "FROM"} and self.upper(i - 1) == "DISTINCT"):
-                clause, anchor = names[word], i
+                clause, anchor = ("table" if word == "FROM" and clause == "delete" else names[word]), i
+            elif word == "TABLE" and any(self.upper(at) in {"CREATE", "ALTER", "DROP", "TRUNCATE"}
+                                         for at in range(scope.lo, i)):
+                clause, anchor = "table", i
         if scope.insert_open is not None:
             opening = scope.insert_open
             close = self.pairs.get(opening, scope.hi)
@@ -607,7 +774,7 @@ def analyze(document: str, offset: int, schema: SchemaContext, *, dialect: str =
     root = model.query(lo, hi)
     root.start, root.end = statement_start, statement_end
     scope = _active(root, offset)
-    clause, anchor = model.clause(scope, offset)
+    clause, anchor = model.clause(scope, start)
     before = [i for i in range(scope.lo, scope.hi) if tokens[i].end <= start]
     qualifier = ""
     if before and tokens[before[-1]].text == ".":
@@ -630,19 +797,34 @@ def analyze(document: str, offset: int, schema: SchemaContext, *, dialect: str =
         relations = _merge(join_left + (join_target,), tuple(r for r in relations if r.outer), dialect)
     elif clause == "join" and visible_sources:
         join_left = tuple(r for at, r in visible_sources if at < anchor)
-        if current is None:
-            joined = [(at, r) for at, r in visible_sources if at > anchor]
-            if joined:
-                at, candidate = joined[-1]
-                _, after = model.identifier(at, scope.hi)
-                if after < scope.hi and tokens[after].text == "(":
-                    after = min(model.pairs.get(after, scope.hi) + 1, scope.hi)
-                if model.upper(after) == "AS":
+        joined = [(at, r) for at, r in visible_sources if at > anchor]
+        if joined:
+            at, candidate = joined[-1]
+            _, after = model.identifier(at, scope.hi)
+            if after < scope.hi and tokens[after].text == "(":
+                after = min(model.pairs.get(after, scope.hi) + 1, scope.hi)
+            explicit_alias = model.upper(after) == "AS"
+            if explicit_alias:
+                after += 1
+            if after < scope.hi and tokens[after].kind in _IDS and model.upper(after) not in _STOP:
+                if tokens[after].end <= start:
                     after += 1
-                if after < scope.hi and tokens[after].kind in _IDS and model.upper(after) not in _STOP:
-                    after += 1
-                if after > at and tokens[after - 1].end <= offset:
-                    join_target = candidate
+                elif not explicit_alias:
+                    candidate = replace(candidate, reference=candidate.name)
+            if after > at and tokens[after - 1].end <= start and not explicit_alias:
+                join_target = candidate
+            elif explicit_alias and after > at and tokens[after - 1].end <= start and model.upper(after - 1) != "AS":
+                join_target = candidate
+    relation_transition = False
+    if clause in {"from", "join"}:
+        sources = [(at, relation) for at, relation in visible_sources if at > anchor]
+        if sources and (not before or tokens[before[-1]].text not in {",", "."}) and (not before or model.upper(before[-1]) != "AS"):
+            at, relation = sources[-1]
+            _, after = model.identifier(at, scope.hi)
+            relation_transition = after > at and tokens[after - 1].end <= start
+    elif clause == "on" and before and before[-1] > anchor:
+        previous = tokens[before[-1]]
+        relation_transition = previous.kind in _IDS | {"number", "string"} or previous.text == ")"
     # The innermost open call supplies the active argument, not commas in children.
     call = None
     containing = [i for i in range(scope.lo, scope.hi) if tokens[i].text == "(" and tokens[i].end <= offset
@@ -707,6 +889,11 @@ def analyze(document: str, offset: int, schema: SchemaContext, *, dialect: str =
             if a < b and tokens[a].kind in _IDS and not (tokens[a].start <= offset <= tokens[a].end):
                 used.append(_name(tokens[a]))
     identifiers = tuple(dict.fromkeys([r.reference for r in relations] + [r.reference for r in scope.ctes] + list(parameters)))
+    group_expressions, group_outputs, group_prefix, group_slot = (), None, "", False
+    if clause == "group" or (clause in {"from", "on", "where", "having"}
+                              and (not token or "group by".startswith(token.lower()))):
+        group_expressions, group_outputs, group_prefix, group_slot = model.grouping(scope, start, end, clause, anchor)
     return Context(start, end, token, qualifier, quote, clause, blocked, relations, scope.ctes, scope.outputs,
                    join_target, join_left, call, value_field, token if value_field else "", literal,
-                   tuple(used), statement_start, statement_end, identifiers)
+                   tuple(used), statement_start, statement_end, identifiers,
+                   group_outputs, group_expressions, group_prefix, group_slot, relation_transition)

@@ -103,7 +103,7 @@ def execute_sql(source: DataSource, sql: str, *, max_rows=10000, readonly=False,
         statements = split_statements(sql, dialect=source.dialect)
         words = _words(sql, dialect=source.dialect)
     except SqlError:
-        raise EngineError("SQL contains an unterminated literal or comment") from None
+        raise EngineError("SQL contains an unterminated literal or comment. Hint: Check matching quotes and close any block comment.") from None
     if len(statements) != 1:
         raise EngineError("Execute exactly one SQL statement at a time")
     if source.kind == "d1-live":

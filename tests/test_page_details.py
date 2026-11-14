@@ -41,7 +41,7 @@ def test_details_generation_saves_metadata_without_changing_or_running_query(tmp
             # A page switch before debounced messages dispatch must keep both fields.
             app.query_one("#page-description", TextArea).load_text("Edited description")
             first_id = app._document_identity
-            app._new_page()
+            app.action_new_query()
             app.open_page(first_id)
             assert app.query_one("#page-description", TextArea).text == "Edited description"
             app.exit()
@@ -76,7 +76,7 @@ def test_inflight_metadata_never_overwrites_changed_or_cancelled_target(tmp_path
             if interrupt == "edit":
                 app.query_one("#page-name", Input).value = "My edit"
             elif interrupt == "switch":
-                app._new_page()
+                app.action_new_query()
             else:
                 await pilot.click("#page-details-cancel")
             release.set()

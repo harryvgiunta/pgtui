@@ -294,3 +294,109 @@ def test_postgres_error_sanitization_deadline_and_recovery(postgres_source):
         execute_sql(postgres_source, "SELECT pg_sleep(3)", readonly=True, timeout=0.02)
     assert not transaction_open(postgres_source)
     assert execute_sql(postgres_source, "SELECT 42", readonly=True)["rows"] == [[42]]
+
+
+@pytest.mark.parametrize("state,hint", [
+    ("42601", "commas"), ("42702", "alias.column"), ("42P09", "distinct alias"),
+    ("42P01", "schema qualification"), ("42703", "column spelling"),
+    ("42803", "every nonaggregate SELECT expression"), ("42883", "argument count"),
+    ("42725", "explicit argument casts"), ("42804", "target column types"),
+    ("42846", "supported conversion"), ("22P02", "input format"),
+])
+def test_postgres_structured_error_hints_never_expose_driver_fields(state, hint):
+    import psycopg
+    from psycopg.pq import DiagnosticField
+    from d8r.engine.datasources import _safe_error
+
+    secret = b"private-password-value SELECT 'private-literal'"
+    exc = psycopg.errors.lookup(state)(secret.decode(), info={
+        DiagnosticField.SQLSTATE: state.encode(),
+        DiagnosticField.STATEMENT_POSITION: b"17",
+        DiagnosticField.MESSAGE_PRIMARY: secret,
+        DiagnosticField.MESSAGE_DETAIL: secret,
+        DiagnosticField.MESSAGE_HINT: secret,
+        DiagnosticField.CONTEXT: secret,
+        DiagnosticField.INTERNAL_QUERY: secret,
+        DiagnosticField.COLUMN_NAME: secret,
+        DiagnosticField.TABLE_NAME: secret,
+    })
+    message = str(_safe_error(exc))
+    assert f"SQLSTATE {state}" in message
+    assert "at character 17" in message
+    assert hint in message
+    assert "private-" not in message
+    if state == "42803":
+        assert "* or alias.*" in message
+
+
+@pytest.mark.parametrize("position", [b"0", b"-1", b"2147483648", b"9" * 1000,
+                                      b"17 private-password", b"1\n2"])
+def test_postgres_error_positions_require_bounded_positive_diagnostics(position):
+    import psycopg
+    from psycopg.pq import DiagnosticField
+    from d8r.engine.datasources import _safe_error
+
+    exc = psycopg.errors.SyntaxError("secret", info={DiagnosticField.STATEMENT_POSITION: position})
+    message = str(_safe_error(exc))
+    assert "at character" not in message
+    assert "secret" not in message
+
+
+def test_arbitrary_errors_cannot_impersonate_native_diagnostics():
+    from d8r.engine.datasources import _safe_error
+
+    class UntrustedError(Exception):
+        @property
+        def sqlstate(self):
+            raise AssertionError("Arbitrary diagnostics must not be inspected")
+
+        def __str__(self):
+            raise AssertionError("Arbitrary exceptions must not be stringified")
+
+    assert str(_safe_error(UntrustedError())) == "SQL execution failed"
+
+
+@pytest.mark.parametrize("query,hint", [
+    ("SELECT FROM data", "commas"),
+    ("SELECT id FROM data AS a JOIN data AS b ON a.id = b.id", "alias.column"),
+    ("SELECT label, count(*) FROM data", "every nonaggregate SELECT expression"),
+    ("SELECT * FROM data GROUP BY id", "* or alias.*"),
+    ('SELECT "private-password-value" FROM data', "column spelling"),
+    ('SELECT * FROM "private-password-value"', "schema qualification"),
+    ("SELECT private_missing_function(id) FROM data", "argument count"),
+    ("SELECT CAST('private-password-value' AS INTEGER)", "input format"),
+])
+def test_duckdb_native_errors_offer_safe_hints(parquet_source, query, hint):
+    with pytest.raises(EngineError) as error:
+        execute_sql(parquet_source, query)
+    assert hint in str(error.value)
+    assert "private-" not in str(error.value)
+    assert "private_missing_function" not in str(error.value)
+    assert execute_sql(parquet_source, "SELECT 42")["rows"] == [[42]]
+
+
+@pytest.mark.parametrize("query,state,hint", [
+    ("SELECT FROM", "42601", "commas"),
+    ("SELECT id FROM (VALUES (1)) a(id) CROSS JOIN (VALUES (2)) b(id)", "42702", "alias.column"),
+    ("SELECT id, count(*) FROM (VALUES (1)) a(id)", "42803", "every nonaggregate SELECT expression"),
+    ("SELECT a.*, count(*) FROM (VALUES (1, 2)) a(id, value)", "42803", "* or alias.*"),
+    ('SELECT "private-password-value"', "42703", "column spelling"),
+    ('SELECT * FROM "private-password-value"', "42P01", "schema qualification"),
+    ("SELECT pg_catalog.length(1)", "42883", "argument count"),
+])
+def test_postgres_native_errors_offer_safe_hints(postgres_source, query, state, hint):
+    with pytest.raises(EngineError) as error:
+        execute_sql(postgres_source, query)
+    message = str(error.value)
+    assert f"SQLSTATE {state}" in message
+    assert hint in message
+    assert "private-" not in message
+    assert execute_sql(postgres_source, "SELECT 42")["rows"] == [[42]]
+
+
+@pytest.mark.parametrize("sql", ["SELECT 'private-password-value", "SELECT 1 /* private-password-value"])
+def test_unterminated_sql_offers_safe_local_hint(parquet_source, sql):
+    with pytest.raises(EngineError) as error:
+        execute_sql(parquet_source, sql)
+    assert "Hint: Check matching quotes" in str(error.value)
+    assert "private-password-value" not in str(error.value)

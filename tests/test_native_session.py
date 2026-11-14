@@ -342,3 +342,28 @@ def test_metadata_failure_warns_without_relabeling_executed_ddl(parquet_source, 
     assert "schema not refreshed: Metadata unavailable." in outcome.status
     assert session.history[0].doc == sql
     assert session.run("SELECT count(*) FROM executed_rows").rows == [[3]]
+
+
+def test_completion_target_snapshots_follow_schema_functions_and_reconnections(parquet_source, d1_source):
+    session = Session({parquet_source.id: parquet_source, d1_source.id: d1_source})
+
+    def offers(document):
+        return complete(document, len(document), session.schema, dialect=session.dialect).items
+
+    with session.target_source(d1_source.id):
+        assert any(item.insert == "label" for item in offers("SELECT r. FROM records r WHERE r."))
+    assert any(item.insert == "label" for item in offers("SELECT d. FROM data d WHERE d."))
+
+    with session.target_source(d1_source.id):
+        assert session.run("ALTER TABLE records ADD COLUMN added TEXT", record=False).ok
+        session.save_fn("local_fields", "", "SELECT added FROM records", "")
+    with session.target_source(d1_source.id):
+        assert any(item.insert == "added" for item in offers("SELECT r. FROM records r WHERE r."))
+        assert any(item.label == "local_fields" for item in offers("SELECT * FROM local_"))
+    assert not any(item.insert == "added" for item in offers("SELECT d. FROM data d WHERE d."))
+
+    replacement = replace(d1_source, datasets={})
+    session.sources[d1_source.id] = replacement
+    with session.target_source(d1_source.id):
+        assert not offers("SELECT r. FROM records r WHERE r.")
+    assert any(item.insert == "label" for item in offers("SELECT d. FROM data d WHERE d."))

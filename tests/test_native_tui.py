@@ -211,3 +211,200 @@ async def test_saved_parquet_startup_reconnect_preserves_draft(parquet_source):
         assert not session.history
         assert app._main_outcome is None
         assert app.query_one("#results-table", DataTable).row_count == 0
+
+
+@async_test
+async def test_source_form_full_string_typing_and_control_focus(credential_backend):
+    from textual.widgets import Checkbox
+
+    session = Session()
+    app = D8RApp(session)
+    async with app.run_test(size=(140, 60)) as pilot:
+        await pilot.press("ctrl+o")
+        await pilot.pause()
+        modal = app.screen
+        for name, value in (("postgres-host", "db.example.test"),
+                            ("postgres-database", "analytics"),
+                            ("postgres-user", "readonly"),
+                            ("postgres-password", "session-only-secret"),
+                            ("display-name", "Primary database")):
+            field = modal.query_one(f"#{name}", Input)
+            field.value = ""
+            field.focus()
+            await pilot.pause()
+            await pilot.press(*value)
+            assert field.value == value
+            assert modal.focused is field
+        host = modal.query_one("#postgres-host", Input)
+        host.focus()
+        await pilot.press("tab")
+        assert modal.focused is modal.query_one("#postgres-port", Input)
+        sslmode = modal.query_one("#postgres-sslmode", Select)
+        sslmode.focus()
+        await pilot.press("enter", "down", "enter")
+        await pilot.pause()
+        assert sslmode.value == "require"
+        assert modal.focused is sslmode
+        remember = modal.query_one("#remember-credentials", Checkbox)
+        remember.focus()
+        await pilot.press("space")
+        assert not remember.value
+        assert modal.focused is remember
+        backend = modal.query_one("#source-backend", Select)
+        backend.focus()
+        await pilot.press("enter", "end", "enter")
+        await pilot.pause()
+        assert backend.value == "d1"
+        assert modal.focused is backend
+        token = modal.query_one("#d1-token", Input)
+        token.focus()
+        await pilot.press(*"session-token-only")
+        assert token.value == "session-token-only"
+        assert modal.focused is token
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.screen is not modal
+        assert token.value == ""
+        assert not credential_backend.values
+        assert not session.source_connected()
+
+
+@async_test
+async def test_source_edit_cancels_inflight_builder_and_restores_field(parquet_source, monkeypatch):
+    from threading import Event
+    from d8r.tui import connection
+
+    session = Session()
+    app = D8RApp(session)
+    started, unblock, released = Event(), Event(), Event()
+    build, release = session.build_parquet_source, connection.release_source
+    built = []
+
+    def delayed_build(*args):
+        started.set()
+        if not unblock.wait(10):
+            raise RuntimeError("Test builder was not released")
+        source = build(*args)
+        built.append(source)
+        return source
+
+    def capture_release(source):
+        release(source)
+        released.set()
+
+    monkeypatch.setattr(session, "build_parquet_source", delayed_build)
+    monkeypatch.setattr(connection, "release_source", capture_release)
+    async with app.run_test(size=(140, 48)) as pilot:
+        app.action_add_source()
+        await pilot.pause()
+        modal = app.screen
+        modal.query_one("#source-backend", Select).value = "parquet"
+        field = modal.query_one("#parquet-path", Input)
+        field.value = parquet_source.connection_key
+        await pilot.pause()
+        await pilot.click(field)
+        original, selection = field.value, field.selection
+        modal.action_test()
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            field.value += ".changed"
+            await pilot.pause()
+            assert not modal._busy
+            assert modal.focused is field
+            assert field.selection == selection
+            await pilot.press(*"-still-editing")
+            start, end = sorted(selection)
+            assert field.value == original[:start] + "-still-editing" + original[end:] + ".changed"
+        finally:
+            unblock.set()
+        assert await asyncio.to_thread(released.wait, 5)
+        assert built[0].con is None
+        assert modal._built is None
+        assert not session.source_connected()
+        await pilot.press("escape")
+
+
+@async_test
+async def test_new_query_shortcut_preserves_query_function_and_chat_drafts():
+    session = Session()
+    app = D8RApp(session)
+    async with app.run_test(size=(150, 55)) as pilot:
+        app.editor.load_text("SELECT current_date")
+        first_id = app._document_identity
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+        second_id = app._document_identity
+        assert second_id != first_id
+        assert app.editor.text == ""
+        assert app.screen.focused is app.editor
+        assert next(page for page in session.workspace["pages"] if page["id"] == first_id)["document"] == "SELECT current_date"
+        app.action_add_source()
+        await pilot.pause()
+        modal = app.screen
+        await pilot.press("ctrl+n")
+        assert app.screen is modal
+        assert app._document_identity == second_id
+        await pilot.press("escape")
+        await pilot.pause()
+        app.editor.load_text("SELECT current_time")
+        app.action_ai()
+        await pilot.pause()
+        composer = app.ai_panel.query_one("#ai-input", TextArea)
+        composer.load_text("Keep this unsent question")
+        composer.focus()
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+        assert app.editor.text == ""
+        assert any(chat.input == "Keep this unsent question" for chat in app.ai_chats.chats.values())
+        app.action_fn()
+        await pilot.pause()
+        app.function_editor.query_one("#fn-name", Input).value = "unsaved_function"
+        app.function_editor.query_one("#fn-body", TextArea).load_text("SELECT 42")
+        app.function_editor.query_one("#fn-name", Input).focus()
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+        assert not app.function_mode
+        assert app.editor.text == ""
+        assert session.workspace["function_draft"]["name"] == "unsaved_function"
+        assert session.workspace["function_draft"]["body"] == "SELECT 42"
+        assert not session.history
+
+
+@async_test
+async def test_bound_button_hover_displays_real_shortcuts():
+    from textual.widgets import Button, Tooltip
+
+    app = D8RApp(Session())
+    app.TOOLTIP_DELAY = 0.01
+    async with app.run_test(size=(160, 60), tooltips=True) as pilot:
+        await pilot.pause()
+        await pilot.hover("#query-new")
+        await pilot.pause(0.1)
+        tooltip = app.screen.query_one(Tooltip)
+        assert tooltip.display
+        assert "Ctrl+N" in str(tooltip.content)
+        app.action_fn()
+        await pilot.pause()
+        await pilot.hover("#fn-preview")
+        await pilot.pause(0.1)
+        assert tooltip.display
+        assert "Ctrl+R" in str(tooltip.content)
+        assert "F5" in str(tooltip.content)
+        app.action_ai()
+        await pilot.pause()
+        await pilot.hover("#ai-send")
+        await pilot.pause(0.1)
+        assert tooltip.display
+        assert "Ctrl+Enter" in str(tooltip.content)
+        assert app.query_one("#ai-cancel", Button).tooltip is None
+        app.action_add_source()
+        await pilot.pause()
+        cancel = app.screen.query_one("#cancel", Button)
+        cancel.scroll_visible(immediate=True)
+        await pilot.pause()
+        await pilot.hover(cancel)
+        await pilot.pause(0.1)
+        tooltip = app.screen.query_one(Tooltip)
+        assert tooltip.display
+        assert "Escape" in str(tooltip.content)
+        await pilot.press("escape")

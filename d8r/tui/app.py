@@ -47,7 +47,7 @@ from .query_editor import QueryTextArea
 from .page_details import PageDetails
 from .results import ResultsTable
 from .session import RunOutcome, Session
-from .settings import SettingsScreen
+from .settings import SettingsScreen, binding_tooltip
 from .fn import FnEditor, FnExplorer, HINT as FUNCTION_HINT
 from .layout import PaneSplitter
 from . import splash
@@ -172,6 +172,7 @@ class D8RApp(App):
         Binding("ctrl+r", "preview_function", "Preview function", show=False),
         Binding("ctrl+d", "delete_function", "Delete function", show=False),
         Binding("ctrl+o", "add_source", "Data source", priority=True),
+        Binding("ctrl+n", "new_query", "New query", priority=True),
         # The way back into Settings when the Intellisense switch has the
         # palette shut — `\settings` itself needs the popup.
         Binding("ctrl+comma", "settings", "Settings", priority=True),
@@ -233,9 +234,11 @@ class D8RApp(App):
                             yield Tree(Text("datasets"), id="schema-tree")
                     with TabPane("Pages", id="tab-pages"):
                         with Horizontal(id="page-actions"):
-                            yield Button("New", id="page-new", compact=True)
+                            yield Button("New", id="page-new", compact=True,
+                                         tooltip=binding_tooltip(self.BINDINGS, "new_query"))
                             yield Button("Duplicate", id="page-duplicate", compact=True)
-                            yield Button("Delete", id="page-delete", compact=True, disabled=True)
+                            yield Button("Delete", id="page-delete", compact=True, disabled=True,
+                                         tooltip=binding_tooltip(DeleteOptionList.BINDINGS, "delete_selected", context="Pages list focused"))
                         yield Input(placeholder="Search all pages…", id="page-search")
                         yield DeleteOptionList(id="pages-list", markup=False)
                         yield Static("↑/↓ select · Enter open · Delete remove", id="pages-hint", markup=False)
@@ -255,7 +258,7 @@ class D8RApp(App):
                             yield Static("", id="source-version", markup=False)
                         with Horizontal(id="document-actions"):
                             yield Button("New Query", id="query-new", compact=True,
-                                         tooltip="Create a blank query page; keep the current draft")
+                                         tooltip=binding_tooltip(self.BINDINGS, "new_query") + " · Keep the current draft")
                             yield Button("Ask AI", id="open-ai", compact=True)
                             yield Button("Show Page Details", id="page-details-toggle", compact=True)
                             yield Button("Reconnect", id="reconnect-source", compact=True)
@@ -276,7 +279,8 @@ class D8RApp(App):
                         with TabPane("Results", id="tab-results"):
                             yield Static("", id="results-error", markup=False)
                             with Horizontal(id="results-actions"):
-                                yield Button("Copy selection", id="results-copy", compact=True)
+                                yield Button("Copy selection", id="results-copy", compact=True,
+                                             tooltip=binding_tooltip(ResultsTable.BINDINGS, "copy_selection", context="Results table focused"))
                                 yield Button("Export CSV…", id="results-export", compact=True)
                                 yield Button("Pin result", id="results-pin", compact=True)
                             yield ResultsTable(id="results-table", zebra_stripes=True, cursor_type="cell")
@@ -295,7 +299,8 @@ class D8RApp(App):
                 with Horizontal(id="assistant-controls", classes="pane-controls"):
                     yield Static("AI / Agents", classes="pane-title")
                     yield Button(Content("[x]"), id="assistant-close", classes="pane-close",
-                                 compact=True, tooltip="Hide AI and Agents pane · reopen with Ask AI or Ctrl+J")
+                                 compact=True, tooltip="Hide AI and Agents pane · reopen with Ask AI or "
+                                 + binding_tooltip(self.BINDINGS, "agents"))
                 with TabbedContent(id="assistant-tabs"):
                     with TabPane("AI", id="tab-ai"):
                         yield AIPanel(
@@ -557,9 +562,13 @@ class D8RApp(App):
 
     @on(Button.Pressed, "#page-new")
     @on(Button.Pressed, "#query-new")
-    def _new_page(self) -> None:
-        if self.refuse_busy("New query page"):
+    def action_new_query(self) -> None:
+        """Open a blank query without discarding query, function or chat drafts."""
+        if self._modal_open() or self.refuse_busy("New query page"):
             return
+        if self.function_mode:
+            self.action_workspace()
+        self.ai_panel._flush_chat()
         self._flush_workspace()
         self._cancel_connection()
         self._load_document("")
@@ -1038,6 +1047,8 @@ class D8RApp(App):
             self.exit()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action == "new_query":
+            return not self._modal_open()
         if action in {"preview_function", "delete_function"}:
             return self.function_mode and not self._modal_open() and not self.ai_panel.has_focus_within
         return super().check_action(action, parameters)
