@@ -15,7 +15,7 @@ from itertools import chain
 import math
 import re
 
-from d8r.sql import RoutineDef, SchemaContext, SqlError, lex_sql, relation_parts
+from d8r.sql import FnDef, RoutineDef, SchemaContext, SqlError, format_parameters, lex_sql, parameter_types, relation_parts
 
 from .catalog import dialect_name, expressions_for, functions_for, keywords_for, types_for
 from .context import analyze
@@ -23,7 +23,7 @@ from .models import Completion, Context, Field, Relation, Signature, Suggestion
 
 _LIMIT = 80
 _RELATION_CLAUSES = frozenset({"from", "join", "into", "update", "table", "relation", "insert"})
-_COLUMN_CLAUSES = frozenset({"insert_columns", "update_set", "set", "using"})
+_COLUMN_CLAUSES = frozenset({"insert_columns", "update_set", "set", "using", "identifier"})
 Usage = Mapping[tuple[str, str, str], int]
 Values = Callable[[str, str], tuple[list[object], bool] | None]
 
@@ -149,7 +149,8 @@ def _routines(schema: SchemaContext, dialect: str) -> Iterable[RoutineDef]:
     names = {_parts(routine.name, dialect)[-1].casefold() for routine in available}
     yield from (routine for routine in expressions_for(dialect) if routine.name not in names)
     for fn in schema.fns:
-        yield RoutineDef(fn.name, tuple(fn.params), "table", fn.doc, "table")
+        parameters = tuple(format_parameters(fn).split(", ")) if fn.params else ()
+        yield RoutineDef(fn.name, parameters, "table", fn.doc, "table", parameter_types=parameter_types(fn))
 
 
 def _call_routines(context: Context, schema: SchemaContext, dialect: str) -> list[RoutineDef]:
@@ -230,7 +231,8 @@ def _columns(context: Context, offers: _Offers, dialect: str, expected: str, fol
             ambiguous = names[field.name] > 1 and context.clause not in _COLUMN_CLAUSES
             qualified = bool(context.qualifier) or ambiguous
             label = relation.reference + "." + field.name if qualified else field.name
-            insert = relation.reference + "." + component if ambiguous and not context.qualifier else component
+            insert = (relation.reference + "." + component
+                      if context.clause not in _COLUMN_CLAUSES and not context.qualifier else component)
             detail = " · ".join(part for part in (field.type, relation.reference,
                                                   "outer scope" if relation.outer else "") if part)
             item = Suggestion(label, insert, detail, "column", field.doc)
@@ -330,7 +332,8 @@ def _tables(document: str, context: Context, schema: SchemaContext, offers: _Off
     qualifier = _parts(context.qualifier, dialect) if context.qualifier else ()
     following_dot = _following(document, context.end).startswith(".")
     following_alias = _following_alias(document, context.end)
-    alias_allowed = (context.clause in {"from", "join"}
+    fresh = context.statement_relation_start is not None and dialect_name(dialect) == "postgres"
+    alias_allowed = ((fresh or context.clause in {"from", "join"})
                      and not _has_following_alias(document, context.end)
                      and not _following(document, context.end).startswith((".", "(")))
     for relation in context.ctes:
@@ -346,16 +349,31 @@ def _tables(document: str, context: Context, schema: SchemaContext, offers: _Off
         parts = _parts(table.name, dialect)
         if following_dot or (qualifier and parts[:-1] != qualifier):
             continue
-        if _match(context.token, parts[-1]) is None:
+        match_name = parts[-1]
+        if fresh and not qualifier and len(parts) > 1:
+            qualified_name = ".".join(parts)
+            qualified_match = _match(context.token, qualified_name)
+            table_match = _match(context.token, match_name)
+            if qualified_match is not None and (table_match is None or qualified_match < table_match):
+                match_name = qualified_name
+        if _match(context.token, match_name) is None:
             continue
         insert = (_identifier(parts[-1], dialect, context.quote) if qualifier or len(parts) == 1
                   else _qualified(table.name, dialect))
         label = parts[-1] if qualifier else table.name
         alias = _identifier(_alias(parts[-1], context), dialect) if alias_allowed else ""
+        if fresh:
+            insert = ".".join(_identifier(part, dialect, '"') for part in parts)
         if alias:
             insert += " AS " + alias
-        offers.add(Suggestion(label, insert, table.doc or "table", "table", table.doc, table=table.name),
-                   name=parts[-1], relevance=1, category="dataset", usage_name=table.name)
+        cursor_back = 0
+        if fresh:
+            insert = "SELECT  FROM " + insert
+            cursor_back = len(insert) - len("SELECT ")
+        offers.add(Suggestion(label, insert, table.doc or "table", "table", table.doc,
+                              cursor_back=cursor_back,
+                              start=context.statement_relation_start if fresh else None, table=table.name),
+                   name=match_name, relevance=1, category="dataset", usage_name=table.name)
         reference = alias or (following_alias[0] if following_alias else "")
         join_end = following_alias[1] if following_alias else context.end
         if (context.clause == "join" and reference
@@ -422,6 +440,36 @@ def _functions(document: str, context: Context, schema: SchemaContext,
         offers.add(Suggestion(label, insert + call_suffix, detail,
                               "function", routine.doc, 0 if has_paren else 1, end=call_end),
                    name=parts[-1], relevance=2, category="function", usage_name=parts[-1])
+
+
+def function_insertion(document: str, offset: int, fn: FnDef, schema: SchemaContext,
+                       *, dialect: str = "postgres") -> Suggestion | None:
+    """Insert a picked local relation using the same scope and suffix rules as completion."""
+    context = analyze(document, offset, schema, dialect=dialect)
+    fresh = context.statement_relation_start is not None
+    if (context.blocked or context.qualifier or context.call is not None
+            or context.relation_transition
+            or not (fresh or context.clause in {"from", "join"})):
+        return None
+    following = _following(document[:context.statement_end], context.end)
+    has_paren = following.startswith("(")
+    if fresh and following and not has_paren:
+        return None
+    insert = ("SELECT * FROM " if fresh else "") + fn.name
+    end = context.end
+    if has_paren:
+        end = context.statement_end - len(following) + 1
+        insert += document[context.end:end]
+    else:
+        insert += "()"
+    cursor_back = 0 if has_paren or not fn.params else 1
+    if fresh and not has_paren and context.statement_end == len(document):
+        insert += ";"
+        if fn.params:
+            cursor_back += 1
+    return Suggestion(fn.name, insert, fn.doc, "function", fn.doc,
+                      cursor_back=cursor_back,
+                      start=context.start, end=end)
 
 
 def _fk_conditions(source: Relation, target: Relation, dialect: str) -> Iterable[str]:
@@ -686,6 +734,15 @@ def complete(document: str, offset: int, schema: SchemaContext, *, dialect: str 
     if context.clause == "statement" and context.call is None:
         if not context.qualifier and not context.quote:
             _syntax(document, context, offers, dialect)
+        if context.statement_relation_start is not None and dialect_name(dialect) == "postgres":
+            _tables(document, context, schema, offers, dialect)
+        return Completion(context, offers.result(), signature)
+    if context.call and expected == "relation":
+        _tables(document, replace(context, clause="relation", statement_relation_start=None), schema, offers, dialect)
+        return Completion(context, offers.result(), signature)
+    if context.call and expected == "identifier":
+        if not context.qualifier and not _following(document, context.end).startswith("."):
+            _columns(context, offers, dialect, "")
         return Completion(context, offers.result(), signature)
     if context.clause in {"type", "cast", "cast_type"}:
         for name in types_for(dialect):
@@ -713,7 +770,10 @@ def complete(document: str, offset: int, schema: SchemaContext, *, dialect: str 
             for field in schema.pool:
                 table = min(field.tables, key=lambda name: offers.usage.get(
                     ("column", name, field.name), 1 << 60), default="")
-                offers.add(Suggestion(field.name, _identifier(field.name, dialect, context.quote),
+                insert = _identifier(field.name, dialect, context.quote)
+                if table:
+                    insert = _qualified(table, dialect) + "." + insert
+                offers.add(Suggestion(field.name, insert,
                                       field.type + " · " + ", ".join(field.tables), "column", field.doc),
                            name=field.name, relevance=3, category="column",
                            table=table)

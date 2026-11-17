@@ -243,14 +243,16 @@ def test_session_only_override_preserves_remembered_credentials():
     assert Session().postgres_profiles[0]["password"] == "remembered"
 
 
-def test_ai_remember_off_stays_session_only(credential_backend):
+def test_ai_remember_off_saves_settings_but_never_persists_key(credential_backend):
     session = Session()
     config = AIConfig(base_url="https://example.com/v1", model="example", api_key="temporary-ai-secret")
-    session.update_settings(ai=config, persist_ai=False)
+    session.update_settings(ai=config, remember_ai_key=False)
     session.update_settings(default_rows=25)
     session.save_fn("one", "", "SELECT 1", "")
     assert session.ai_config.api_key == "temporary-ai-secret"
-    assert Session().ai_config.api_key == ""
+    restored = Session()
+    assert restored.ai_config == replace(config, api_key="")
+    assert not restored.ai_remember_key
     assert not credential_backend.values
     assert "temporary-ai-secret" not in session.settings_path.read_text(encoding="utf-8")
 

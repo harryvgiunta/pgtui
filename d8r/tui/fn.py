@@ -19,14 +19,17 @@ from uuid import uuid4
 from typing import TYPE_CHECKING
 
 from textual import on
+from textual.binding import Binding
+from textual.message import Message
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.content import Text
+from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, OptionList, Select, Static, TextArea
 from textual.widgets.option_list import Option
 
 from d8r.ai.context import AIProposal
-from d8r.sql import is_identifier
+from d8r.sql import FnDef, format_parameters, is_identifier
 
 from .ai import AIPanel, AITarget
 
@@ -38,34 +41,34 @@ if TYPE_CHECKING:
 
 NEW = "＋ New function…"
 
-HINT = "select a function · ctrl+r preview · ctrl+d delete · ctrl+space complete · F4 AI complete · escape intellisense · ctrl+q back"
+HINT = "select a function · ctrl+r preview · ctrl+d delete · ctrl+space complete · F4 AI complete · escape / ctrl+q back"
 
-PARAMETER_GUIDE = """1. Declare names, not values
-Parameters: min_id
-No @, types or defaults here.
-Names must be unique identifiers.
+PARAMETER_GUIDE = """1. Declare ordered parameters
+min_id, source:relation, field:identifier
+Bare names are SQL expressions.
+No @ or defaults in this field.
 
 2. Write one native SQL query
-SELECT id, label FROM data
+SELECT @field FROM @source
 WHERE id > @min_id
 
 Keep @parameters unquoted.
-Save checks placeholders and
-expansion, not server grammar.
+Identifier: one column/name.
+Relation: table or schema.table.
+For split names: @schema.@table,
+declare both as identifier.
+Double-quote names with spaces.
+Expressions use SQL single-quoted text.
 
-3. Try it on the selected source
-Name: rows_above
-Preview arguments: 1
-Run preview saves, then runs it.
+3. Save locally; preview explicitly
+Save checks expansion, not server SQL.
+Run preview saves, then runs the query.
 
-4. Call it from a SQL document
-SELECT * FROM rows_above(1)
-
-Arguments are SQL expressions
-in parameter order. Quote text
-with single quotes: 'alpha'.
-No parameters? Leave both fields
-blank and call name()."""
+4. Insert from the Functions picker
+Search, Down to rows, Enter inserts.
+Edit selected opens the saved draft.
+Quality templates install locally only;
+queries run only when you request it."""
 
 
 class FnBodyPane(EditorPane):
@@ -80,19 +83,188 @@ class FnBodyPane(EditorPane):
 
 
 class FnExplorer(Vertical):
-    """The Functions tab, available from either workspace editor."""
+    """Searchable source-local call picker; editing and installation are explicit."""
+
+    BINDINGS = [
+        Binding("escape", "back", "Back to query", show=False, priority=True),
+        Binding("down", "enter_list", "Function list", show=False, priority=True),
+        Binding("up", "focus_search", "Search functions", show=False, priority=True),
+    ]
+
+    DEFAULT_CSS = """
+    FnExplorer #fn-search { height: 3; }
+    FnExplorer .fn-library-actions { height: auto; }
+    FnExplorer #fn-list { min-height: 4; height: 1fr; }
+    """
+
+    class InsertRequested(Message):
+        def __init__(self, name: str) -> None:
+            super().__init__()
+            self.name = name
+
+    class EditRequested(Message):
+        def __init__(self, name: str) -> None:
+            super().__init__()
+            self.name = name
+
+    class InstallQualityRequested(Message):
+        pass
+
+    class BackRequested(Message):
+        """Leave the picker without inserting or changing a definition."""
+
+    def __init__(self, *, manage: bool = True, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._manage = manage
+        self._functions: tuple[FnDef, ...] = ()
 
     def compose(self) -> ComposeResult:
-        yield Button("Use current query page as function", id="query-to-fn", compact=True,
-                     tooltip="Copy the current query into a new function draft; nothing is saved or run")
+        yield Input(placeholder="Search functions, parameters or descriptions", id="fn-search")
+        if self._manage:
+            with Horizontal(classes="fn-library-actions"):
+                yield Button("Edit selected", id="fn-edit-selected", compact=True)
+                yield Button("New", id="fn-new", compact=True)
+            yield Button("Use current query page as function", id="query-to-fn", compact=True,
+                         tooltip="Copy the current query into a new function draft; nothing is saved or run")
+            yield Button("Install quality templates", id="fn-install-quality", compact=True,
+                         tooltip="Store native SQL definitions locally for this source; no SQL is run; collisions cancel the entire install")
         yield OptionList(id="fn-list")
-        with VerticalScroll(id="fn-param-guide"):
-            yield Static("How parameters work", classes="guide-title")
-            yield Static(PARAMETER_GUIDE, markup=False)
+        if self._manage:
+            with VerticalScroll(id="fn-param-guide"):
+                yield Static("How parameters work", classes="guide-title")
+                yield Static(PARAMETER_GUIDE, markup=False)
+        else:
+            yield Static("No matching saved functions. Add or install templates in Functions for this source.",
+                         id="fn-picker-empty", markup=False)
+
+    def focus_search(self) -> None:
+        self.query_one("#fn-search", Input).focus()
+
+    def action_back(self) -> None:
+        self.post_message(self.BackRequested())
+
+    def show_functions(self, functions, selected: str = "") -> None:
+        """Accept this workspace editor's library, never fetch schema or rows."""
+        self._functions = tuple(functions.values() if hasattr(functions, "values") else functions)
+        self._draw(selected)
+
+    def _draw(self, selected: str = "") -> None:
+        search = self.query_one("#fn-search", Input).value.casefold().split()
+        rows = []
+        for fn in self._functions:
+            signature = format_parameters(fn) or "no arguments"
+            detail = f"{signature} · {fn.doc}" if fn.doc else signature
+            haystack = f"{fn.name} {detail}".casefold()
+            if all(term in haystack for term in search):
+                rows.append((fn.name, detail))
+        if self._manage and not search:
+            rows.append((NEW, "define a new function"))
+        listing = self.query_one("#fn-list", OptionList)
+        listing.clear_options()
+        listing.add_options(Option(prompt(name, detail), id=name) for name, detail in rows)
+        listing.highlighted = next((i for i, (name, _) in enumerate(rows) if name == selected),
+                                   0 if rows else None)
+        if self._manage:
+            self.query_one("#fn-edit-selected", Button).disabled = not rows
+        else:
+            self.query_one("#fn-picker-empty", Static).display = not rows
+
+    @on(Input.Changed, "#fn-search")
+    def _filter(self, event: Input.Changed) -> None:
+        event.stop()
+        self._draw()
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action in {"enter_list", "focus_search"}:
+            if not self.is_mounted:
+                return False
+            if action == "enter_list":
+                return self.query_one("#fn-search", Input).has_focus
+            listing = self.query_one("#fn-list", OptionList)
+            return listing.has_focus and listing.highlighted in (None, 0)
+        return super().check_action(action, parameters)
+
+    def action_enter_list(self) -> None:
+        listing = self.query_one("#fn-list", OptionList)
+        listing.focus()
+        if listing.option_count and listing.highlighted is None:
+            listing.highlighted = 0
+
+    def action_focus_search(self) -> None:
+        self.focus_search()
+
+    @on(OptionList.OptionSelected, "#fn-list")
+    def _choose(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        name = str(event.option_id or "")
+        if name == NEW:
+            self.post_message(self.EditRequested(""))
+        elif name:
+            self.post_message(self.InsertRequested(name))
+
+    @on(Button.Pressed, "#fn-edit-selected")
+    def _edit_selected(self, event: Button.Pressed) -> None:
+        event.stop()
+        listing = self.query_one("#fn-list", OptionList)
+        if listing.highlighted is not None:
+            name = str(listing.get_option_at_index(listing.highlighted).id or "")
+            self.post_message(self.EditRequested("" if name == NEW else name))
+
+    @on(Button.Pressed, "#fn-new")
+    def _new(self, event: Button.Pressed) -> None:
+        event.stop()
+        self.post_message(self.EditRequested(""))
+
+    @on(Button.Pressed, "#fn-install-quality")
+    def _install(self, event: Button.Pressed) -> None:
+        event.stop()
+        self.post_message(self.InstallQualityRequested())
+
+
+class FunctionPicker(ModalScreen[FnDef | None]):
+    """Reuse the source-local library for a draft-only function reference."""
+
+    DEFAULT_CSS = """
+    FunctionPicker { align: center middle; }
+    FunctionPicker > FnExplorer {
+        width: 80;
+        max-width: 95%;
+        height: 65%;
+        padding: 1 2;
+        background: $surface;
+        border: round $primary;
+    }
+    """
+
+    def __init__(self, functions: tuple[FnDef, ...]) -> None:
+        super().__init__()
+        self._functions = {fn.name: fn for fn in functions}
+
+    def compose(self) -> ComposeResult:
+        explorer = FnExplorer(manage=False)
+        explorer.border_title = "Insert a saved function into chat"
+        yield explorer
+
+    def on_mount(self) -> None:
+        explorer = self.query_one(FnExplorer)
+        explorer.show_functions(self._functions)
+        explorer.focus_search()
+
+    @on(FnExplorer.InsertRequested)
+    def _choose(self, event: FnExplorer.InsertRequested) -> None:
+        event.stop()
+        self.dismiss(self._functions.get(event.name))
+
+    @on(FnExplorer.BackRequested)
+    def _back(self, event: FnExplorer.BackRequested) -> None:
+        event.stop()
+        self.dismiss(None)
 
 
 class FnEditor(Vertical):
     """A persistent function draft in the workspace's middle editor slot."""
+
+    BINDINGS = [Binding("escape", "back", "Back to query", show=False, priority=True)]
 
 
     def __init__(self, ide: "D8RApp", **kwargs) -> None:
@@ -142,10 +314,10 @@ class FnEditor(Vertical):
                 yield Input(self._initial_fields["description"], placeholder="one line on what it returns", id="fn-doc")
             with Horizontal(classes="fn-field"):
                 yield Static("Parameters")
-                yield Input(self._initial_fields["parameters"], placeholder="min_amount (names in order, no @)", id="fn-params")
+                yield Input(self._initial_fields["parameters"], placeholder="min_amount, source:relation, field:identifier", id="fn-params")
             with Horizontal(classes="fn-field"):
                 yield Static("Preview arguments")
-                yield Input(self._initial_fields["arguments"], placeholder="1, 'alpha' (SQL expressions in parameter order)", id="fn-args")
+                yield Input(self._initial_fields["arguments"], placeholder="data, id, 1 (SQL values or declared names, in order)", id="fn-args")
             with FnBodyPane(id="fn-body-pane"):
                 yield QueryTextArea(self._initial_fields["body"], id="fn-body", show_line_numbers=True,
                                     dialect=self.session.sources[self.source_id].dialect)
@@ -167,7 +339,7 @@ class FnEditor(Vertical):
         self.preview_grid.cursor_type = "cell"
         self.query_one("#fn-reconnect").display = not self.session.source_connected(self.source_id)
         self._draft_body = self.query_one("#fn-body", TextArea)
-        self._draft_body.border_title = "SQL body · @param binds an expression"
+        self._draft_body.border_title = "SQL body · @param binds its declared kind"
         self._draft_inputs = {
             key: self.query_one(selector, Input) for key, selector in (
                 ("name", "#fn-name"), ("description", "#fn-doc"),
@@ -333,7 +505,7 @@ class FnEditor(Vertical):
     def _parameter_names(self) -> list[str]:
         """Read this form's unsaved signature; invalid/duplicate names aren't offers."""
         names = self.query_one("#fn-params", Input).value.split(",")
-        return list(dict.fromkeys(name for part in names if is_identifier(name := part.strip())))
+        return list(dict.fromkeys(name for part in names if is_identifier(name := part.partition(":")[0].strip())))
 
     @on(Input.Changed, "#fn-params")
     def _parameters_changed(self) -> None:
@@ -360,7 +532,7 @@ class FnEditor(Vertical):
         assert fn is not None
         self.query_one("#fn-name", Input).value = fn.name.strip()
         self.query_one("#fn-doc", Input).value = fn.doc.strip()
-        self.query_one("#fn-params", Input).value = ", ".join(fn.params)
+        self.query_one("#fn-params", Input).value = format_parameters(fn)
         self.query_one("#fn-args", Input).value = proposal.arguments
         self.query_one("#fn-body", TextArea).load_text(proposal.body)
         self.query_one(CommandPalette).close()
@@ -397,19 +569,14 @@ class FnEditor(Vertical):
     # -- drawing -------------------------------------------------------------
 
     def _draw_list(self, highlight: int | None = None) -> None:
-        """Redraw the library list from live state, with one row highlighted."""
-        rows: list[tuple[str, str]] = []
-        for fn in self.session.functions_for(self.source_id).values():
-            signature = ", ".join(fn.params) if fn.params else "no arguments"
-            detail = f"{signature} · {fn.doc}" if fn.doc else f"{signature} · {len(fn.body.splitlines())} lines"
-            rows.append((fn.name, detail))
-        rows.append((NEW, "define a new function"))
-        if highlight is None:
-            highlight = next((index for index, (name, _) in enumerate(rows) if name == self.selected), len(rows) - 1)
-        listing = self.ide.query_one("#fn-list", OptionList)
-        listing.clear_options()
-        listing.add_options([Option(prompt(name, detail), id=name) for name, detail in rows])
-        listing.highlighted = max(0, min(highlight, len(rows) - 1))
+        """Refresh the picker using the visible workspace editor's source."""
+        source_id = self.source_id if self.ide.function_mode else self.session.active_id
+        functions = self.session.functions_for(source_id)
+        selected = self.selected
+        if highlight is not None:
+            keys = list(functions)
+            selected = keys[highlight] if 0 <= highlight < len(keys) else NEW
+        self.ide.query_one(FnExplorer).show_functions(functions, selected)
 
     def _select(self, name: str) -> None:
         """Highlight `name` in the list and load it (or a blank form) into the fields."""
@@ -428,7 +595,7 @@ class FnEditor(Vertical):
         with self.prevent(Input.Changed, TextArea.Changed, TextArea.SelectionChanged):
             self.query_one("#fn-name", Input).value = fn.name if fn else ""
             self.query_one("#fn-doc", Input).value = fn.doc if fn else ""
-            self.query_one("#fn-params", Input).value = ", ".join(fn.params) if fn else ""
+            self.query_one("#fn-params", Input).value = format_parameters(fn) if fn else ""
             self.query_one("#fn-args", Input).value = ""
             self.query_one("#fn-body", TextArea).load_text(fn.body if fn else "")
         self.preview_grid.clear(columns=True)

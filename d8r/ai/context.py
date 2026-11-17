@@ -11,7 +11,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from d8r.engine import execute_sql, sample_rows, transaction_open
-from d8r.sql import FnDef, SqlError, is_identifier, parse_sql, validate_function
+from d8r.sql import FnDef, SqlError, format_parameters, is_identifier, parse_parameters, parse_sql, validate_function
 
 if TYPE_CHECKING:
     from d8r.tui.session import Session
@@ -73,13 +73,15 @@ set original_name to its exact saved name and preserve that name in name. Renami
 is not supported by AI proposals; never overwrite another function or silently
 turn an edit into a new definition. For a function draft, original_name must
 match the snapshot's function_name (null for a new draft).
-parameters is an ordered list of bare names (no @, types, or defaults). arguments
-is a string of example call values in that order, quoting strings. Use [] and ""
+parameters is an ordered list of name, name:expression, name:identifier or name:relation
+declarations (no @ or defaults). Identifier takes one safely quoted column/name;
+relation takes a table or schema.table. arguments is a string of example SQL call
+values in that order (single quotes for text, double quotes for names). Use [] and ""
 when no parameters are needed. Preserve parameters unless the request calls for
 changing them. Infer sensible details from the request and schema; ask only if
 intent is unclear. For validate_sql, supply the proposed parameters AND body, even
 when parameters is empty. Saved function bodies are single SQL queries with
-@parameter expression placeholders, called as SELECT * FROM function_name(args).
+@parameter placeholders of the declared kind, called as SELECT * FROM function_name(args).
 They expand locally; do not wrap saved templates in CREATE FUNCTION.
 Validation checks only lexical/template structure, never server syntax or schema.
 save_function checks the supplied signature before persisting, without execution.
@@ -135,6 +137,13 @@ def _tool(name: str, description: str, properties: dict, required: tuple[str, ..
         "parameters": {"type": "object", "properties": properties,
                        "required": list(required), "additionalProperties": False},
     }}
+
+
+def _function_parameters(declarations: tuple[str, ...] | list[str]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    names, kinds = parse_parameters(", ".join(declarations))
+    if len(names) != len(declarations):
+        raise SqlError("Each parameter list item must contain exactly one declaration.")
+    return names, kinds
 
 
 class AIContext:
@@ -219,6 +228,8 @@ class AIContext:
         snapshot = {"source": self.source_id, "dialect": self.source.dialect,
                     "source_kind": self.source.kind,
                     "server_version": self.source.server_version or "not connected",
+                    "connected": self.session.source_connected(self.source_id),
+                    "metadata_cache_info": self.session.schema_cache_info(self.source_id),
                     "current_time_utc": datetime.now(timezone.utc).isoformat(),
                     "default_rows": self.session.default_rows,
                     "document": self.document,
@@ -226,6 +237,8 @@ class AIContext:
                     "function_name": self.function_name or None,
                     "declared_parameters": self.parameters}
         permissions = (
+            "When metadata_cache_info is nonempty, schema and server version are from an offline "
+            "snapshot and may be stale, not live or newly verified. "
             "Only use the tools supplied for this request. When schema or sample reads are disabled, "
             "use context already shared by the user or earlier tool results; explain missing context "
             "rather than inventing tables, columns or values."
@@ -240,8 +253,12 @@ class AIContext:
         if self.session.sources.get(self.source_id) is not self.source:
             return "The source changed; start a new chat."
         if self.parameters is not None:
+            try:
+                names, kinds = _function_parameters(self.parameters)
+            except SqlError as exc:
+                return str(exc)
             return self._validate_function(FnDef(
-                name=self.function_name or "proposal", params=self.parameters, body=text,
+                name=self.function_name or "proposal", params=names, body=text, param_types=kinds,
             ))
         document = parse_sql(text, self._current_functions(), dialect=self.source.dialect)
         if document.errors:
@@ -297,7 +314,8 @@ class AIContext:
                 or not isinstance(fields["parameters"], list)
                 or any(not isinstance(param, str) for param in fields["parameters"])):
             raise ValueError("The function details are incomplete. Ask the AI to fix the draft.")
-        return AIProposal(body, FnDef(name=fields["name"], params=fields["parameters"],
+        names, kinds = _function_parameters(fields["parameters"])
+        return AIProposal(body, FnDef(name=fields["name"], params=names, param_types=kinds,
                                      body=body, doc=fields["description"]), fields["arguments"],
                           fields["original_name"])
 
@@ -352,7 +370,7 @@ class AIContext:
         return self._validate_function(proposal.function, proposal.arguments)
 
     def _validate_function(self, fn: FnDef, arguments: str = "") -> str | None:
-        if sum(map(len, (fn.body, fn.name, fn.doc, arguments, *fn.params))) > 64000:
+        if sum(map(len, (fn.body, fn.name, fn.doc, arguments, *fn.params, *fn.param_types))) > 64000:
             return "The proposal exceeds 64,000 characters."
         if not is_identifier(fn.name):
             return "The function name must be one bare identifier."
@@ -369,7 +387,8 @@ class AIContext:
 
     def _save_function(self, args: dict) -> dict:
         """Validate and commit without yielding between the live guard and save."""
-        fn = FnDef(name=args["name"], params=args["parameters"], body=args["body"], doc=args["description"])
+        names, kinds = _function_parameters(args["parameters"])
+        fn = FnDef(name=args["name"], params=names, param_types=kinds, body=args["body"], doc=args["description"])
         proposal = AIProposal(fn.body, fn, original_name=args["original_name"])
         error = self.validate_replacement(proposal)
         if error is None:
@@ -378,7 +397,7 @@ class AIContext:
             return {"saved": False, "error": error}
         try:
             with self.session.target_source(self.source_id):
-                saved = self.session.save_fn(fn.name, ", ".join(fn.params), fn.body, fn.doc)
+                saved = self.session.save_fn(fn.name, format_parameters(fn), fn.body, fn.doc)
         except Exception:
             # Storage/backend failures may include paths or connection details.
             return {"saved": False, "error": "Function could not be saved. Resolve the local storage error and retry; nothing was executed."}
@@ -494,14 +513,16 @@ class AIContext:
             elif name == "functions":
                 query = args.get("query", "").casefold()
                 result = {"functions": [
-                    {"name": fn.name, "description": fn.doc[:1000], "parameters": fn.params, "body": fn.body[:6000]}
+                    {"name": fn.name, "description": fn.doc[:1000],
+                     "parameters": format_parameters(fn).split(", ") if fn.params else [], "body": fn.body[:6000]}
                     for fn in {**self._functions, **self.saved_functions}.values()
                     if query in (fn.name + " " + fn.doc).casefold()
                 ][:15]}
             else:
                 if "parameters" in args:
+                    names, kinds = _function_parameters(args["parameters"])
                     error = self._validate_function(FnDef(
-                        name=self.function_name or "proposal", params=args["parameters"], body=args["text"],
+                        name=self.function_name or "proposal", params=names, param_types=kinds, body=args["text"],
                     ))
                 else:
                     error = self.validate_proposal(args["text"])
@@ -532,6 +553,8 @@ class AIContext:
                 break
         return {"source": self.source_id, "dialect": self.source.dialect,
                 "server_version": self.source.server_version, "tables": tables,
+                "connected": self.session.source_connected(self.source_id),
+                "metadata_cache_info": self.session.schema_cache_info(self.source_id),
                 "note": "Cached metadata only; at most 40 tables and 100 columns each. Use table/query to narrow."}
 
     async def _test_query(self, text: str) -> dict:

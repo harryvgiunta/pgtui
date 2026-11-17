@@ -35,13 +35,14 @@ from textual.widgets import (
 from textual.widgets.option_list import Option
 
 from d8r.ai.context import AIProposal
+from d8r.completion.engine import function_insertion
 from d8r.engine import POSTGRES_VERSION, DataSource
-from d8r.sql import ColumnDef
+from d8r.sql import ColumnDef, format_parameters
 from d8r.themes import COZY_PASTEL
 
 from .add_source import AddSourceModal
 from .connection import ConnectionProgress, build_saved_source, saved_source_label
-from .ai import AIChats, AIPanel, AITarget, AgentsPane, DeleteOptionList
+from .ai import AIChats, AIPanel, AITarget, ConversationTabs, DeleteOptionList
 from .palette import CommandPalette, EditorPane
 from .query_editor import QueryTextArea
 from .page_details import PageDetails
@@ -139,23 +140,21 @@ class D8RApp(App):
     TITLE = "PGTUI"
     SUB_TITLE = "native SQL IDE"
 
-    # Result tabs, left explorer and right-side assistant/agents tabs stay
-    # mounted across editor modes.
+    # Result tabs, explorer and conversation panel stay mounted across modes.
     TAB_PANES: dict[str, str] = {
         "results": "tab-results",
         "sql": "tab-sql",
         "history": "tab-history",
     }
     PANES: dict[str, str] = {
-        **TAB_PANES, "schema": "#schema-pane", "agents": "tab-agents", "ai": "#workspace-ai",
+        **TAB_PANES, "schema": "#schema-pane", "ai": "#workspace-ai",
     }
     PANE_TITLES: dict[str, str] = {
         "results": "Results pane",
         "sql": "SQL pane",
         "history": "History pane",
         "schema": "Schema pane",
-        "agents": "Agents tab",
-        "ai": "AI pane (right)",
+        "ai": "AI conversations (right)",
     }
     # Autosave after typing pauses; one timer absorbs the whole key-repeat burst.
     _WORKSPACE_SAVE_INTERVAL = 0.2
@@ -164,7 +163,7 @@ class D8RApp(App):
     # editor claims ctrl+k for "delete to line end" and the app needs it.
     BINDINGS = [
         Binding("ctrl+q", "back_or_quit", "Back / Quit", show=False),
-        Binding("ctrl+j", "agents", "Agents", priority=True),
+        Binding("ctrl+j", "conversations", "Conversations", priority=True),
         Binding("ctrl+enter", "run_or_chat", "Run", priority=True),
         Binding("f5", "run", "Run", priority=True, show=False),
         Binding("ctrl+k", "compile", "SQL preview", priority=True),
@@ -202,6 +201,7 @@ class D8RApp(App):
         self._function_started = bool(self.session.workspace.get("function_draft"))
         self._page_rows: tuple = ()
         self._value_reads: dict[tuple[int, str, str, int], asyncio.Task] = {}
+        self._function_pick: tuple | None = None
         self._connection_progress: ConnectionProgress | None = None
         self._connection_generation = 0
         self._startup_connection_started = False
@@ -297,18 +297,15 @@ class D8RApp(App):
                                min_size=28, min_remaining=30, id="ai-splitter")
             with Vertical(id="assistant-slot"):
                 with Horizontal(id="assistant-controls", classes="pane-controls"):
-                    yield Static("AI / Agents", classes="pane-title")
+                    yield Static("Conversations", classes="pane-title")
                     yield Button(Content("[x]"), id="assistant-close", classes="pane-close",
-                                 compact=True, tooltip="Hide AI and Agents pane · reopen with Ask AI or "
-                                 + binding_tooltip(self.BINDINGS, "agents"))
-                with TabbedContent(id="assistant-tabs"):
-                    with TabPane("AI", id="tab-ai"):
-                        yield AIPanel(
-                            self.session, self._ai_target, self._apply_ai_document,
-                            self._focus_editor, reveal=self._reveal_ai_chat, id="workspace-ai",
-                        )
-                    with TabPane("Agents", id="tab-agents"):
-                        yield AgentsPane(id="workspace-agents")
+                                 compact=True, tooltip="Hide conversations · reopen with Ask AI or "
+                                 + binding_tooltip(self.BINDINGS, "conversations"))
+                yield ConversationTabs(id="conversation-tabs")
+                yield AIPanel(
+                    self.session, self._ai_target, self._apply_ai_document,
+                    self.action_workspace, reveal=self._reveal_ai_chat, id="workspace-ai",
+                )
         with Vertical(id="footer"):
             yield Static(KEY_HINTS, id="keymap")
             yield Static("", id="status", markup=False)
@@ -339,6 +336,8 @@ class D8RApp(App):
         if self.session.credential_warning:
             self._set_status(self.session.credential_warning)
             self.notify(self.session.credential_warning, title="Credential storage", severity="warning", timeout=15)
+        if self.session.metadata_cache_warning:
+            self.notify(self.session.metadata_cache_warning, title="Metadata cache", severity="warning", timeout=15)
         self.editor.focus()
         self._queue_workspace_save()
         self._flush_workspace()
@@ -741,7 +740,7 @@ class D8RApp(App):
             return
         if proposal.function is not None:
             fn = proposal.function
-            self.session.save_fn(fn.name, ", ".join(fn.params), proposal.body, fn.doc)
+            self.session.save_fn(fn.name, format_parameters(fn), proposal.body, fn.doc)
             self.refresh_functions()
             self._set_status(f'Function "{fn.name}" saved locally · query unchanged and not executed')
             return
@@ -806,7 +805,9 @@ class D8RApp(App):
             "PostgreSQL" if source.dialect == "postgres" else "DuckDB")
         version = source.server_version or (f"target {POSTGRES_VERSION}" if source.dialect == "postgres" else "")
         state = "" if self.session.source_connected() else " · disconnected"
-        self.query_one("#source-version", Static).update(f"{label} {version}{state}")
+        cache_info = self.session.schema_cache_info()
+        self.query_one("#source-version", Static).update(
+            f"{label} {version}{state}" + (f" · {cache_info}" if cache_info else ""))
 
     def _sync_source_select(self) -> None:
         select = self.query_one("#source-select", Select)
@@ -922,10 +923,9 @@ class D8RApp(App):
 
     @on(Button.Pressed, "#assistant-close")
     def _close_assistant(self) -> None:
-        if not self.update_settings(panes={"ai": False, "agents": False}):
+        if not self.update_settings(panes={"ai": False}):
             return
         self.set_pane("ai", False)
-        self.set_pane("agents", False)
 
 
     def pane_visible(self, name: str) -> bool:
@@ -934,7 +934,7 @@ class D8RApp(App):
             return self.session.pane_visibility["schema"]
         if name == "ai":
             return self.ai_panel.display
-        tabs = self.query_one("#assistant-tabs" if name == "agents" else "#result-tabs", TabbedContent)
+        tabs = self.query_one("#result-tabs", TabbedContent)
         return tabs.get_tab(self.PANES[name]).display
 
     def set_pane(self, name: str, visible: bool) -> None:
@@ -949,7 +949,7 @@ class D8RApp(App):
                 self.ai_panel.action_close()
             self.call_after_refresh(self._refresh_splitters)
             return
-        tabs = self.query_one("#assistant-tabs" if name == "agents" else "#result-tabs", TabbedContent)
+        tabs = self.query_one("#result-tabs", TabbedContent)
         pane_id = self.PANES[name]
         if visible:
             if name in self.TAB_PANES:
@@ -994,13 +994,7 @@ class D8RApp(App):
 
     def _refresh_splitters(self) -> None:
         self.query_one("#explorer-splitter").display = self.query_one("#explorer-slot").display
-        tabs = self.query_one("#assistant-tabs", TabbedContent)
-        if tabs.get_tab("tab-ai").display != self.ai_panel.display:
-            if self.ai_panel.display:
-                tabs.show_tab("tab-ai")
-            else:
-                tabs.hide_tab("tab-ai")
-        visible = self.ai_panel.display or self.pane_visible("agents")
+        visible = self.ai_panel.display or self.session.pane_visibility["ai"]
         self.query_one("#assistant-slot").display = visible
         self.query_one("#ai-splitter").display = visible
         self._refresh_pages()
@@ -1015,16 +1009,7 @@ class D8RApp(App):
 
     def _reveal_ai_chat(self) -> None:
         self._refresh_splitters()
-        self.query_one("#assistant-tabs", TabbedContent).active = "tab-ai"
-
-    @on(TabbedContent.TabActivated, "#assistant-tabs")
-    def _assistant_tab_changed(self, event: TabbedContent.TabActivated) -> None:
-        if not self._workspace_ready or event.pane.id != event.tabbed_content.active:
-            return
-        if event.pane.id == "tab-agents":
-            self.ai_panel._flush_chat()
-            self.call_after_refresh(self.ai_chats.refresh_agents)
-        elif (chat := self.ai_panel.chat) is not None and chat.unread:
+        if (chat := self.ai_panel.chat) is not None and chat.unread:
             chat.unread = False
             self.ai_chats.persist(chat)
             self.ai_chats.changed(chat)
@@ -1048,7 +1033,11 @@ class D8RApp(App):
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if action == "new_query":
-            return not self._modal_open()
+            focused = self.screen.focused
+            in_conversations = focused is not None and any(
+                isinstance(widget, ConversationTabs) for widget in (focused, *focused.ancestors)
+            )
+            return not self._modal_open() and not in_conversations
         if action in {"preview_function", "delete_function"}:
             return self.function_mode and not self._modal_open() and not self.ai_panel.has_focus_within
         return super().check_action(action, parameters)
@@ -1285,8 +1274,46 @@ class D8RApp(App):
         self.push_screen(SettingsScreen(self))
 
     def action_fn(self) -> None:
-        """`\\fn` — open the function library."""
-        self._open_fn()
+        """Open a searchable library without replacing the active editor."""
+        if self._modal_open():
+            return
+        if not self.session.pane_visibility["schema"] and not self.update_settings(panes={"schema": True}):
+            return
+        self._function_pick = self._function_pick_snapshot()
+        for palette in self.query(CommandPalette):
+            palette.close()
+        self.set_pane("schema", True)
+        self.query_one("#explorer-tabs", TabbedContent).active = "tab-functions"
+        source_id = self.function_editor.source_id if self.function_mode else self.session.active_id
+        explorer = self.query_one(FnExplorer)
+        explorer.show_functions(self.session.functions_for(source_id))
+        self.call_after_refresh(explorer.focus_search)
+
+    def action_dbt(self) -> None:
+        if not self._modal_open():
+            from .dbt import DBTScreen
+            self.push_screen(DBTScreen(self))
+
+    def set_dbt_project_dir(self, path: str) -> bool:
+        workspaces = deepcopy(self.session.workspace["source_workspaces"])
+        state = workspaces.setdefault(self.session.source_key(), {
+            "document_id": self._document_identity, "function_draft": None, "active_view": "workspace",
+        })
+        state["dbt_project_dir"] = path
+        return self.save_workspace(source_workspaces=workspaces)
+
+    def apply_dbt_import(self, sql: str) -> None:
+        """Apply an explicitly imported model as one undoable native SQL edit."""
+        editor = self.function_editor.query_one("#fn-body", TextArea) if self.function_mode else self.editor
+        editor.history.checkpoint()
+        end = editor.document.get_location_from_index(len(editor.text))
+        editor.replace(sql, (0, 0), end, maintain_selection_offset=False)
+        editor.move_cursor((0, 0))
+        editor.history.checkpoint()
+        for palette in self.query(CommandPalette):
+            palette.close()
+        self.ai_panel.target_changed()
+        self._set_status("dbt model imported · native SQL draft only; nothing executed")
 
     def action_query_to_fn(self) -> None:
         """Open a new function draft without saving or rewriting the document."""
@@ -1319,20 +1346,26 @@ class D8RApp(App):
         self.ai_panel.open()
         self.call_after_refresh(self._refresh_splitters)
 
-    def action_agents(self) -> None:
-        """Reveal and focus the right tab without changing the active editor."""
+    def action_conversations(self) -> None:
+        """Reveal recent conversations without changing the query document."""
         if self._modal_open():
             return
-        for panel in self.ai_chats.panels():
-            panel._flush_chat()
-        panes = {"agents": True}
-        if any(not self.session.pane_visibility[name] for name in panes):
-            if not self.update_settings(panes=panes):
-                return
+        if not self.update_settings(panes={"ai": True}):
+            return
         self.palette.close()
-        self.set_pane("agents", True)
         self._refresh_splitters()
-        self.query_one("#agents-list", OptionList).focus()
+        self.ai_chats.refresh_conversations()
+        self.query_one(ConversationTabs).focus()
+
+    @on(ConversationTabs.Selected)
+    def _conversation_selected(self, event: ConversationTabs.Selected) -> None:
+        event.stop()
+        self.open_ai_chat(event.chat_id)
+
+    @on(ConversationTabs.NewChatRequested)
+    def _new_conversation(self, event: ConversationTabs.NewChatRequested) -> None:
+        event.stop()
+        self.ai_panel.action_clear()
 
     def open_ai_chat(self, chat_id: str | None) -> None:
         chat = self.ai_chats.chats.get(chat_id)
@@ -1395,9 +1428,69 @@ class D8RApp(App):
         self.editor.focus()
         self.palette.sync()
 
-    @on(OptionList.OptionSelected, "#fn-list")
-    def _function_selected(self, event: OptionList.OptionSelected) -> None:
-        self.function_editor.select_function(str(event.option_id or ""))
+    def _function_pick_snapshot(self) -> tuple:
+        editor = self.function_editor.query_one("#fn-body", TextArea) if self.function_mode else self.editor
+        source_id = self.function_editor.source_id if self.function_mode else self.session.active_id
+        # Local insertion belongs to a saved source and document, not a live
+        # connection instance or the other editor's inactive draft.
+        identity = self.function_editor._draft_identity if self.function_mode else self._document_identity
+        return (editor, editor.text, editor.cursor_location, getattr(editor, "document_load_serial", 0),
+                self.session.source_key(source_id), identity, self.function_mode)
+
+    @on(FnExplorer.BackRequested)
+    def _leave_function_picker(self, event: FnExplorer.BackRequested) -> None:
+        event.stop()
+        self._function_pick = None
+        self.action_workspace()
+
+    @on(FnExplorer.InsertRequested)
+    def _insert_function(self, event: FnExplorer.InsertRequested) -> None:
+        event.stop()
+        current = self._function_pick_snapshot()
+        if self._function_pick is not None and self._function_pick != current:
+            self._set_status("The editor target changed; reopen Functions before inserting.")
+            return
+        editor, document, caret, *_ = current
+        source_id = self.function_editor.source_id if self.function_mode else self.session.active_id
+        source = self.session.sources[source_id]
+        fn = self.session.functions_for(source.id).get(event.name)
+        if fn is None:
+            return
+        self._function_pick = None
+        offset = editor.document.get_index_from_location(caret)
+        with self.session.target_source(source.id):
+            edit = function_insertion(document, offset, fn, self.session.schema, dialect=source.dialect)
+        if edit is None:
+            self._set_status("Local functions return tables; insert at a new statement or after FROM/JOIN, or use Run preview.")
+            return
+        editor.history.checkpoint()
+        editor.replace(edit.insert, editor.document.get_location_from_index(edit.start),
+                       editor.document.get_location_from_index(edit.end), maintain_selection_offset=False)
+        editor.cursor_location = editor.document.get_location_from_index(edit.start + len(edit.insert) - edit.cursor_back)
+        editor.history.checkpoint()
+        editor.focus()
+        self._set_status(f"Inserted {fn.name} · nothing executed")
+
+    @on(FnExplorer.EditRequested)
+    def _edit_function(self, event: FnExplorer.EditRequested) -> None:
+        event.stop()
+        self._function_pick = None
+        self._open_fn(focus=event.name, restore_draft=bool(event.name))
+
+    @on(FnExplorer.InstallQualityRequested)
+    def _install_quality_functions(self, event: FnExplorer.InstallQualityRequested) -> None:
+        event.stop()
+        if self.refuse_busy("Install quality library"):
+            return
+        source_id = self.function_editor.source_id if self.function_mode else self.session.active_id
+        try:
+            with self.session.target_source(source_id):
+                count = self.session.install_quality_functions()
+        except ValueError as exc:
+            self._set_status(str(exc))
+            return
+        self.refresh_functions()
+        self._set_status(f"Installed {count} data-quality functions · nothing executed")
 
     def _render_results(self, outcome: RunOutcome) -> None:
         self._main_outcome = outcome
@@ -1529,6 +1622,8 @@ class D8RApp(App):
         if activate and self.select_source(source.id):
             detail = f"{len(source.datasets)} tables · {source.server_version}"
             self._set_status(f"{source.id} added · {detail}")
+        if self.session.metadata_cache_warning:
+            self.notify(self.session.metadata_cache_warning, title="Metadata cache", severity="warning", timeout=15)
         if isinstance(self.screen, SettingsScreen):
             self.screen._draw()
 
@@ -1591,13 +1686,13 @@ class D8RApp(App):
     def _inspect_column(self, node) -> None:
         source = self.session.source
         data = node.data
-        if not self.session.source_connected():
-            self._set_status("Reconnect this source before inspecting values.")
-            node.collapse()
-            return
         cached = self.session.cached_values(source, data["dataset"], data["name"])
         if cached is not None:
             self._render_distinct_values(node, *cached)
+            return
+        if not self.session.source_connected():
+            self._set_status("Reconnect this source before inspecting values.")
+            node.collapse()
             return
         node.remove_children()
         node.add_leaf(Text("Loading distinct values…", style="dim"), data={"kind": "note"})
@@ -1632,6 +1727,29 @@ class D8RApp(App):
         self.session.busy = ""
         if not task.cancelled():
             task.exception()  # Also consume failures after a consumer or the app has closed.
+
+    @on(CommandPalette.ValuesRequested)
+    def _completion_values_requested(self, event: CommandPalette.ValuesRequested) -> None:
+        event.stop()
+        if (self._closing or self.session.busy or event.source.con is None
+                or not self.session.value_cache_enabled or not event.palette.values_current(event.snapshot)):
+            return
+        self.run_worker(self._complete_values(event), group="completion-values", exit_on_error=False)
+
+    async def _complete_values(self, request: CommandPalette.ValuesRequested) -> None:
+        epoch = self.session.value_cache_epoch
+        try:
+            await self._column_values(request.source, request.table, request.column)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Driver messages can include secrets. Explicit Ctrl+Space retries.
+            if not self._closing and request.palette.values_current(request.snapshot):
+                self._set_status("Could not load column values; Ctrl+Space retries when the connection is available.")
+            return
+        if (not self._closing and epoch == self.session.value_cache_epoch
+                and self.session.sources.get(request.source.id) is request.source):
+            request.palette.values_ready(request.snapshot, request.source, request.table, request.column)
 
     @on(CommandPalette.HistoryPreviewChanged)
     def _history_preview_changed(self, event: CommandPalette.HistoryPreviewChanged) -> None:
@@ -1778,6 +1896,7 @@ class D8RApp(App):
         actions = {
             "run": self.action_run,
             "compile": self.action_compile,
+            "dbt": self.action_dbt,
             "add-source": self.action_add_source,
             "history": self.action_toggle_history,
             "toggle-results": self.action_toggle_results,

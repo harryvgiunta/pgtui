@@ -1,0 +1,602 @@
+"""Offline, explicit dbt file exchange; never imports or invokes a dbt runtime.
+
+Only literal ref/source/config calls are interpreted. Relation names come from
+manifest artifacts or literal source YAML, never profiles or schema guesses.
+"""
+from __future__ import annotations
+
+import ast
+from dataclasses import dataclass
+from copy import deepcopy
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+from typing import Any
+
+import yaml
+
+from d8r.sql import (
+    SqlError, Token, _relation_end, _relation_sites, lex_sql, relation_parts,
+    quote_identifier, split_statements,
+)
+
+
+class DbtError(ValueError):
+    """An actionable project or conversion error, safe to show in the form."""
+
+
+class _UniqueLoader(yaml.SafeLoader):
+    pass
+
+
+def _mapping(loader: _UniqueLoader, node: yaml.MappingNode, deep: bool = False) -> dict:
+    # Flatten YAML merges before constructing values, but reject explicit duplicate
+    # keys rather than silently discarding project configuration.
+    keys = [loader.construct_object(key, deep=deep) for key, _ in node.value
+            if key.tag != "tag:yaml.org,2002:merge"]
+    try:
+        if len(keys) != len(set(keys)):
+            raise DbtError("Duplicate YAML keys: resolve them before exchanging this project.")
+    except TypeError as exc:
+        raise DbtError("YAML mapping keys must be scalar values.") from exc
+    loader.flatten_mapping(node)
+    return yaml.SafeLoader.construct_mapping(loader, node, deep=deep)
+
+
+_UniqueLoader.add_constructor("tag:yaml.org,2002:map", _mapping)
+
+
+def _yaml(text: str, path: Path) -> dict:
+    try:
+        value = yaml.load(text, Loader=_UniqueLoader)
+    except yaml.YAMLError as exc:
+        raise DbtError(f"Invalid YAML in {path.name}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise DbtError(f"{path.name} must contain a YAML mapping.")
+    return value
+
+
+def _literal(value: Any) -> bool:
+    return isinstance(value, str) and bool(value) and not any(
+        marker in value for marker in ("{{", "{%", "{#", "\x00")
+    )
+
+
+def _linked(path: Path) -> bool:
+    return path.is_symlink() or path.is_junction()
+
+
+def _safe_root(value: str | Path) -> Path:
+    if not str(value).strip():
+        raise DbtError("Choose a local project directory containing dbt_project.yml.")
+    original = Path(value).expanduser()
+    if ".." in original.parts:
+        raise DbtError("Project paths cannot contain '..' traversal.")
+    root = original.absolute()
+    if any(_linked(item) for item in (root, *root.parents)):
+        raise DbtError("Symlink/junction project paths are refused; choose the real directory.")
+    if not root.is_dir():
+        raise DbtError(f"Project directory does not exist: {root}")
+    return root
+
+
+def _relative(value: str) -> Path:
+    if not isinstance(value, str) or not value or "\\" in value or ":" in value:
+        raise DbtError("Use a nonempty project-relative path with '/' separators.")
+    path = PurePosixPath(value)
+    if path.is_absolute() or ".." in path.parts:
+        raise DbtError(f"Absolute paths and '..' traversal are refused: {value}")
+    if any(part.lower() in {"profiles.yml", "profiles.yaml"} for part in path.parts):
+        raise DbtError("Credential profiles are outside dbt exchange and are never accessed.")
+    return Path(*path.parts)
+
+
+@dataclass(frozen=True)
+class ImportedModel:
+    sql: str
+    name: str
+    materialized: str
+    description: str
+    config: dict[str, Any]
+    used_compiled: bool = False
+
+
+@dataclass(frozen=True)
+class ExportedModel:
+    sql_path: Path
+    yaml_path: Path
+    sql: str
+
+
+@dataclass(frozen=True)
+class _Relation:
+    kind: str
+    package: str
+    name: str
+    relation: str
+    source: str = ""
+    version: Any = None
+    latest_version: Any = None
+
+    def expression(self) -> str:
+        if self.kind == "source":
+            call = f"source({self.source!r}, {self.name!r})"
+        else:
+            args = f"{self.package!r}, {self.name!r}"
+            if self.version is not None:
+                args += f", version={self.version!r}"
+            call = f"ref({args})"
+        return "{{ " + call + " }}"
+
+
+def _name(token: Token, dialect: str) -> str:
+    return (relation_parts(token.text, dialect=dialect) or (token.text,))[0]
+
+
+def _cte_ranges(tokens: tuple[Token, ...], dialect: str) -> list[tuple[str, int, int]]:
+    """Record lexical CTE visibility, including nested WITH and recursive bodies."""
+    pairs: dict[int, int] = {}
+    stack: list[int] = []
+    enclosing: dict[int, int | None] = {}
+    for i, token in enumerate(tokens):
+        enclosing[i] = stack[-1] if stack else None
+        if token.kind == "symbol" and token.text == "(":
+            stack.append(i)
+        elif token.kind == "symbol" and token.text == ")" and stack:
+            pairs[stack.pop()] = i
+    ranges = []
+    for i, token in enumerate(tokens):
+        if token.kind != "word" or token.text.upper() != "WITH":
+            continue
+        end = pairs.get(enclosing[i], len(tokens))
+        j = i + 1
+        recursive = j < len(tokens) and tokens[j].text.upper() == "RECURSIVE"
+        j += int(recursive)
+        definitions = []
+        while j < end and tokens[j].kind in {"word", "quoted_identifier"}:
+            name = _name(tokens[j], dialect)
+            j += 1
+            if j < end and tokens[j].text == "(":
+                j = pairs.get(j, end) + 1
+            if j >= end or tokens[j].text.upper() != "AS":
+                break
+            j += 1
+            if j < end and tokens[j].text.upper() == "NOT":
+                j += 1
+            if j < end and tokens[j].text.upper() == "MATERIALIZED":
+                j += 1
+            if j >= end or tokens[j].text != "(" or j not in pairs:
+                break
+            closing = pairs[j]
+            definitions.append((name, j if recursive else closing + 1, end))
+            j = closing + 1
+            if j >= end or tokens[j].text != ",":
+                break
+            j += 1
+        ranges.extend(definitions)
+    return ranges
+
+
+def _call(expression: str) -> tuple[str, list[Any], dict[str, Any]]:
+    """Parse literal call syntax, with no eval, attribute access, or Jinja runtime."""
+    try:
+        node = ast.parse(expression.strip(), mode="eval").body
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            raise ValueError
+        if node.func.id not in {"ref", "source", "config"}:
+            raise ValueError
+        if any(keyword.arg is None for keyword in node.keywords):
+            raise ValueError
+        def literal(item):
+            if isinstance(item, ast.Name) and item.id in {"true", "false", "none"}:
+                return {"true": True, "false": False, "none": None}[item.id]
+            if isinstance(item, ast.List):
+                return [literal(child) for child in item.elts]
+            if isinstance(item, ast.Tuple):
+                return tuple(literal(child) for child in item.elts)
+            if isinstance(item, ast.Dict):
+                return {literal(key): literal(value) for key, value in zip(item.keys, item.values)}
+            value = ast.literal_eval(item)
+            if value is not None and not isinstance(value, (str, int, float, bool)):
+                raise ValueError
+            return value
+        args = [literal(item) for item in node.args]
+        kwargs = {item.arg: literal(item.value) for item in node.keywords}
+        if len(kwargs) != len(node.keywords):
+            raise ValueError
+        return node.func.id, args, kwargs
+    except (SyntaxError, ValueError, TypeError, RecursionError) as exc:
+        raise DbtError("Advanced/dynamic Jinja requires an actual compiled artifact. Compile outside PGTUI, then reload.") from exc
+
+
+class DbtProject:
+    """A user-opened local project snapshot. Construction performs file reads only."""
+
+    def __init__(self, directory: str | Path, *, dialect: str = "postgres") -> None:
+        if dialect not in {"postgres", "sqlite", "duckdb"}:
+            raise DbtError("dbt exchange supports PostgreSQL, SQLite and DuckDB SQL only.")
+        self.root = _safe_root(directory)
+        self.dialect = dialect
+        self.project = _yaml(self._read("dbt_project.yml"), self.root / "dbt_project.yml")
+        self.name = self.project.get("name")
+        if not _literal(self.name):
+            raise DbtError("dbt_project.yml needs a literal project name.")
+        _relative(self.name)
+        if "/" in self.name:
+            raise DbtError("The dbt project name cannot contain path separators.")
+        paths = self.project.get("model-paths", ["models"])
+        if not isinstance(paths, list) or not paths:
+            raise DbtError("model-paths must be a nonempty list of relative directories.")
+        self.model_paths = tuple(self._path(path) for path in paths)
+        target = self.project.get("target-path", "target")
+        self.target = self._path(target)
+        self.models: tuple[str, ...] = ()
+        self.yaml_files: dict[Path, dict] = {}
+        models = []
+        for directory_path in self.model_paths:
+            if not directory_path.exists():
+                continue
+            if not directory_path.is_dir():
+                raise DbtError(f"Model path is not a directory: {directory_path}")
+            for current, dirs, files in os.walk(directory_path, followlinks=False):
+                for child in dirs + files:
+                    candidate = Path(current) / child
+                    self._path(candidate.relative_to(self.root).as_posix())
+                for filename in files:
+                    path = Path(current) / filename
+                    if path.suffix.lower() == ".sql":
+                        models.append(path.relative_to(self.root).as_posix())
+                    elif path.suffix.lower() in {".yml", ".yaml"}:
+                        self.yaml_files[path] = _yaml(self._read(path.relative_to(self.root).as_posix()), path)
+        self.models = tuple(sorted(set(models)))
+        manifest_path = self._path((self.target / "manifest.json").relative_to(self.root).as_posix())
+        self.manifest: dict = {}
+        if manifest_path.exists():
+            try:
+                self.manifest = json.loads(self._read(manifest_path.relative_to(self.root).as_posix()))
+            except json.JSONDecodeError as exc:
+                raise DbtError("Invalid manifest.json; regenerate the artifact outside PGTUI.") from exc
+            if not isinstance(self.manifest, dict):
+                raise DbtError("manifest.json must contain an object.")
+        self.relations: list[_Relation] = []
+        self.nodes: list[dict] = []
+        self._index()
+
+    def _path(self, value: str) -> Path:
+        path = self.root / _relative(value)
+        current = self.root
+        if _linked(current):
+            raise DbtError(f"Symlink/junction paths are refused: {current}")
+        for part in path.relative_to(self.root).parts:
+            current = current / part
+            if _linked(current):
+                raise DbtError(f"Symlink/junction paths are refused: {current}")
+        return path
+
+    def _read(self, value: str) -> str:
+        path = self._path(value)
+        try:
+            return path.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeError) as exc:
+            raise DbtError(f"Cannot read {path.name}: {exc}") from exc
+
+    def _index(self) -> None:
+        source_keys = set()
+        for group in ("nodes", "sources"):
+            entries = self.manifest.get(group, {})
+            if not isinstance(entries, dict):
+                raise DbtError(f"manifest.json {group} must be an object.")
+            for node in entries.values():
+                if not isinstance(node, dict):
+                    raise DbtError(f"manifest.json contains an invalid {group} entry.")
+                kind = node.get("resource_type", "source" if group == "sources" else "")
+                if kind == "source":
+                    source_keys.add((node.get("source_name"), node.get("name")))
+                config = node.get("config") or {}
+                if not isinstance(config, dict):
+                    raise DbtError("Manifest node config must be an object.")
+                if config.get("enabled") is False:
+                    continue
+                if kind == "model":
+                    self.nodes.append(node)
+                if kind not in {"model", "seed", "snapshot", "source"}:
+                    continue
+                relation = node.get("relation_name")
+                if not _literal(relation) or relation_parts(relation, dialect=self.dialect) is None:
+                    continue
+                if config.get("materialized") == "ephemeral":
+                    continue
+                package, name = node.get("package_name"), node.get("name")
+                if not _literal(package) or not _literal(name):
+                    continue
+                self.relations.append(_Relation(
+                    "source" if kind == "source" else "ref", package, name, relation,
+                    str(node.get("source_name", "")), node.get("version"), node.get("latest_version"),
+                ))
+        for data in self.yaml_files.values():
+            for source in self._entries(data, "sources"):
+                source_name = source.get("name")
+                for table in self._entries(source, "tables"):
+                    name = table.get("name")
+                    if (source_name, name) in source_keys:
+                        continue
+                    enabled = True
+                    for owner in (source, table):
+                        source_config = owner.get("config", {})
+                        if not isinstance(source_config, dict):
+                            raise DbtError("Source config must be a mapping.")
+                        enabled = source_config.get("enabled", owner.get("enabled", enabled))
+                    if enabled is not True:
+                        continue
+                    schema = source.get("schema", source_name)
+                    database = source.get("database")
+                    identifier = table.get("identifier", name)
+                    parts = ([database] if database is not None else []) + [schema, identifier]
+                    if not all(_literal(part) for part in [source_name, name, *parts]):
+                        continue
+                    quoting = {}
+                    for owner in (self.project, source, table):
+                        policy = owner.get("quoting", {})
+                        if not isinstance(policy, dict) or any(not isinstance(value, bool) for value in policy.values()):
+                            raise DbtError("Source quoting must be a mapping of literal booleans.")
+                        quoting.update(policy)
+                    labels = (["database"] if database is not None else []) + ["schema", "identifier"]
+                    rendered = [quote_identifier(part) if quoting.get(label, True) else part
+                                for label, part in zip(labels, parts)]
+                    if any(relation_parts(value, dialect=self.dialect) is None or
+                           len(relation_parts(value, dialect=self.dialect)) != 1 for value in rendered):
+                        raise DbtError("An unquoted source identifier is not one SQL identifier; enable quoting or supply a manifest.")
+                    self.relations.append(_Relation("source", self.name, name, ".".join(rendered), source_name))
+
+    @staticmethod
+    def _entries(data: dict, key: str) -> list[dict]:
+        entries = data.get(key, [])
+        if not isinstance(entries, list) or any(not isinstance(item, dict) for item in entries):
+            raise DbtError(f"YAML {key} must be a list of mappings.")
+        return entries
+
+    def _model_metadata(self, name: str) -> tuple[Path | None, dict]:
+        matches = [(path, item) for path, data in self.yaml_files.items()
+                   for item in self._entries(data, "models") if item.get("name") == name]
+        if len(matches) > 1:
+            raise DbtError(f"Model {name!r} is described in multiple YAML files; resolve the ambiguity first.")
+        return matches[0] if matches else (None, {})
+
+    def to_dbt(self, sql: str) -> str:
+        try:
+            tokens = tuple(token for token in lex_sql(sql, dialect=self.dialect)
+                           if token.kind not in {"whitespace", "comment"})
+            statements = split_statements(sql, dialect=self.dialect)
+        except SqlError as exc:
+            raise DbtError(str(exc)) from exc
+        if len(statements) != 1 or not tokens or tokens[0].text.upper() not in {"SELECT", "WITH", "VALUES", "TABLE"}:
+            raise DbtError("Export one native SELECT/WITH/VALUES/TABLE query, not a script or DDL statement.")
+        if any(marker in sql for marker in ("{{", "{%", "{#")):
+            raise DbtError("Export expects native SQL, not existing Jinja. Import the model first.")
+        ctes = _cte_ranges(tokens, self.dialect)
+        replacements = []
+        sites = set(_relation_sites(tokens))
+        # PostgreSQL/DuckDB TABLE query shorthand has no FROM keyword.
+        for index, token in enumerate(tokens[:-1]):
+            if token.kind == "word" and token.text.upper() == "TABLE" and (
+                index == 0 or tokens[index - 1].text.upper() in {"(", "UNION", "INTERSECT", "EXCEPT", "ALL"}
+            ):
+                sites.add(index + 1)
+        for start in sorted(sites):
+            end = _relation_end(tokens, start)
+            if end < len(tokens) and tokens[end].text == "(":
+                continue  # native table-valued functions are not dbt relations
+            raw = sql[tokens[start].start:tokens[end - 1].end]
+            parts = relation_parts(raw, dialect=self.dialect)
+            if parts is None:
+                continue
+            if len(parts) == 1 and any(name == parts[0] and low <= start < high for name, low, high in ctes):
+                continue
+            matches = [item for item in self.relations
+                       if relation_parts(item.relation, dialect=self.dialect) == parts]
+            expressions = {item.expression() for item in matches}
+            if len(expressions) != 1:
+                reason = "Ambiguous" if expressions else "No authoritative"
+                raise DbtError(f"{reason} dbt mapping for {raw!r}. Use the exact manifest relation_name or a literal YAML source; refresh artifacts outside PGTUI.")
+            # Preserve comments embedded between qualified identifier components.
+            comments = [token.text for token in lex_sql(raw, dialect=self.dialect) if token.kind == "comment"]
+            suffix = "".join(" " + comment + ("\n" if comment.startswith("--") else " ") for comment in comments)
+            replacements.append((tokens[start].start, tokens[end - 1].end, expressions.pop() + suffix))
+        for start, end, replacement in reversed(replacements):
+            sql = sql[:start] + replacement + sql[end:]
+        return sql
+
+    def _resolve(self, kind: str, args: list, kwargs: dict) -> str:
+        if kind == "source":
+            if len(args) != 2 or kwargs or not all(isinstance(arg, str) for arg in args):
+                raise DbtError("source() requires two literal names.")
+            matches = [item for item in self.relations if item.kind == kind and (item.source, item.name) == tuple(args)]
+        else:
+            if len(args) not in {1, 2} or not all(isinstance(arg, str) for arg in args) or set(kwargs) - {"v", "version"} or len(kwargs) > 1:
+                raise DbtError("ref() requires literal model/package names and optional version=.")
+            package, name = (self.name, args[0]) if len(args) == 1 else args
+            version = kwargs.get("version", kwargs.get("v"))
+            matches = [item for item in self.relations if item.kind == kind and item.package == package and item.name == name
+                       and (item.version == version if version is not None else
+                            item.version is None or item.version == item.latest_version)]
+        values = {item.relation for item in matches}
+        if len(values) != 1:
+            raise DbtError(f"Cannot resolve {kind}{tuple(args)!r} unambiguously. Supply a current manifest with relation_name, or an actual compiled artifact.")
+        return values.pop()
+
+    def _compiled(self, path: str, raw: str, node: dict | None) -> str | None:
+        if node is not None:
+            recorded = node.get("raw_code", node.get("raw_sql"))
+            if recorded is not None and recorded != raw:
+                raise DbtError("The manifest is stale for this model. Compile the current model outside PGTUI and reload.")
+            compiled = node.get("compiled_code", node.get("compiled_sql"))
+            if isinstance(compiled, str) and compiled.strip():
+                return compiled
+        artifact = self.target / "compiled" / self.name / _relative(path)
+        artifact = self._path(artifact.relative_to(self.root).as_posix())
+        if artifact.is_file():
+            if artifact.stat().st_mtime_ns < self._path(path).stat().st_mtime_ns:
+                raise DbtError("The compiled SQL file predates this model. Compile outside PGTUI and reload.")
+            return self._read(artifact.relative_to(self.root).as_posix())
+        return None
+
+    def _project_config(self, path: str, name: str) -> dict:
+        config = {}
+        tree = self.project.get("models", {})
+        relative = self._path(path)
+        directory = next(root for root in self.model_paths if relative.is_relative_to(root))
+        levels = [self.name, *relative.relative_to(directory).parts[:-1], name]
+        for level in [*levels, None]:
+            if not isinstance(tree, dict):
+                raise DbtError("Project model configuration must be a mapping.")
+            for key, value in tree.items():
+                if isinstance(key, str) and key.startswith("+"):
+                    config[key[1:]] = value
+                elif key in {"materialized", "tags", "enabled", "alias", "schema", "database"} and not isinstance(value, dict):
+                    config[key] = value
+            if level is not None:
+                tree = tree.get(level, {})
+        return config
+
+    def import_model(self, path: str) -> ImportedModel:
+        candidate = self._path(path)
+        if path not in self.models:
+            raise DbtError("Select a .sql model within the configured model-paths.")
+        raw = self._read(path)
+        nodes = [node for node in self.nodes if node.get("original_file_path") == path and node.get("package_name") == self.name]
+        if len(nodes) > 1:
+            raise DbtError("Multiple manifest nodes use this file; import an unambiguous compiled model.")
+        node = nodes[0] if nodes else None
+        name = node.get("name", candidate.stem) if node else candidate.stem
+        _, metadata = self._model_metadata(name)
+        config = dict(node.get("config", {})) if node else self._project_config(path, name)
+        yaml_config = metadata.get("config", {})
+        if not isinstance(yaml_config, dict):
+            raise DbtError("Model YAML config must be a mapping.")
+        if node is None:
+            config.update(yaml_config)
+        try:
+            sql = self._simple_import(raw, config)
+            used_compiled = False
+        except DbtError as exc:
+            sql = self._compiled(path, raw, node)
+            if sql is None:
+                raise DbtError(f"{exc} No compiled artifact found in manifest.json or target/compiled/<project>/{path}.") from exc
+            if any(marker in sql for marker in ("{{", "{%", "{#")):
+                raise DbtError("The compiled artifact still contains Jinja; regenerate it outside PGTUI.")
+            used_compiled = True
+        return ImportedModel(sql, name, str(config.get("materialized", "view")),
+                             str(metadata.get("description", node.get("description", "") if node else "")),
+                             config, used_compiled)
+
+    def _simple_import(self, raw: str, config: dict) -> str:
+        if "{%" in raw or "{#" in raw or "{{-" in raw or "-}}" in raw:
+            raise DbtError("Jinja blocks, comments and whitespace controls require compiled SQL.")
+        pattern = re.compile(r"{{(.*?)}}", re.DOTALL)
+        matches = list(pattern.finditer(raw))
+        if "{{" in pattern.sub("", raw) or "}}" in pattern.sub("", raw):
+            raise DbtError("Unbalanced Jinja expression; compile the model outside PGTUI.")
+        result = []
+        offset = 0
+        for match in matches:
+            kind, args, kwargs = _call(match.group(1))
+            if kind == "config":
+                if args:
+                    if len(args) != 1 or not isinstance(args[0], dict) or kwargs:
+                        raise DbtError("config() requires literal keyword arguments or one literal dictionary.")
+                    kwargs = args[0]
+                if any(not isinstance(key, str) for key in kwargs):
+                    raise DbtError("config() keys must be strings.")
+                config.update(kwargs)
+                replacement = ""
+            else:
+                replacement = self._resolve(kind, args, kwargs)
+            result.extend((raw[offset:match.start()], replacement))
+            offset = match.end()
+        result.append(raw[offset:])
+        return "".join(result)
+
+    def export_model(self, sql: str, name: str, materialized: str = "view", description: str = "", *,
+                     overwrite: bool = False, config: dict[str, Any] | None = None) -> ExportedModel:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            raise DbtError("Model name must be one identifier: letters, digits and underscores; no paths.")
+        if materialized not in {"view", "table", "incremental", "ephemeral"}:
+            raise DbtError("Choose view, table, incremental or ephemeral materialization.")
+        matches = [path for path in self.models if Path(path).stem == name]
+        if len(matches) > 1:
+            raise DbtError("Multiple SQL models have this name; choose a unique name.")
+        sql_path = self._path(matches[0]) if matches else self.model_paths[0] / f"{name}.sql"
+        sql_path = self._path(sql_path.relative_to(self.root).as_posix())
+        yaml_path, existing = self._model_metadata(name)
+        if yaml_path is None:
+            yaml_path = sql_path.with_suffix(".yml")
+        yaml_path = self._path(yaml_path.relative_to(self.root).as_posix())
+        if not overwrite and (sql_path.exists() or yaml_path.exists() or existing):
+            raise DbtError("Files or model metadata already exist. Review them and explicitly enable overwrite consent.")
+        data = _yaml(self._read(yaml_path.relative_to(self.root).as_posix()), yaml_path) if yaml_path.exists() else {"version": 2, "models": []}
+        entries = list(self._entries(data, "models"))
+        index = next((index for index, item in enumerate(entries) if item.get("name") == name), None)
+        # Detach YAML aliases so updating this model cannot alter other models.
+        entry = deepcopy(entries[index]) if index is not None else {"name": name}
+        if index is None:
+            entries.append(entry)
+        else:
+            entries[index] = entry
+        entry["description"] = description
+        entry_config = entry.setdefault("config", {})
+        if not isinstance(entry_config, dict):
+            raise DbtError("Existing model config must be a mapping; no files were changed.")
+        if config is not None:
+            if not isinstance(config, dict) or any(not isinstance(key, str) for key in config):
+                raise DbtError("Imported config must be a mapping with string keys.")
+            entry_config.update(deepcopy(config))
+        entry_config["materialized"] = materialized
+        data["models"] = entries
+        converted = self.to_dbt(sql)
+        output = "{{ config(materialized=" + repr(materialized) + ") }}\n" + converted
+        yaml_output = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
+        self._write_pair(sql_path, output, yaml_path, yaml_output, overwrite=overwrite)
+        return ExportedModel(sql_path, yaml_path, output)
+
+    def _write_pair(self, sql_path: Path, sql: str, yaml_path: Path, yaml_text: str, *, overwrite: bool) -> None:
+        """Reserve both destinations before writing; restore originals on I/O failure."""
+        handles = []
+        originals = []
+        try:
+            for path in (sql_path, yaml_path):
+                self._path(path.relative_to(self.root).as_posix())
+                path.parent.mkdir(parents=True, exist_ok=True)
+                exists = path.exists()
+                if exists and not overwrite:
+                    raise DbtError("A destination appeared after preview; explicit overwrite consent is required.")
+                original = path.read_bytes() if exists else None
+                # Exclusive creation closes the normal no-clobber race.
+                handle = path.open("r+b" if exists else "x+b")
+                handles.append((path, handle))
+                originals.append(original)
+            for (_, handle), text in zip(handles, (sql, yaml_text)):
+                handle.seek(0)
+                handle.write(text.encode("utf-8"))
+                handle.truncate()
+                handle.flush()
+        except (OSError, DbtError) as exc:
+            restore_errors = []
+            for (path, handle), original in zip(handles, originals):
+                try:
+                    if original is not None:
+                        handle.seek(0)
+                        handle.write(original)
+                        handle.truncate()
+                        handle.flush()
+                    handle.close()
+                    if original is None:
+                        path.unlink(missing_ok=True)
+                except OSError as restore_error:
+                    restore_errors.append(f"{path.name}: {restore_error}")
+            detail = (" Restoration also failed; inspect files: " + "; ".join(restore_errors)
+                      if restore_errors else " Original file contents retained.")
+            raise DbtError(f"Could not export model: {exc}.{detail}") from exc
+        finally:
+            for _, handle in handles:
+                handle.close()

@@ -19,7 +19,8 @@ from textual.widgets import OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
 from d8r.completion.engine import complete
-from d8r.completion.models import Signature
+from d8r.completion.context import analyze, command_span
+from d8r.completion.models import Field, Signature
 from .session import Session
 
 ACTIONS: tuple[tuple[str, str, str], ...] = (
@@ -27,6 +28,7 @@ ACTIONS: tuple[tuple[str, str, str], ...] = (
     ("SQL preview", "ctrl+k · expand functions without executing", "compile"),
     ("Data source…", "ctrl+o · PostgreSQL, Cloudflare D1 or local Parquet", "add-source"),
     ("Functions…", "open the SQL function library", "fn"),
+    ("dbt…", "import/export project models and configuration", "dbt"),
     ("Query to function", "create a function draft from this document", "query-to-fn"),
     ("Export results", "save selected or buffered rows as CSV", "export-results"),
     ("AI", "chat and review an AI-proposed replacement", "ai"),
@@ -69,6 +71,7 @@ class View:
     end: int | None = None
     signature: Signature | None = None
     hint: str = ""
+    value_field: Field | None = None
 
     @property
     def labels(self) -> list[str]:
@@ -92,21 +95,21 @@ def _location(document: str, offset: int) -> tuple[int, int]:
 def view_for(session: Session, doc: str, line: str, column: int, *,
              parameters: Iterable[str] = (), row: int = 0,
              query_history: bool = True, manual: bool = False) -> View | None:
-    before = line[:column]
     offset = _offset(doc, (row, column))
-    action = re.fullmatch(r"\s*\\([^\\]*)", before)
-    if action:
-        token = action.group(1)
+    source = session.source
+    action = command_span(doc, offset, dialect=source.dialect)
+    if action is not None:
+        start, end, token = action
         entries = [Entry(label, detail=detail, action=name, kind="action")
                    for label, detail, name in ACTIONS
                    if token.casefold() in label.casefold() or token.casefold() in name.casefold()]
-        return View(offset - column + before.index("\\"), token, entries, "command", offset) if entries else None
-    source = session.source
+        return View(start, token, entries, "command", end) if entries else None
     result = complete(doc, offset, session.schema, dialect=source.dialect,
                       parameters=tuple(parameters), usage=session.completion_usage(),
                       values=lambda table, column: session.cached_values(source, table, column),
                       manual=manual)
     context = result.context
+    value_field = context.value_field if not context.blocked else None
     entries = [Entry(item.label, item.insert, item.detail, cursor_back=item.cursor_back,
                      kind=item.kind, documentation=item.documentation,
                      start=item.start, end=item.end, table=item.table) for item in result.items]
@@ -120,10 +123,12 @@ def view_for(session: Session, doc: str, line: str, column: int, *,
                                      "query history", replace_document=True, kind="history"))
                 if len(seen) == 10:
                     break
-    if not entries and result.signature is None and not result.hint:
+    if not entries and result.signature is None and not result.hint and value_field is None:
         return None
     return View(context.start, context.token, entries, end=context.end,
-                signature=result.signature, hint=result.hint)
+                signature=result.signature,
+                hint="\n".join(filter(None, (result.hint, session.schema_cache_info()))),
+                value_field=value_field)
 
 
 class CompletionDetails(VerticalScroll):
@@ -155,6 +160,15 @@ class CommandPalette(OptionList):
             self.action = action
             super().__init__()
 
+    class ValuesRequested(Message):
+        def __init__(self, palette: CommandPalette, source, table: str, column: str, snapshot: tuple) -> None:
+            super().__init__()
+            self.palette = palette
+            self.source = source
+            self.table = table
+            self.column = column
+            self.snapshot = snapshot
+
     class HistoryPreviewChanged(Message):
         def __init__(self, palette: CommandPalette, document: str | None) -> None:
             super().__init__()
@@ -174,6 +188,8 @@ class CommandPalette(OptionList):
         self._view: View | None = None
         self._preferred_width = 40
         self._dismissed = False
+        self._ai_dismissed = False
+        self._load_serial = 0
         self._history_dismissed = False
         self._preview_document: str | None = None
         self._sync_pending = False
@@ -188,6 +204,8 @@ class CommandPalette(OptionList):
         self._last_document = ""
         self._edit_serial = 0
         self._accepting = False
+        self._values_snapshot: tuple | None = None
+        self._close_generation = 0
 
     @property
     def is_open(self) -> bool:
@@ -201,6 +219,7 @@ class CommandPalette(OptionList):
         self.editor = editor
         self._last_document = editor.text
         self._edit_serial = getattr(editor, "user_edit_serial", 0)
+        self._load_serial = getattr(editor, "document_load_serial", 0)
         with self.session.target_source(self.source_id):
             editor.dialect = self.session.source.dialect
         self.set_interval(0.1, self._guard_ai)
@@ -229,14 +248,15 @@ class CommandPalette(OptionList):
                     getattr(self.app, "function_mode", False), self.session.intellisense,
                     self.session.ai_completion, self.session.ai_allow_schema_refreshes,
                     getattr(editor, "user_edit_serial", 0), getattr(editor, "document_load_serial", 0),
-                    getattr(editor, "selection_revision", 0))
+                    getattr(editor, "selection_revision", 0), self._close_generation)
 
     def _eligible(self, *, ai: bool = False) -> bool:
         editor = self.editor
         return bool(editor is not None and editor.is_mounted and editor.is_on_screen
                     and self.app.focused is editor and not editor.read_only
                     and editor.selection.start == editor.selection.end
-                    and self.session.intellisense and (not ai or not self.session.busy)
+                    and self.session.intellisense
+                    and (not ai or not self.session.busy and not self._ai_dismissed)
                     and not self._dismissed and not getattr(self.app, "_closing", False))
 
     def cancel_ai(self) -> None:
@@ -257,20 +277,32 @@ class CommandPalette(OptionList):
     def document_changed(self) -> None:
         self._guard_ai()
         editor = self.editor
-        if editor is None or editor.text == self._last_document:
+        if editor is None:
+            return
+        load_serial = getattr(editor, "document_load_serial", 0)
+        if load_serial != self._load_serial:
+            self._load_serial = load_serial
+            self._dismissed = False
+            self._ai_dismissed = False
+            self._history_dismissed = False
+        if editor.text == self._last_document:
             return
         self._last_document = editor.text
         serial = getattr(editor, "user_edit_serial", 0)
         typed = (serial != self._edit_serial
                  and serial > getattr(editor, "programmatic_edit_serial", 0))
         self._edit_serial = serial
+        if typed:
+            # Escape dismisses an offer, not local completion for future edits.
+            self._dismissed = False
         row, column = editor.cursor_location
         if typed and column and editor.document[row][column - 1] in {"\\", "@"}:
             self._dismissed = False
             self._history_dismissed = False
         self.cancel_ai()
+        self._values_snapshot = self._snapshot() if typed and not self._accepting and self._eligible() else None
         self.queue_sync()
-        if typed and not self._accepting and self.session.ai_completion and self._eligible():
+        if typed and not self._accepting and self.session.ai_completion and self._eligible(ai=True):
             self.request_ai(automatic=True)
 
     def caret_changed(self) -> None:
@@ -295,6 +327,7 @@ class CommandPalette(OptionList):
 
     def sync(self, *, manual: bool = False) -> None:
         self._sync_pending = False
+        values_snapshot, self._values_snapshot = self._values_snapshot, None
         self._guard_ai()
         editor = self.editor
         if editor is None:
@@ -313,8 +346,18 @@ class CommandPalette(OptionList):
             view = view_for(self.session, editor.text, line, column, parameters=self._parameters(),
                             row=row, query_history=self.workspace_actions and not self._history_dismissed,
                             manual=manual)
+            if (view is not None and view.phase == "argument" and view.value_field is not None
+                    and not self.session.busy and self.session.value_cache_enabled
+                    and (manual or values_snapshot is not None and values_snapshot == self._snapshot())):
+                value_field = view.value_field
+                source = self.session.source
+                if (value_field.table and value_field.column
+                        and self.session.cached_values(source, value_field.table, value_field.column) is None):
+                    self.post_message(self.ValuesRequested(self, source, value_field.table,
+                                                           value_field.column, self._snapshot()))
         if view is not None and not self.workspace_actions:
-            view = replace(view, entries=[entry for entry in view.entries if not entry.action])
+            view = replace(view, entries=[entry for entry in view.entries
+                                          if not entry.action or entry.action in {"ai", "fn", "dbt"}])
         if view is None:
             self._hide()
             self._render_details()
@@ -341,6 +384,32 @@ class CommandPalette(OptionList):
         self._show(view)
         return self._accept(choices[0])
 
+    def values_current(self, snapshot: tuple) -> bool:
+        """Guard asynchronous cached-value publication without initiating a read."""
+        return self._eligible() and self._snapshot() == snapshot
+
+    def values_ready(self, snapshot: tuple, source, table: str, column: str) -> bool:
+        """Publish a finished cache read after typing, but never after retarget/dismissal."""
+        if not self._eligible():
+            return False
+        current = self._snapshot()
+        # Only document, caret, user-edit serial and selection revision may advance.
+        # Source/schema, page/draft, load revision, settings and close generation stay fixed.
+        if (len(current) != len(snapshot) or current[2] is not source
+                or any(old != new for index, (old, new) in enumerate(zip(snapshot, current))
+                       if index not in (0, 1, 15, 17))
+                or current[0] != snapshot[0] and current[15] <= snapshot[15]):
+            return False
+        with self.session.target_source(self.source_id):
+            context = analyze(self.editor.text, _offset(self.editor.text, self.editor.cursor_location),
+                              self.session.schema, dialect=source.dialect, parameters=self._parameters())
+        field = context.value_field
+        if context.blocked or field is None or (field.table, field.column) != (table, column):
+            return False
+        self._values_snapshot = None
+        self.sync()
+        return True
+
     def manual_local(self) -> None:
         self.cancel_ai()
         self._dismissed = False
@@ -350,6 +419,7 @@ class CommandPalette(OptionList):
     def request_ai(self, *, automatic: bool = False) -> None:
         if not automatic:
             self._dismissed = False
+            self._ai_dismissed = False
         self.cancel_ai()
         if not self._eligible(ai=True) or (automatic and not self.session.ai_completion):
             return
@@ -357,7 +427,7 @@ class CommandPalette(OptionList):
         if len(document.strip()) < 3:
             return
         row, column = self.editor.cursor_location
-        if self.editor.document[row][:column].lstrip().startswith("\\"):
+        if command_span(document, _offset(document, (row, column)), dialect=self.editor.dialect) is not None:
             return
         if automatic and not any(character.isspace() for character in document.strip()):
             return
@@ -377,7 +447,6 @@ class CommandPalette(OptionList):
                 source = self.session.source
                 document = self.editor.text
                 cursor = _offset(document, self.editor.cursor_location)
-                from d8r.completion.context import analyze
                 context = analyze(document, cursor, self.session.schema, dialect=source.dialect,
                                   parameters=self._parameters())
                 if context.blocked:
@@ -386,7 +455,8 @@ class CommandPalette(OptionList):
                     document=document, cursor=cursor, start=context.start, end=context.end,
                     dialect=source.dialect, server_version=source.server_version,
                     schema=self.session.schema, parameters=self._parameters(),
-                    allow_schema=self.session.ai_allow_schema_refreshes)
+                    allow_schema=self.session.ai_allow_schema_refreshes,
+                    metadata_cache_info=self.session.schema_cache_info())
                 config = self.session.ai_config
             self._ai_status = "AI · requesting suggestions… · Esc cancels"
             self._render_details()
@@ -400,7 +470,7 @@ class CommandPalette(OptionList):
                                  documentation=item.insert)
                            for index, item in enumerate(suggestions)]
                 self._show(View(request.start, document[request.start:cursor], entries,
-                                "ai", request.end))
+                                "ai", request.end, hint=self.session.schema_cache_info(self.source_id)))
             self._render_details()
         except asyncio.CancelledError:
             pass
@@ -532,6 +602,8 @@ class CommandPalette(OptionList):
         self._publish_history_preview()
 
     def close(self) -> None:
+        self._close_generation += 1
+        self._values_snapshot = None
         self.cancel_ai()
         self._hide()
 
@@ -557,12 +629,14 @@ class CommandPalette(OptionList):
         if self._ai_snapshot is not None:
             self.close()
             self._dismissed = True
+            self._ai_dismissed = True
         elif self._view is not None and any(entry.replace_document for entry in self._view.entries):
             self._history_dismissed = True
             self.sync()
         elif self.is_open or (self.details is not None and self.details.display):
             self.close()
             self._dismissed = True
+            self._ai_dismissed = True
         else:
             self._dismissed = False
             self.sync(manual=True)

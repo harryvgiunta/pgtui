@@ -3,7 +3,7 @@
 This is deliberately not a SQL parser. The database owns SQL grammar and name
 resolution. Tokens preserve every byte, including trivia; their kinds are word,
 quoted_identifier, string, dollar_string, number, parameter, symbol, whitespace,
-and comment. Only saved relation calls and their expression parameters expand.
+and comment. Only saved relation calls and their declared parameter kinds expand.
 """
 from __future__ import annotations
 
@@ -19,9 +19,11 @@ class FnDef:
     params: tuple[str, ...] = ()
     body: str = ""
     doc: str = ""
+    param_types: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "params", tuple(self.params))
+        object.__setattr__(self, "param_types", tuple(self.param_types))
 
 
 @dataclass(frozen=True)
@@ -182,6 +184,40 @@ _IDENTIFIERS = frozenset({"word", "quoted_identifier"})
 def is_identifier(text: str) -> bool:
     """Whether text is one unquoted SQL identifier (not a qualified name)."""
     return bool(_WORD.fullmatch(text))
+
+
+PARAMETER_TYPES = frozenset({"expression", "identifier", "relation"})
+
+
+def parse_parameters(text: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Parse the local form's name[:kind] signature without SQL execution."""
+    if not text.strip():
+        return (), ()
+    names: list[str] = []
+    types: list[str] = []
+    for part in text.split(","):
+        name, separator, kind = part.strip().partition(":")
+        name = name.strip()
+        kind = kind.strip() if separator else "expression"
+        if not is_identifier(name) or kind not in PARAMETER_TYPES:
+            raise SqlError("Parameters must be name, name:expression, name:identifier or name:relation.")
+        if name in names:
+            raise SqlError(f"Duplicate parameter: {name}.")
+        names.append(name)
+        types.append(kind)
+    return tuple(names), tuple(types) if any(kind != "expression" for kind in types) else ()
+
+
+def format_parameters(fn: FnDef) -> str:
+    return ", ".join(name if kind == "expression" else f"{name}:{kind}"
+                     for name, kind in zip(fn.params, parameter_types(fn)))
+
+
+def parameter_types(fn: FnDef) -> tuple[str, ...]:
+    if fn.param_types and (len(fn.param_types) != len(fn.params)
+                           or any(kind not in PARAMETER_TYPES for kind in fn.param_types)):
+        raise SqlError(f"{fn.name}() parameter types must match its names and use expression, identifier or relation.")
+    return fn.param_types or ("expression",) * len(fn.params)
 
 
 def quote_identifier(name: str) -> str:
@@ -430,7 +466,7 @@ def _relation_sites(tokens: tuple[Token, ...]) -> Iterable[int]:
                 frames.pop()
         elif text == ";" and token.kind == "symbol":
             frames = [_RelationFrame()]
-        elif word in {"SELECT", "DELETE", "WITH"} and not (word == "WITH" and frame.in_from):
+        elif word in {"SELECT", "DELETE", "WITH"} and not (word == "WITH" and frame.in_from and not frame.expect):
             frame.query = True
             frame.in_from = False
             frame.expect = False
@@ -526,6 +562,7 @@ def _function_body(fn: FnDef, *, dialect: str = "postgres") -> str:
         raise SqlError(f"{fn.name}() parameters must be bare SQL identifiers.")
     if len(set(fn.params)) != len(fn.params):
         raise SqlError(f"{fn.name}() has duplicate parameters.")
+    types = dict(zip(fn.params, parameter_types(fn)))
     statements = split_statements(fn.body, dialect=dialect)
     if len(statements) != 1:
         raise SqlError(f"{fn.name}() must contain exactly one SELECT, WITH, VALUES or TABLE query.")
@@ -558,9 +595,10 @@ def _function_body(fn: FnDef, *, dialect: str = "postgres") -> str:
             index in relation_sites
             or previous is not None and previous.kind == "word" and previous.text.upper() in {"AS", "TABLE", "WITH", "RECURSIVE"}
             or previous is not None and previous.text == "."
+            or following is not None and following.text == "."
             or following is not None and following.text == "("
         )
-        if identifier_slot:
+        if identifier_slot and types[token.text[1:]] == "expression":
             raise SqlError(f"{token.text} is an expression parameter, not an SQL identifier.", line=line)
     return body
 
@@ -600,15 +638,28 @@ def _arguments(text: str, tokens: tuple[Token, ...], opening: int, name: str) ->
     raise SqlError(f"A call to {name}() needs a closing ')'.")
 
 
+def _bound_argument(text: str, kind: str, *, dialect: str) -> str:
+    if kind == "expression":
+        # The newline prevents a trailing line comment swallowing the closer.
+        return "(" + text + "\n)"
+    tokens = lex_sql(text, dialect=dialect)
+    if any(token.kind == "comment" for token in tokens):
+        raise SqlError(f"A {kind} argument cannot contain SQL comments.")
+    parts = relation_parts(text, dialect=dialect)
+    maximum = 1 if kind == "identifier" else 3
+    if parts is None or not 1 <= len(parts) <= maximum:
+        shape = "one column/name" if kind == "identifier" else "a table, schema.table or catalog.schema.table"
+        raise SqlError(f"A {kind} argument must be {shape}, not an SQL expression.")
+    return relation_name(*parts)
+
+
 def _substitute(body: str, arguments: Mapping[str, str], *, dialect: str = "postgres") -> str:
     pieces: list[str] = []
     start = 0
     size = len(body)
     for token in lex_sql(body, dialect=dialect):
         if token.kind == "parameter":
-            # A newline keeps an argument's final -- comment from swallowing the
-            # closing expression parenthesis. Parentheses preserve precedence.
-            argument = "(" + arguments[token.text[1:]] + "\n)"
+            argument = arguments[token.text[1:]]
             size += len(argument) - len(token.text)
             if size > MAX_EXPANDED_SQL:
                 raise SqlError("Saved function expansion is too large.")
@@ -652,7 +703,11 @@ class _Expansion:
                 if len(args) != len(fn.params):
                     raise SqlError(f"{fn.name}() takes {len(fn.params)} argument(s); got {len(args)}.")
                 body = _function_body(fn, dialect=self.dialect)
-                bound = {param: self.expand(arg, stack, depth + 1) for param, arg in zip(fn.params, args)}
+                bound = {
+                    param: _bound_argument(self.expand(arg, stack, depth + 1) if kind == "expression" else arg,
+                                           kind, dialect=self.dialect)
+                    for param, arg, kind in zip(fn.params, args, parameter_types(fn))
+                }
                 body = self.expand(_substitute(body, bound, dialect=self.dialect), (*stack, key), depth + 1)
                 after = end + 1
                 if after < len(tokens) and tokens[after].kind == "word" and tokens[after].text.upper() == "WITH":
@@ -694,8 +749,9 @@ def parse_sql(text: str, functions: Functions = (), *, dialect: str = "postgres"
 def validate_function(fn: FnDef, functions: Functions = (), *, dialect: str = "postgres") -> None:
     registry = _with_function(fn, functions)
     _function_body(fn, dialect=dialect)
-    # NULL is a real expression placeholder, not an attempt to type-check SQL.
-    function_query(fn, ", ".join("NULL" for _ in fn.params), registry, dialect=dialect)
+    # Lexically valid stand-ins only: this does not query schema or type-check SQL.
+    placeholders = ("NULL" if kind == "expression" else '"_parameter"' for kind in parameter_types(fn))
+    function_query(fn, ", ".join(placeholders), registry, dialect=dialect)
 
 
 def function_query(fn: FnDef, arguments: str, functions: Functions = (), *, dialect: str = "postgres") -> str:

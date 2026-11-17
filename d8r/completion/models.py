@@ -63,6 +63,8 @@ class Context:
     group_prefix: str = ""
     group_slot: bool = False
     relation_transition: bool = False
+    # First relation token of an otherwise fresh statement (including qualifiers).
+    statement_relation_start: int | None = None
 
 
 @dataclass(frozen=True)

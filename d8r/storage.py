@@ -76,7 +76,10 @@ def _validate(value: object) -> dict:
             raise ValueError("source functions must be a list")
         names = set()
         for function in group:
-            fn = _record(function, {"name", "params", "body", "description"}, "function")
+            keys = {"name", "params", "body", "description"}
+            if isinstance(function, dict) and "param_types" in function:
+                keys.add("param_types")
+            fn = _record(function, keys, "function")
             _text(fn["name"], "function name", nonempty=True)
             _text(fn["body"], "function body")
             _text(fn["description"], "function description")
@@ -89,6 +92,10 @@ def _validate(value: object) -> dict:
                 _text(param, "function parameter", nonempty=True)
             if len(set(fn["params"])) != len(fn["params"]):
                 raise ValueError("duplicate function parameter")
+            types = fn.get("param_types", [])
+            if (not isinstance(types, list) or (types and len(types) != len(fn["params"]))
+                    or any(kind not in ("expression", "identifier", "relation") for kind in types)):
+                raise ValueError("invalid function parameter types")
     postgres_profiles = document["postgres_profiles"]
     if not isinstance(postgres_profiles, list):
         raise ValueError("postgres_profiles must be a list")
@@ -138,8 +145,7 @@ def _settings(value: object) -> dict:
         "version": 1, "intellisense": True,
         "entry_screen": False,
         "theme": DEFAULT_THEME,
-        "panes": {"results": True, "sql": True, "history": True, "schema": True,
-                  "agents": True, "ai": False},
+        "panes": {"results": True, "sql": True, "history": True, "schema": True, "ai": False},
         "pane_sizes": {"explorer": 36, "ai": 44, "editor": 22},
         "source": "postgres",
         "default_rows": 50,
@@ -150,6 +156,7 @@ def _settings(value: object) -> dict:
         "ai_allow_schema_refreshes": True,
         "ai_test_queries": False,
         "ai_completion": False,
+        "ai_remember_key": True,
         "ai": asdict(AIConfig()),
     }
     if not isinstance(value, dict) or not value.keys() <= defaults.keys():
@@ -165,7 +172,7 @@ def _settings(value: object) -> dict:
         raise ValueError("Choose a supported theme from Settings → Theme.")
     if type(document["ai_auto_accept"]) is not bool:
         raise ValueError("ai_auto_accept must be a boolean")
-    for field in ("ai_allow_sample_data", "ai_allow_schema_refreshes", "ai_test_queries", "ai_completion"):
+    for field in ("ai_allow_sample_data", "ai_allow_schema_refreshes", "ai_test_queries", "ai_completion", "ai_remember_key"):
         if type(document[field]) is not bool:
             raise ValueError(f"{field} must be a boolean")
     if type(document["value_cache_enabled"]) is not bool:
@@ -174,6 +181,12 @@ def _settings(value: object) -> dict:
         raise ValueError("Values per column must be an integer between 1 and 10000.")
     for field in ("panes", "pane_sizes", "ai"):
         provided = document[field]
+        if field == "panes" and isinstance(provided, dict) and "agents" in provided:
+            provided = dict(provided)
+            legacy = provided.pop("agents")
+            if type(legacy) is not bool or ("ai" in provided and type(provided["ai"]) is not bool):
+                raise ValueError("pane visibility must be a boolean")
+            provided["ai"] = provided.get("ai", False) or legacy
         if not isinstance(provided, dict) or not provided.keys() <= defaults[field].keys():
             raise ValueError(f"invalid {field} settings fields")
         document[field] = defaults[field] | provided
@@ -559,7 +572,10 @@ class SettingsStore(_CredentialStore):
             raise ValueError(self.error)
         runtime = _settings(document)
         ai = runtime["ai"]
-        unchanged = not replace_ai and ai == self.document["ai"]
+        unchanged = (not replace_ai and ai == self.document["ai"]) or (
+            self.ai_credentials_missing and runtime["ai_remember_key"] and not ai["api_key"]
+            and all(ai[key] == self.document["ai"][key] for key in ("base_url", "model"))
+        )
         public = {key: value for key, value in ai.items() if key != "api_key"}
         disk = {**runtime, "version": 2, "ai": {**public, "api_key_ref": None}}
         created: set[str] = set()
@@ -702,7 +718,10 @@ def _workspace_document(value: object) -> dict:
         raise ValueError("invalid source workspaces")
     for key, workspace in document["source_workspaces"].items():
         _text(key, "workspace source key", nonempty=True)
-        _record(workspace, {"document_id", "function_draft", "active_view"}, "source workspace")
+        if isinstance(workspace, dict):
+            workspace.setdefault("dbt_project_dir", "")
+        _record(workspace, {"document_id", "function_draft", "active_view", "dbt_project_dir"}, "source workspace")
+        _text(workspace["dbt_project_dir"], "dbt project directory")
         _text(workspace["document_id"], "source workspace document_id")
         if workspace["active_view"] not in ("workspace", "function"):
             raise ValueError("invalid source workspace view")
@@ -724,12 +743,14 @@ def _workspace_document(value: object) -> dict:
                 "status": "idle", "status_text": "Conversation restored; send for a fresh proposal.",
                 "unread": False, "selected": True}
             document["chats"][key] = chat
-        _record(chat, legacy | {"target_key", "title", "status", "status_text", "unread", "selected"}, "chat")
+        if isinstance(chat, dict):
+            chat.setdefault("closed", False)
+        _record(chat, legacy | {"target_key", "title", "status", "status_text", "unread", "selected", "closed"}, "chat")
         _chat_messages(chat["messages"])
         for field in ("transcript", "input", "target_key", "title", "status_text"):
             _text(chat[field], f"chat {field}")
         if (type(chat["turns"]) is not int or chat["turns"] < 0
-                or any(type(chat[field]) is not bool for field in ("visible", "unread", "selected"))
+                or any(type(chat[field]) is not bool for field in ("visible", "unread", "selected", "closed"))
                 or chat["status"] not in ("idle", "working", "error", "cancelled")):
             raise ValueError("invalid saved chat state")
     if not isinstance(document["history"], list):

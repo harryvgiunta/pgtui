@@ -27,7 +27,7 @@ def async_test(function):
 def configured(source, **settings):
     session = Session({source.id: source})
     session.update_settings(ai=AIConfig("https://provider.invalid/v1", "test", "private-test-key"),
-                            persist_ai=False, **settings)
+                            remember_ai_key=False, **settings)
     return session
 
 
@@ -98,6 +98,43 @@ async def test_local_only_signature_and_stable_highlight(parquet_source, monkeyp
         app.update_settings(intellisense=False)
         await pilot.press("ctrl+space", "ctrl+shift+space")
         assert not app.palette.is_open and not requests
+
+
+@pytest.mark.parametrize("source_fixture,table", [("parquet_source", "data"), ("d1_source", "records")])
+@async_test
+async def test_quality_function_table_then_column_completion(request, source_fixture, table):
+    source = request.getfixturevalue(source_fixture)
+    session = Session({source.id: source})
+    session.install_quality_functions()
+    app = D8RApp(session)
+    document = f"SELECT * FROM dq_missing_percent({table[:2]});"
+    async with app.run_test(size=(140, 45)) as pilot:
+        await load_editor(app, pilot, document, (0, len(document) - 2))
+        await pilot.press("ctrl+space")
+        app.palette.highlighted = next(i for i, entry in enumerate(app.palette.view.entries)
+                                       if entry.kind == "table" and entry.insert == table)
+        await pilot.press("tab", "comma")
+        await pilot.pause()
+        assert app.palette.is_open
+        view = app.palette.view
+        assert {entry.label for entry in view.entries} == {"id", "label"}
+        assert view.signature.active_parameter == 1
+        assert "field:identifier" in app.palette.details.content.plain
+        assert app.editor.has_focus
+        before = f"SELECT * FROM dq_missing_percent({table},);"
+        assert app.editor.text == before
+        assert session.column_reference(before, table, "label", offset=len(before) - 2) == '"label"'
+        app.palette.highlighted = next(i for i, entry in enumerate(view.entries) if entry.label == "label")
+        await pilot.press("tab")
+        query = f"SELECT * FROM dq_missing_percent({table},label);"
+        assert app.editor.text == query
+        assert not session.history
+        app.palette.close()
+        await pilot.press("ctrl+z")
+        assert app.editor.text == before
+        outcome = session.run(query, record=False)
+        assert outcome.ok, outcome.error
+        assert float(outcome.rows[0][0]) == pytest.approx(100 / 3)
 
 
 @async_test
@@ -173,8 +210,9 @@ async def test_automatic_ai_only_after_real_typing_idle(parquet_source, monkeypa
         await pilot.press("escape")
         await pilot.press("b")
         await pilot.pause(0.85)
-        assert len(requests) == 1  # Escape stays dismissed while typing.
-        assert not app.palette.is_open
+        assert len(requests) == 1  # Escape still revokes automatic AI, not local completion.
+        assert app.palette.is_open and app.palette.view.phase == "argument"
+        assert any(entry.kind == "column" and "label" in entry.insert for entry in app.palette.view.entries)
 
 
 @pytest.mark.parametrize("change", ["escape", "text", "caret", "source", "schema", "functions",
@@ -217,7 +255,7 @@ async def test_late_ai_response_is_never_published(parquet_source, monkeypatch, 
         elif change == "page":
             app._document_identity = "different-page-with-identical-text"
         elif change == "mode":
-            app.action_fn()
+            app.action_query_to_fn()
         elif change == "off":
             app.update_settings(intellisense=False)
         elif change == "automatic-off":
@@ -255,7 +293,7 @@ async def test_function_parameters_invalidate_ai_and_keep_query_isolated(parquet
     app = D8RApp(session)
     async with app.run_test(size=(140, 45)) as pilot:
         await load_editor(app, pilot, "SELECT id FROM data", (0, 7))
-        app.action_fn()
+        app.action_query_to_fn()
         await pilot.pause()
         form = app.function_editor
         form._select_target(d1_source.id)
@@ -538,3 +576,58 @@ async def test_sql_colors_refresh_on_edit_undo_redo_and_load(parquet_source):
         assert color() == identifier
         app.editor.load_text("SELECT 2")
         assert color() == keyword
+
+
+@pytest.mark.parametrize("scenario", ["fresh", "qualified", "after_semicolon", "dismissed", "new_page"])
+@async_test
+async def test_postgres_table_first_typing_needs_no_manual_completion(postgres_source, scenario):
+    from uuid import uuid4
+    from d8r.engine import execute_sql, refresh_source_schema
+    from d8r.sql import relation_name
+
+    namespace = "etl_" + uuid4().hex
+    relation = relation_name(namespace, "dataset_symbol")
+    execute_sql(postgres_source, f'CREATE SCHEMA "{namespace}"')
+    try:
+        execute_sql(postgres_source, f"CREATE TABLE {relation} (id integer)")
+        refresh_source_schema(postgres_source)
+        session = Session({postgres_source.id: postgres_source})
+        app = D8RApp(session)
+        async with app.run_test(size=(140, 45)) as pilot:
+            await pilot.pause()
+            prefix = "SELECT 1; " if scenario == "after_semicolon" else ""
+            if prefix:
+                await load_editor(app, pilot, prefix, (0, len(prefix)))
+            await pilot.press("e", "t")
+            await pilot.pause()
+            assert app.palette.is_open
+            if scenario in {"dismissed", "new_page"}:
+                await pilot.press("escape")
+                assert not app.palette.is_open
+                if scenario == "new_page":
+                    await pilot.press("ctrl+n", "e", "t")
+            await pilot.press("l")
+            await pilot.pause()
+            assert app.palette.is_open
+            assert any(entry.table == relation and entry.kind == "table" for entry in app.palette.view.entries)
+            typed = "etl"
+            if scenario == "qualified":
+                await pilot.press(*namespace[3:], ".")
+                await pilot.pause()
+                assert any(entry.table == relation for entry in app.palette.view.entries)
+                await pilot.press(*"dataset_symbol")
+                await pilot.pause()
+                typed = namespace + ".dataset_symbol"
+            index = next(i for i, entry in enumerate(app.palette.view.entries)
+                         if entry.table == relation and entry.kind == "table")
+            steps = (index - app.palette.highlighted) % app.palette.option_count
+            await pilot.press(*(["down"] * steps), "enter")
+            await pilot.pause()
+            assert app.editor.text == prefix + f"SELECT  FROM {relation} AS ds"
+            assert app.editor.cursor_location == (0, len(prefix + "SELECT "))
+            app.palette.close()
+            await pilot.press("ctrl+z")
+            assert app.editor.text == prefix + typed
+            assert not session.history
+    finally:
+        execute_sql(postgres_source, f'DROP SCHEMA "{namespace}" CASCADE')

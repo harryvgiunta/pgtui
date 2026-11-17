@@ -9,7 +9,7 @@ from dataclasses import dataclass, field, replace
 from functools import lru_cache
 import re
 
-from d8r.sql import RoutineDef, SchemaContext, SqlError, Token, lex_sql
+from d8r.sql import RoutineDef, SchemaContext, SqlError, Token, lex_sql, parameter_types
 from .models import Call, Context, Field, Relation
 from .catalog import functions_for, keywords_for
 
@@ -91,6 +91,23 @@ def _scan(text: str, dialect: str) -> tuple[Token, ...]:
                 i += 1
         result.append(Token(kind, text[start:i], start, i))
     return tuple(result)
+
+
+def command_span(document: str, offset: int, *, dialect: str = "postgres") -> tuple[int, int, str] | None:
+    """Return only the command word at the caret, never SQL trivia or literals."""
+    if len(document) > _MAX_CHARS:
+        return None
+    match = re.search(r"\\([A-Za-z-]*)$", document[:offset])
+    if match is None:
+        return None
+    dialect = "sqlite" if dialect.lower() in {"sqlite", "d1"} else dialect.lower()
+    for token in _scan(document, dialect):
+        if token.start <= match.start() < token.end:
+            if token.kind in {"string", "dollar_string", "comment", "quoted_identifier"}:
+                return None
+            break
+    tail = re.match(r"[A-Za-z-]*", document[offset:])
+    return match.start(), offset + tail.end(), match.group(1)
 
 
 def _name(token: Token) -> str:
@@ -183,6 +200,16 @@ class _Model:
         while i + 1 < hi and self.tokens[i].text == "." and self.tokens[i + 1].kind in _IDS:
             i += 2
         return self.text[self.tokens[start].start:self.tokens[i - 1].end], i
+
+    def relation(self, name: str, ctes: tuple[Relation, ...]) -> Relation | None:
+        relation = next((r for r in reversed(ctes) if _key(r.reference, self.dialect) == _key(name, self.dialect)), None)
+        if relation is not None:
+            return replace(relation, reference=name)
+        table = self.schema.table_by_name(name, dialect=self.dialect)
+        if table is not None:
+            return Relation(name, name, tuple(Field(c.name, c.type, table.name, c.name, c.doc, c.values)
+                                             for c in table.columns), table.name, table.doc, table.foreign_keys)
+        return None
 
     def resolve(self, lo: int, hi: int, relations: tuple[Relation, ...]) -> Field | None:
         while lo < hi and self.tokens[lo].text == "(" and self.pairs.get(lo) == hi - 1:
@@ -546,12 +573,7 @@ class _Model:
                     expect = False
                     i += 1
                     continue
-                relation = next((r for r in reversed(ctes) if _key(r.reference, self.dialect) == _key(name, self.dialect)), None)
-                if relation is not None:
-                    relation = replace(relation, reference=name)
-                table = self.schema.table_by_name(name, dialect=self.dialect) if relation is None else None
-                if table is not None:
-                    relation = Relation(name, name, tuple(Field(c.name, c.type, table.name, c.name, c.doc, c.values) for c in table.columns), table.name, table.doc, table.foreign_keys)
+                relation = self.relation(name, ctes)
                 i = after
                 if i < hi and self.tokens[i].text == "(" and not insert_target:
                     close = min(self.pairs.get(i, hi), hi)
@@ -733,7 +755,7 @@ def analyze(document: str, offset: int, schema: SchemaContext, *, dialect: str =
     if len(scanned) > _MAX_TOKENS:
         return Context(offset, offset, blocked=True)
     current = next((t for t in scanned if t.start < offset <= t.end and (
-        t.kind in _IDS or t.kind in {"string", "dollar_string", "comment"} or t.text == "*")), None)
+        t.kind in _IDS or t.kind in {"number", "string", "dollar_string", "comment"} or t.text == "*")), None)
     if current is None:
         current = next((t for t in scanned if t.start == offset and (t.kind in _IDS or t.text == "*")), None)
     if current is not None:
@@ -776,7 +798,17 @@ def analyze(document: str, offset: int, schema: SchemaContext, *, dialect: str =
     scope = _active(root, offset)
     clause, anchor = model.clause(scope, start)
     before = [i for i in range(scope.lo, scope.hi) if tokens[i].end <= start]
+    if clause == "update_set":
+        assignment = anchor + 1
+        for i in model.top(anchor + 1, scope.hi):
+            if tokens[i].end > start:
+                break
+            if tokens[i].text == ",":
+                assignment = i + 1
+        if any(tokens[i].text == "=" for i in model.top(assignment, scope.hi) if tokens[i].end <= start):
+            clause = "set_expression"
     qualifier = ""
+    qualifier_start = start
     if before and tokens[before[-1]].text == ".":
         stop, at = before[-1], before[-1] - 1
         while at >= scope.lo and tokens[at].kind in _IDS:
@@ -786,6 +818,7 @@ def analyze(document: str, offset: int, schema: SchemaContext, *, dialect: str =
                 break
         if at >= scope.lo:
             qualifier = document[tokens[at].start:tokens[stop].start]
+            qualifier_start = tokens[at].start
     relations = scope.relations
     if clause in {"insert_columns", "update_set"}:
         relations = tuple(r for r in relations if not r.outer)[:1]
@@ -853,6 +886,22 @@ def analyze(document: str, offset: int, schema: SchemaContext, *, dialect: str =
                 if word == "CAST":
                     clause = "type"
             call = Call(name, argument, tokens[begin].start)
+            fn = schema.fn_by_name(name)
+            kinds = parameter_types(fn) if fn is not None else ()
+            if argument < len(kinds) and kinds[argument] == "identifier":
+                # Identifier arguments refer to supplied input relations, not the
+                # call's output columns or unrelated surrounding FROM sources.
+                inputs = []
+                close = min(model.pairs.get(opening, scope.hi), scope.hi)
+                for kind, (a, b) in zip(kinds[:argument], model.split(opening + 1, close)):
+                    if kind != "relation":
+                        continue
+                    source, after = model.identifier(a, b)
+                    if source and after == b:
+                        relation = model.relation(source, scope.ctes)
+                        if relation is not None:
+                            inputs.append(relation)
+                relations, clause = tuple(inputs), "identifier"
             break
     # A cast type follows :: even when the type token is only partly typed.
     if before and (tokens[before[-1]].text == "::" or (
@@ -862,13 +911,30 @@ def analyze(document: str, offset: int, schema: SchemaContext, *, dialect: str =
     rhs = before[-1] if before else -1
     # IN lists retain their field across commas; nested calls retain their own context.
     in_open = next((i for i in reversed(containing) if model.upper(i - 1) == "IN"), None)
-    if in_open is not None and (rhs == in_open or (rhs >= 0 and tokens[rhs].text == ",")):
+    if (in_open is not None and containing[-1] == in_open
+            and (rhs == in_open or (rhs >= 0 and tokens[rhs].text == ","))):
         rhs = in_open - 1
     if rhs >= scope.lo and model.upper(rhs) == "NOT" and model.upper(rhs - 1) == "IS":
         rhs -= 1
-    if rhs >= scope.lo and (tokens[rhs].text in {"=", "<", ">", "<=", ">=", "<>", "!="} or model.upper(rhs) in {"LIKE", "ILIKE", "IN", "IS", "BETWEEN"}):
+    field_end = None
+    if rhs >= scope.lo and model.upper(rhs) == "FROM" and model.upper(rhs - 1) == "DISTINCT":
+        field_end = rhs - 2
+        if model.upper(field_end) == "NOT":
+            field_end -= 1
+        if model.upper(field_end) != "IS":
+            field_end = None
+    elif rhs >= scope.lo and model.upper(rhs) == "AND":
+        # Only the second bound of BETWEEN, not an unrelated boolean AND.
+        for i in reversed(before[:-1]):
+            if model.upper(i) == "BETWEEN":
+                field_end = i
+                break
+            if model.upper(i) in {"AND", "OR", "WHERE", "ON", "HAVING"}:
+                break
+    elif rhs >= scope.lo and (tokens[rhs].text in {"=", "<", ">", "<=", ">=", "<>", "!="} or model.upper(rhs) in {"LIKE", "ILIKE", "IN", "IS", "BETWEEN"}):
         field_end = rhs
-        if model.upper(rhs - 1) == "NOT":
+    if field_end is not None:
+        if model.upper(field_end - 1) == "NOT":
             field_end -= 1
         field_start = field_end - 1
         while field_start >= scope.lo + 2 and tokens[field_start - 1].text == "." and tokens[field_start - 2].kind in _IDS:
@@ -893,7 +959,13 @@ def analyze(document: str, offset: int, schema: SchemaContext, *, dialect: str =
     if clause == "group" or (clause in {"from", "on", "where", "having"}
                               and (not token or "group by".startswith(token.lower()))):
         group_expressions, group_outputs, group_prefix, group_slot = model.grouping(scope, start, end, clause, anchor)
+    statement_relation_start = None
+    if clause == "statement" and scope is root:
+        relation_start = qualifier_start
+        if not any(tokens[i].start < relation_start for i in range(lo, hi)):
+            statement_relation_start = relation_start
     return Context(start, end, token, qualifier, quote, clause, blocked, relations, scope.ctes, scope.outputs,
                    join_target, join_left, call, value_field, token if value_field else "", literal,
                    tuple(used), statement_start, statement_end, identifiers,
-                   group_outputs, group_expressions, group_prefix, group_slot, relation_transition)
+                   group_outputs, group_expressions, group_prefix, group_slot, relation_transition,
+                   statement_relation_start)

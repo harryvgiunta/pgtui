@@ -12,7 +12,7 @@ from uuid import uuid4
 from textual import events, on
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Horizontal, HorizontalScroll, Vertical, VerticalScroll
 from textual.content import Text
 from textual.message import Message
 from textual.screen import ModalScreen
@@ -25,13 +25,52 @@ from d8r.ai import client
 from d8r.ai.context import AIContext, AIProposal, AIQuestion
 from d8r.ai.diagnostics import AIDiagnostics
 from d8r.credentials import CredentialError
+from d8r.sql import FnDef
 
+
+STAGE_SAYINGS = {
+    "general": ("Warming up the query engine...", "Pulling up a stool at the database...",
+                "Flipping through the data dictionary..."),
+    "schema": ("Sniffing around your schemas...", "Checking the table blueprints...",
+               "Introspecting columns and keys...", "Digging through your slop..."),
+    "query_history": ("Digging through your past queries...", "Checking the archives for clues...",
+                      "Borrowing wisdom from query history..."),
+    "functions": ("Unpacking your custom functions...", "Checking the function toolbox..."),
+    "generating": ("Translating human into SQL...", "Stitching joins together...",
+                   "Drafting a clean SELECT...", "Generating you some slop..."),
+    "validate_sql": ("Double-checking my semicolons...", "Linting the syntax before you run it...",
+                     "Making sure the parser stays happy..."),
+}
+
+
+def stage_saying(stage: str, turn: int) -> str:
+    """Stable for a whole stage and turn; never advance on a clock or token."""
+    sayings = STAGE_SAYINGS[stage]
+    saying = sayings[max(0, turn - 1) % len(sayings)]
+    if stage == "validate_sql":
+        saying += " Offline lexical/template checks only; not server syntax or execution."
+    return saying
 
 class ComposerArea(TextArea):
     """Enter sends; Shift+Enter inserts a newline without stealing button keys."""
 
     class Submitted(Message):
         """Enter asked to send the composer's text."""
+
+    class FunctionsRequested(Message):
+        """The user typed the local function-picker command."""
+
+    def function_command_span(self) -> tuple[int, int] | None:
+        if self.selection.start != self.selection.end:
+            return None
+        text = self.text
+        end = self.document.get_index_from_location(self.cursor_location)
+        start = end - 3
+        if (start < 0 or text[start:end].casefold() != "\\fn"
+                or start and not text[start - 1].isspace()
+                or end < len(text) and not text[end].isspace()):
+            return None
+        return start, end
 
     async def _on_key(self, event: events.Key) -> None:
         self._restart_blink()
@@ -47,6 +86,8 @@ class ComposerArea(TextArea):
             self.insert("\n")
         else:
             await super()._on_key(event)
+            if event.is_printable and self.function_command_span() is not None:
+                self.post_message(self.FunctionsRequested())
 
 
 class AIDiagnosticsScreen(ModalScreen):
@@ -126,6 +167,7 @@ class AIChat:
     turns: int = 0
     visible: bool = False
     selected: bool = True
+    closed: bool = False
     status: str = "idle"
     status_text: str = "New chat · describe what you want."
     unread: bool = False
@@ -144,6 +186,7 @@ class AIChat:
     question_answer: asyncio.Future[str] | None = None
     question_choice: int = 0
     question_other: str = ""
+    stage: str = ""
 
     @property
     def saves_function(self) -> bool:
@@ -180,7 +223,7 @@ class AIChat:
         return {"target_key": self.target_key, "title": self.title, "messages": self.messages,
                 "transcript": self.transcript, "input": self.input or self.pending_prompt,
                 "turns": self.turns, "visible": self.visible, "selected": self.selected,
-                "status": self.status, "status_text": self.status_text, "unread": self.unread}
+                "closed": self.closed, "status": self.status, "status_text": self.status_text, "unread": self.unread}
 
     @property
     def page_id(self) -> str | None:
@@ -220,18 +263,18 @@ class AIChats:
                         and panel.screen is self.app.screen
                         for panel in self.panels()))
 
-    def changed(self, chat: AIChat, *, agents: bool = True) -> None:
+    def changed(self, chat: AIChat, *, conversations: bool = True) -> None:
         if self.closing or self.chats.get(chat.id) is not chat:
             return
         for panel in self.panels():
             if panel.chat_id == chat.id:
                 panel._draw_chat()
-        if agents:
-            self.refresh_agents()
+        if conversations:
+            self.refresh_conversations()
 
-    def refresh_agents(self) -> None:
+    def refresh_conversations(self) -> None:
         for screen in self.app.screen_stack:
-            for pane in screen.query(AgentsPane):
+            for pane in screen.query(ConversationTabs):
                 if pane.is_mounted:
                     pane.refresh_chats()
 
@@ -252,7 +295,7 @@ class AIChats:
         return chat
 
     def for_target(self, target: AITarget) -> AIChat | None:
-        candidates = [chat for chat in self.chats.values() if chat.target_key == target.key]
+        candidates = [chat for chat in self.chats.values() if chat.target_key == target.key and not chat.closed]
         return next((chat for chat in candidates if chat.selected), candidates[-1] if candidates else None)
 
     def select(self, chat: AIChat) -> None:
@@ -261,7 +304,32 @@ class AIChats:
                 previous.selected = False
                 self.persist(previous)
         chat.selected = True
+        chat.closed = False
         self.persist(chat)
+        self.changed(chat)
+
+    def close_tab(self, chat_id: str) -> None:
+        """Close a tab, retaining its history and independently running request."""
+        chat = self.chats.get(chat_id)
+        if chat is None or chat.source_key != self.session.source_key():
+            return
+        for panel in self.panels():
+            if panel.chat_id == chat_id:
+                panel._flush_chat()
+                panel.detach_chat()
+                panel._set_visible(False)
+                panel.return_focus()
+        chat.closed = True
+        chat.visible = False
+        chat.selected = False
+        self.persist(chat)
+        self.refresh_conversations()
+
+    def set_stage(self, chat: AIChat, stage: str, generation: int) -> None:
+        if generation != chat.generation or chat.status != "working":
+            return
+        chat.stage = stage
+        chat.status_text = stage_saying(stage, chat.turns)
         self.changed(chat)
 
     def discard(self, chat_ids: list[str]) -> None:
@@ -283,7 +351,7 @@ class AIChats:
         for panel in self.panels():
             if panel.chat_id in removed:
                 panel.detach_chat()
-        self.refresh_agents()
+        self.refresh_conversations()
 
     def delete(self, chat_id: str) -> None:
         if chat_id not in self.chats:
@@ -363,8 +431,9 @@ class AIChats:
         chat.partial = ""
         chat.status = "working"
         chat.unread = False
+        chat.stage = "general"
         chat.status_text = ("Steering queued; waiting for the current context read to finish…" if self.context_tasks else
-                            "Restarting with your steering…" if steering else "Connecting…")
+                            "Restarting with your steering…" if steering else stage_saying("general", chat.turns))
         chat.diagnostics.record(f"Turn {chat.turns} started", json.dumps({
             "model": config.model, "max_attempts": config.max_attempts, "timeout": config.timeout,
             "max_tool_rounds": config.max_tool_rounds, "max_tool_calls": config.max_tool_calls,
@@ -533,11 +602,15 @@ class AIChats:
                 self.changed(chat)
             return result
         self.session.busy = "AI context lookup running"
+        if name in STAGE_SAYINGS:
+            self.set_stage(chat, name, generation)
         task = asyncio.create_task(context.call_tool(name, args))
         self.context_tasks.add(task)
         task.add_done_callback(self._context_finished)
         # A cancelled request cannot release a sample/check still running in a thread.
-        return await asyncio.shield(task)
+        result = await asyncio.shield(task)
+        self.set_stage(chat, "generating", generation)
+        return result
 
     def _context_finished(self, task: asyncio.Task) -> None:
         self.context_tasks.discard(task)
@@ -559,6 +632,7 @@ class AIChats:
                 return
             if self.session.busy:
                 raise client.AIError(f"{self.session.busy}; send again after it finishes.")
+            self.set_stage(chat, "general", generation)
             async for event in client.run_turn(
                 config, messages, context.tools,
                 lambda name, args: self._call_tool(chat, context, name, args, generation),
@@ -566,8 +640,10 @@ class AIChats:
                 if generation != chat.generation:
                     return
                 if event.kind == "text":
+                    if chat.stage != "generating" or chat.status_text != stage_saying("generating", chat.turns):
+                        self.set_stage(chat, "generating", generation)
                     chat.partial += event.text
-                    self.changed(chat, agents=False)
+                    self.changed(chat, conversations=False)
                 elif event.kind == "status":
                     chat.diagnostics.record("Status", event.text)
                     chat.status_text = event.text
@@ -781,129 +857,216 @@ class DeleteOptionList(OptionList):
                 self.post_message(self.DeleteRequested(self, option_id))
 
 
-class AgentsPane(Vertical):
-    """Status-first roster; selecting or highlighting a row never owns its request."""
+class ConversationTab(Horizontal):
+    """One durable chat with separate select and close controls."""
 
-    COMPONENT_CLASSES = {
-        "agents--busy", "agents--ready", "agents--seen", "agents--error", "agents--cancelled",
-    }
-    STATES = {
-        "Busy": (0, "⟳"),
-        "Ready": (1, "●"),
-        "Error": (2, "✕"),
-        "Cancelled": (3, "■"),
-        "Seen": (4, "○"),
-    }
+    def __init__(self, chat_id: str) -> None:
+        super().__init__(id=f"conversation-{chat_id}")
+        self.chat_id = chat_id
 
     def compose(self) -> ComposeResult:
-        from .settings import binding_tooltip
+        yield Button("New chat", classes="conversation-select", compact=True)
+        yield Button("×", classes="conversation-close", compact=True,
+                     tooltip="Close tab (Ctrl+W / Delete); retain history and running request")
 
-        yield Static("Agents", classes="pane-title", markup=False)
-        yield Static("", id="agents-summary", markup=False)
-        yield Static("No agents yet.\nOpen Ask AI to start a chat.", id="agents-empty", markup=False)
-        yield DeleteOptionList(id="agents-list")
-        with Horizontal(id="agents-actions"):
-            yield Button("Delete", id="agent-delete", compact=True, disabled=True,
-                         tooltip=binding_tooltip(DeleteOptionList.BINDINGS, "delete_selected", context="Agents list focused"))
-        yield Static("↑/↓ select · Enter open · Delete remove", id="agents-hint", markup=False)
+
+class ConversationTabs(Horizontal, can_focus=True):
+    """Source-isolated recent chats, independent of request lifetime."""
+
+    BINDINGS = [
+        Binding("left", "previous_chat", "Previous chat", show=False),
+        Binding("right", "next_chat", "Next chat", show=False),
+        Binding("home", "first_chat", "First chat", show=False),
+        Binding("end", "last_chat", "Last chat", show=False),
+        Binding("ctrl+w,delete", "close_chat", "Close chat", show=False),
+        Binding("ctrl+n", "new_chat", "New chat", show=False),
+    ]
+    COMPONENT_CLASSES = {"conversation--busy", "conversation--ready", "conversation--seen",
+                         "conversation--error", "conversation--cancelled"}
+
+    class Selected(Message):
+        def __init__(self, chat_id: str) -> None:
+            super().__init__()
+            self.chat_id = chat_id
+
+    class NewChatRequested(Message):
+        pass
+
+    def compose(self) -> ComposeResult:
+        yield HorizontalScroll(id="conversation-strip")
+        yield Button("+", id="conversation-new", compact=True, tooltip="New chat (Ctrl+N when tabs focused)")
+        yield Button("History", id="conversation-history", compact=True,
+                     tooltip="Reopen saved chats or permanently delete them")
 
     def on_mount(self) -> None:
-        self._rows = None
+        self._refresh_pending = False
         self.refresh_chats()
 
     def notify_style_update(self) -> None:
         super().notify_style_update()
         if self.is_mounted:
-            # Roster text embeds status colors; rebuild it after theme changes.
-            self._rows = None
-            self.call_after_refresh(self.refresh_chats)
-
-    def on_resize(self) -> None:
-        if self.is_mounted:
             self.refresh_chats()
 
-    def _prompt(self, chat: AIChat, width: int) -> Text:
-        state = chat.label
-        style = self.get_component_rich_style("agents--" + state.lower(), partial=True)
-        lines = [
-            Text.assemble((f"{self.STATES[state][1]} {state}  ", style),
-                          (" ".join(chat.title.split()), "bold")),
-            Text.assemble("  ", ("unread · " if chat.unread else "",
-                                 self.get_component_rich_style("agents--busy", partial=True)),
-                          (chat.target_label, "dim")),
-            Text("  " + " ".join(chat.status_text.split()), style="dim"),
-        ]
-        for line in lines:
-            line.truncate(width, overflow="ellipsis")
-        return Text("\n").join(lines)
+    def refresh_chats(self) -> None:
+        if not self.is_mounted or getattr(self, "_refresh_pending", False):
+            return
+        self._refresh_pending = True
+        self.call_after_refresh(self._refresh_chats)
+
+    async def _refresh_chats(self) -> None:
+        self._refresh_pending = False
+        if not self.is_mounted:
+            return
+        manager = self.app.ai_chats
+        chats = [chat for chat in reversed(manager.chats.values())
+                 if chat.source_key == manager.session.source_key() and not chat.closed]
+        strip = self.query_one("#conversation-strip", HorizontalScroll)
+        tabs = {tab.chat_id: tab for tab in strip.query(ConversationTab)}
+        wanted = {chat.id for chat in chats}
+        for chat_id, tab in tabs.items():
+            if chat_id not in wanted:
+                if tab.has_focus_within:
+                    self.focus()
+                await tab.remove()
+        active = {panel.chat_id for panel in manager.panels() if panel.display}
+        for chat in reversed(chats):
+            tab = tabs.get(chat.id)
+            if tab is None:
+                tab = ConversationTab(chat.id)
+                if strip.children:
+                    await strip.mount(tab, before=0)
+                else:
+                    await strip.mount(tab)
+            button = tab.query_one(".conversation-select", Button)
+            style = self.get_component_rich_style("conversation--" + chat.label.lower(), partial=True)
+            title = " ".join(chat.title.split()) or "New chat"
+            button.label = Text.assemble(("● ", style), title)
+            button.tooltip = f"{title} · {chat.label}\n{chat.target_label}\n{chat.status_text}"
+            tab.set_class(chat.id in active, "selected")
+
+    def _focused_tab(self) -> ConversationTab | None:
+        focused = self.screen.focused
+        if focused is not None:
+            for widget in (focused, *focused.ancestors):
+                if isinstance(widget, ConversationTab):
+                    return widget
+        return None
+
+    def _move(self, direction: int, *, edge: bool = False) -> None:
+        tabs = list(self.query(ConversationTab))
+        if not tabs:
+            self.query_one("#conversation-new", Button).focus()
+            return
+        focused = self._focused_tab()
+        index = tabs.index(focused) if focused in tabs else (-1 if direction > 0 else 0)
+        index = (0 if direction > 0 else len(tabs) - 1) if edge else (index + direction) % len(tabs)
+        button = tabs[index].query_one(".conversation-select", Button)
+        button.focus()
+        button.scroll_visible(animate=False)
+
+    def action_previous_chat(self) -> None:
+        self._move(-1)
+
+    def action_next_chat(self) -> None:
+        self._move(1)
+
+    def action_first_chat(self) -> None:
+        self._move(1, edge=True)
+
+    def action_last_chat(self) -> None:
+        self._move(-1, edge=True)
+
+    def action_close_chat(self) -> None:
+        tab = self._focused_tab()
+        if tab is not None:
+            self.app.ai_chats.close_tab(tab.chat_id)
+            self.focus()
+
+    def action_new_chat(self) -> None:
+        self.post_message(self.NewChatRequested())
+
+    def action_history(self) -> None:
+        self.app.push_screen(ConversationHistory(self.app.ai_chats), self._history_selected)
+
+    def _history_selected(self, chat_id: str | None) -> None:
+        if chat_id is not None:
+            self.post_message(self.Selected(chat_id))
+
+    @on(Button.Pressed)
+    def _pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        button = event.button
+        if button.id == "conversation-new":
+            self.action_new_chat()
+        elif button.id == "conversation-history":
+            self.action_history()
+        elif isinstance(button.parent, ConversationTab):
+            if button.has_class("conversation-close"):
+                self.app.ai_chats.close_tab(button.parent.chat_id)
+            else:
+                self.post_message(self.Selected(button.parent.chat_id))
+
+
+class ConversationHistory(ModalScreen[str | None]):
+    """Closing is reversible; only explicit Delete revokes saved history."""
+
+    BINDINGS = [Binding("escape", "dismiss", "Back", show=False)]
+
+    def __init__(self, manager: AIChats) -> None:
+        super().__init__()
+        self.manager = manager
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="conversation-history-dialog"):
+            yield Static("Conversation history", classes="pane-title", markup=False)
+            yield Static("Enter reopens · Delete permanently removes and cancels · Escape returns", markup=False)
+            yield DeleteOptionList(id="conversation-history-list")
+            yield Static("No saved chats for this source.", id="conversation-history-empty", markup=False)
+            with Horizontal(id="conversation-history-actions"):
+                yield Button("Open", id="conversation-history-open", compact=True)
+                yield Button("Delete permanently", id="conversation-history-delete", compact=True)
+                yield Button("Back", id="conversation-history-back", compact=True)
+
+    def on_mount(self) -> None:
+        self.refresh_chats()
+        self.query_one(DeleteOptionList).focus()
 
     def refresh_chats(self) -> None:
-        manager = self.app.ai_chats
-        source_key = manager.session.source_key()
-        chats = sorted((chat for chat in reversed(manager.chats.values())
-                        if chat.source_key == source_key),
-                       key=lambda chat: self.STATES[chat.label][0])
-        options = self.query_one(OptionList)
-        width = max(1, self.content_size.width - options.styles.gutter.width - options.styles.scrollbar_size_vertical)
-        rows = [(chat.id, chat.title, chat.target_label, chat.label, chat.unread, chat.status_text)
-                for chat in chats]
-        if (width, rows) == getattr(self, "_rows", None):
-            return
-        self._rows = width, rows
-        counts = dict.fromkeys(self.STATES, 0)
-        for row in rows:
-            counts[row[3]] += 1
-        summary_widget = self.query_one("#agents-summary", Static)
-        summary_width = max(1, self.content_size.width - summary_widget.styles.gutter.width)
-        summary = Text()
-        line_width = 0
-        for state, count in counts.items():
-            if not count:
-                continue
-            group = Text(f"{self.STATES[state][1]} {count} {state}",
-                         style=self.get_component_rich_style("agents--" + state.lower(), partial=True))
-            group.truncate(summary_width, overflow="ellipsis")
-            if line_width:
-                if line_width + 3 + group.cell_len > summary_width:
-                    summary.append("\n")
-                    line_width = 0
-                else:
-                    summary.append(" · ", style="dim")
-                    line_width += 3
-            summary.append(group)
-            line_width += group.cell_len
-        summary_widget.update(summary)
-        self.query_one("#agents-empty", Static).display = not chats
-        options.display = bool(chats)
-        selected = options.highlighted
-        selected_id = options.get_option_at_index(selected).id if selected is not None and options.option_count else None
+        options = self.query_one(DeleteOptionList)
+        selected = options.highlighted or 0
+        chats = [chat for chat in reversed(self.manager.chats.values())
+                 if chat.source_key == self.manager.session.source_key()]
         options.clear_options()
-        options.add_options(Option(self._prompt(chat, width), id=chat.id) for chat in chats)
-        if selected_id is not None and any(chat.id == selected_id for chat in chats):
-            options.highlighted = options.get_option_index(selected_id)
-            options.scroll_to_highlight()
-        elif chats:
-            options.highlighted = min(selected or 0, len(chats) - 1)
-        self.query_one("#agent-delete", Button).disabled = options.highlighted is None
-
-    @on(OptionList.OptionHighlighted, "#agents-list")
-    def _highlighted(self) -> None:
-        self.query_one("#agent-delete", Button).disabled = self.query_one(OptionList).highlighted is None
-
-    @on(Button.Pressed, "#agent-delete")
-    def _delete_pressed(self, event: Button.Pressed) -> None:
-        event.stop()
-        self.query_one("#agents-list", DeleteOptionList).action_delete_selected()
-
-    @on(DeleteOptionList.DeleteRequested, "#agents-list")
-    def _delete_requested(self, event: DeleteOptionList.DeleteRequested) -> None:
-        event.stop()
-        self.app.ai_chats.delete(event.option_id)
+        options.add_options(Option(Text(f"{chat.title} · {chat.label}"
+                                        f"{' · closed' if chat.closed else ''}\n{chat.target_label}"), id=chat.id)
+                            for chat in chats)
+        if chats:
+            options.highlighted = min(selected, len(chats) - 1)
+        self.query_one("#conversation-history-empty").display = not chats
+        self.query_one("#conversation-history-open", Button).disabled = not chats
+        self.query_one("#conversation-history-delete", Button).disabled = not chats
 
     @on(OptionList.OptionSelected)
     def _selected(self, event: OptionList.OptionSelected) -> None:
         event.stop()
-        self.app.open_ai_chat(event.option.id)
+        self.dismiss(event.option.id)
+
+    @on(DeleteOptionList.DeleteRequested)
+    def _delete(self, event: DeleteOptionList.DeleteRequested) -> None:
+        event.stop()
+        self.manager.delete(event.option_id)
+        self.refresh_chats()
+
+    @on(Button.Pressed)
+    def _pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        options = self.query_one(DeleteOptionList)
+        if event.button.id == "conversation-history-back":
+            self.dismiss(None)
+        elif event.button.id == "conversation-history-delete":
+            options.action_delete_selected()
+        elif options.highlighted is not None:
+            self.dismiss(options.get_option_at_index(options.highlighted).id)
 
 
 
@@ -918,7 +1081,7 @@ class AIPanel(Vertical):
         Binding("tab", "next_control", "Next control", show=False, priority=True),
         Binding("shift+tab", "previous_control", "Previous control", show=False, priority=True),
         Binding("ctrl+enter", "send", "Send", show=False, priority=True),
-        Binding("escape", "close", "Close AI", show=False),
+        Binding("escape", "close", "Back to query", show=False, priority=True),
     ]
 
     def __init__(self, session, snapshot: Callable[[], AITarget],
@@ -932,7 +1095,7 @@ class AIPanel(Vertical):
         self.reveal = reveal
         self.chat_id: str | None = None
         self._target_key: str | None = None
-        self._composer: TextArea | None = None
+        self._composer: ComposerArea | None = None
         self._save_timer: Timer | None = None
         self._question_key: tuple[str, int, int] | None = None
         self._draft_target: AITarget | None = None
@@ -979,7 +1142,7 @@ class AIPanel(Vertical):
             yield Static("", id="ai-function-details", markup=False)
             yield TextArea("", read_only=True, show_line_numbers=True, id="ai-proposal")
         composer = ComposerArea(
-            placeholder="Ask about this document or a saved function…",
+            placeholder="Ask about this document… \\fn opens saved functions",
             soft_wrap=True, highlight_cursor_line=False, id="ai-input",
         )
         composer.border_title = "Message"
@@ -992,14 +1155,14 @@ class AIPanel(Vertical):
             yield Button("Apply", id="ai-apply", disabled=True, variant="success", compact=True)
         with Horizontal(classes="ai-buttons"):
             yield Button("New chat", id="ai-clear", compact=True)
-            yield Button("Agents", id="ai-agents", compact=True,
-                         tooltip=binding_tooltip(self.app.BINDINGS, "agents"))
+            yield Button("History", id="ai-history", compact=True,
+                         tooltip="Reopen saved chats; Delete permanently removes a chat and cancels its request")
         with Horizontal(classes="ai-buttons"):
             yield Button("Settings", id="ai-settings", compact=True)
             yield Button("Logs", id="ai-logs", compact=True)
 
     def on_mount(self) -> None:
-        self._composer = self.query_one("#ai-input", TextArea)
+        self._composer = self.query_one("#ai-input", ComposerArea)
         self._ready = True
         self.target_changed()
 
@@ -1063,6 +1226,7 @@ class AIPanel(Vertical):
         if self.display != visible:
             self.display = visible
             self.post_message(self.VisibilityChanged())
+            self.manager.refresh_conversations()
         return True
 
     def target_changed(self) -> None:
@@ -1086,7 +1250,7 @@ class AIPanel(Vertical):
             visible = chat.visible if chat is not None else self.display
             self._set_visible(visible and self.session.pane_visibility["ai"])
             self._set_input(chat.input if chat is not None else "")
-            self.manager.refresh_agents()
+            self.manager.refresh_conversations()
         self._draft_target = current
         self._draw_chat()
 
@@ -1199,7 +1363,9 @@ class AIPanel(Vertical):
         details.display = chat.proposal is not None and chat.proposal.function is not None
         if details.display:
             fn = chat.proposal.function
-            details.update(f"{fn.name}({', '.join(fn.params)})\n{fn.doc}\nExample call: {chat.proposal.arguments}")
+            from d8r.sql import format_parameters
+
+            details.update(f"{fn.name}({format_parameters(fn)})\n{fn.doc}\nExample call: {chat.proposal.arguments}")
         self._draw_question(chat, matching=matching, stale=stale)
 
     def _draw_question(self, chat: AIChat, *, matching: bool, stale: bool) -> None:
@@ -1287,7 +1453,7 @@ class AIPanel(Vertical):
 
     def _focus_control(self, direction: int) -> None:
         names = ("question-options", "question-other", "question-submit") if self.query_one("#ai-question").display else ()
-        names += ("proposal", "input", "send", "cancel", "apply", "clear", "agents", "settings", "logs")
+        names += ("proposal", "input", "send", "cancel", "apply", "clear", "history", "settings", "logs")
         controls = [self.query_one(f"#ai-{name}") for name in names]
         controls = [widget for widget in controls if widget.display and not widget.disabled]
         focused = self.screen.focused
@@ -1299,7 +1465,7 @@ class AIPanel(Vertical):
         actions = {"ai-send": self.action_send, "ai-cancel": self.action_cancel,
                    "ai-apply": self.action_apply, "ai-clear": self.action_clear,
                    "ai-settings": self.action_settings,
-                   "ai-logs": self.action_logs, "ai-agents": self.action_agents}
+                   "ai-logs": self.action_logs, "ai-history": self.action_history}
         actions["ai-question-submit"] = self.action_answer_question
         action = actions.get(event.button.id)
         if action is not None:
@@ -1311,9 +1477,67 @@ class AIPanel(Vertical):
         event.stop()
         self.action_send()
 
-    def action_agents(self) -> None:
+    @on(ComposerArea.FunctionsRequested)
+    def _functions_requested(self, event: ComposerArea.FunctionsRequested) -> None:
+        event.stop()
+        self.target_changed()
+        self._request_functions()
+
+    def _function_pick_snapshot(self) -> tuple | None:
+        composer, chat = self._composer, self.chat
+        if (not self._ready or not self.is_mounted or not self.display or self.manager.closing
+                or composer is None or composer.read_only or chat is None or chat.closed):
+            return None
+        target = self.snapshot()
+        source = self.session.sources.get(target.source_id)
+        if source is None or chat.target_key != target.key:
+            return None
+        return (composer, composer.document, id(composer.document), composer.text, composer.selection,
+                chat.id, id(chat), chat.generation, target.key, source, id(source),
+                tuple(self.session.functions_for(target.source_id).values()))
+
+    def _request_functions(self) -> bool:
+        if self._composer is None or (span := self._composer.function_command_span()) is None:
+            return False
+        self._capture_input()
+        snapshot = self._function_pick_snapshot()
+        if snapshot is None:
+            self._status("Open a chat for the current target before choosing a function.")
+            return True
+        from .fn import FunctionPicker
+
+        functions = tuple(self.session.functions_for(self.snapshot().source_id).values())
+        self.app.push_screen(FunctionPicker(functions), partial(self._function_picked, snapshot, span))
+        return True
+
+    def _function_picked(self, snapshot: tuple, span: tuple[int, int], fn: FnDef | None) -> None:
+        if fn is None:
+            if self._ready and self.is_mounted and not self.manager.closing:
+                self.return_focus()
+            return
+        if snapshot != self._function_pick_snapshot():
+            if self._ready and self.is_mounted:
+                self._status("Chat, draft or source changed; reopen the function picker.")
+            return
+        composer = self._composer
+        start, end = span
+        composer.history.checkpoint()
+        composer.replace(fn.name + "()", composer.document.get_location_from_index(start),
+                         composer.document.get_location_from_index(end), maintain_selection_offset=False)
+        composer.move_cursor(composer.document.get_location_from_index(
+            start + len(fn.name) + (1 if fn.params else 2)))
+        composer.history.checkpoint()
+        composer.focus()
         self._flush_chat()
-        self.app.action_agents()
+        self._status(f"Inserted {fn.name} · chat draft only, not sent")
+
+    def action_history(self) -> None:
+        self._flush_chat()
+        self.app.push_screen(ConversationHistory(self.manager), self._history_selected)
+
+    def _history_selected(self, chat_id: str | None) -> None:
+        if chat_id is not None:
+            self.app.open_ai_chat(chat_id)
 
 
     def action_logs(self) -> None:
@@ -1327,6 +1551,8 @@ class AIPanel(Vertical):
     def action_send(self) -> None:
         self.target_changed()
         self._capture_input()
+        if self._request_functions():
+            return
         prompt = self._composer.text.strip() if self._composer is not None else ""
         if not prompt:
             self._status("Enter a question or describe the change you want.")
@@ -1350,9 +1576,7 @@ class AIPanel(Vertical):
         self.select_chat(chat.id)
 
     def action_close(self) -> None:
-        if not self._set_visible(False, persist=True):
-            return
-        if self.chat is not None:
+        if self._set_visible(False, persist=True) and self.chat is not None:
             self.chat.visible = False
         self._flush_chat()
         self.return_focus()

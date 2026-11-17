@@ -30,10 +30,11 @@ from d8r.engine import (
 )
 from d8r.sql import (
     FnDef, SQLDocument, SchemaContext, SqlError, TableDef, function_query,
-    lex_sql, open_tables, parse_sql, quote_identifier,
+    lex_sql, open_tables, parse_parameters, parse_sql, quote_identifier,
     relation_parts, split_statements, validate_function,
 )
 from d8r.storage import MemoryStore, SettingsStore, WorkspaceStore
+from d8r.schema_cache import SchemaCacheStore, SchemaSnapshot, capture_schema
 
 PREVIEW_ROW_CAP = 10000
 """Maximum buffered preview rows; never an implicit SQL LIMIT or full count."""
@@ -147,7 +148,7 @@ class Session:
         # connection until its real work finishes. Headless
         # callers keep the synchronous run API and need no reservation.
         self.busy: str = ""
-        self._value_cache: dict[tuple[int, str, str], tuple[DataSource, tuple[list[object], bool]]] = {}
+        self._value_cache: dict[tuple[str, str, str], tuple[DataSource, tuple[list[object], bool]]] = {}
         self._value_cache_lock = RLock()
         self.value_cache_epoch = 0
         # Definitions load without parsing bodies or connecting to their source.
@@ -156,6 +157,7 @@ class Session:
         self._source_functions: dict[str, dict[str, FnDef]] = {
             key: {item["name"]: FnDef(
                 name=item["name"], params=tuple(item["params"]), body=item["body"], doc=item["description"],
+                param_types=tuple(item.get("param_types", ())),
             ) for item in definitions}
             for key, definitions in saved_functions.items()
         }
@@ -197,6 +199,14 @@ class Session:
         self.workspace["history"] = [asdict(entry) for entry in self._history]
         self._completion_usage: dict[str, tuple[int, tuple[TableDef, ...], dict[tuple[str, str, str], int]]] = {}
         self._schema_snapshots: dict[str, tuple[DataSource, dict, SchemaContext]] = {}
+        self._schema_cache = SchemaCacheStore(self._memory.path.parent)
+        self._schema_cache_lock = RLock()
+        self._cached_schemas = dict(self._schema_cache.snapshots)
+        self._hydrated_schemas: dict[str, tuple[DataSource, SchemaSnapshot, dict]] = {}
+        self.metadata_cache_warning = self._schema_cache.error
+        for source in self.sources.values():
+            if source.con is not None:
+                self.cache_source_schema(source)
         if not self.workspace["pages"]:
             seen: set[tuple[str, str, str]] = set()
             for entry in reversed(self._history):
@@ -240,6 +250,12 @@ class Session:
         selected_workspace = source_workspaces[self.workspace["source"]]
         self.workspace["function_draft"] = deepcopy(selected_workspace["function_draft"])
         self.workspace["active_view"] = selected_workspace["active_view"]
+
+    @property
+    def dbt_project_dir(self) -> str:
+        """The selected source workspace's project home; reading never opens it."""
+        state = self.workspace["source_workspaces"].get(self.source_key(), {})
+        return state.get("dbt_project_dir", "")
 
     @property
     def history(self) -> list[HistoryEntry]:
@@ -324,6 +340,11 @@ class Session:
         """The saved application palette, independent of the current workspace."""
         return self._settings.document["theme"]
 
+    @property
+    def ai_remember_key(self) -> bool:
+        """Whether explicit provider saves may persist the key in the OS vault."""
+        return self._settings.document["ai_remember_key"]
+
     def update_settings(
         self, *, intellisense: bool | None = None,
         panes: dict[str, bool] | None = None, source: str | None = None,
@@ -338,7 +359,7 @@ class Session:
         value_cache_limit: int | None = None,
         entry_screen: bool | None = None,
         theme: str | None = None,
-        persist_ai: bool = True,
+        remember_ai_key: bool | None = None,
     ) -> None:
         """Save explicit preference changes before applying them to the session.
 
@@ -368,8 +389,11 @@ class Session:
                 ai.validate()
             else:
                 ai.validate_limits()
-            if persist_ai:
-                document["ai"] = asdict(ai)
+            if remember_ai_key is not None:
+                document["ai_remember_key"] = remember_ai_key
+            document["ai"] = asdict(ai)
+            if not document["ai_remember_key"]:
+                document["ai"]["api_key"] = ""
         if default_rows is not None:
             document["default_rows"] = default_rows
         if ai_auto_accept is not None:
@@ -386,8 +410,7 @@ class Session:
             document["value_cache_enabled"] = value_cache_enabled
         if value_cache_limit is not None:
             document["value_cache_limit"] = value_cache_limit
-        if ai is None or persist_ai or document != self._settings.document:
-            self._settings.save(document, replace_ai=ai is not None and persist_ai)
+        self._settings.save(document, replace_ai=ai is not None)
         with self._value_cache_lock:
             enabled = self._settings.document["value_cache_enabled"]
             limit = self._settings.document["value_cache_limit"]
@@ -403,8 +426,8 @@ class Session:
         if source is not None:
             self.set_active(source)
         if ai is not None:
-            self.ai_config = ai
-            self.ai_credentials_missing = False
+            self.ai_credentials_missing = self._settings.ai_credentials_missing
+            self.ai_config = _MissingAIConfig(**asdict(ai)) if self.ai_credentials_missing else ai
         if default_rows is not None:
             self.default_rows = default_rows
 
@@ -493,22 +516,24 @@ class Session:
                 outcome.status += f" · history not saved: {exc}"
 
 
+    @classmethod
+    def _source_identity(cls, source: DataSource) -> str:
+        if source.connection_key:
+            return source.connection_key
+        if source.kind == "postgres-live":
+            return cls._postgres_profile_id(source.postgres)
+        if source.kind == "d1-live":
+            return cls._d1_profile_id(source.d1)
+        return source.id
+
     def source_key(self, source_id: str | None = None) -> str:
         source_id = self.active_id if source_id is None else source_id
         source = self.sources.get(source_id)
-        if source is not None and source.connection_key:
-            return source.connection_key
-        if source is None:
-            return source_id
-        if source.kind == "postgres-live":
-            return self._postgres_profile_id(source.postgres)
-        if source.kind == "d1-live":
-            return self._d1_profile_id(source.d1)
-        return source_id
+        return self._source_identity(source) if source is not None else source_id
 
     def source_connected(self, source_id: str | None = None) -> bool:
         source = self.sources.get(self.active_id if source_id is None else source_id)
-        return source is not None and source.con is not None
+        return source is not None and source.con is not None and not getattr(source.con, "closed", False)
 
 
     def restore_source(self, key: str, *, activate: bool = True) -> str:
@@ -529,6 +554,7 @@ class Session:
                 kind="disconnected", dialect="sqlite" if is_d1 else "duckdb" if is_parquet else "postgres",
                 connection_key=key,
             )
+        self._hydrate_cached_schema(self.sources[source_id])
         if activate:
             self.set_active(source_id)
         return source_id
@@ -556,7 +582,8 @@ class Session:
                 else:
                     durable[group].append(profile)
         self._memory.save({key: [
-            {"name": fn.name, "params": list(fn.params), "body": fn.body, "description": fn.doc}
+            {"name": fn.name, "params": list(fn.params), "body": fn.body, "description": fn.doc,
+             **({"param_types": list(fn.param_types)} if fn.param_types else {})}
             for fn in definitions.values()
         ] for key, definitions in functions.items()}, **durable)
 
@@ -673,6 +700,7 @@ class Session:
         Never hold this scope across an await: the session's active source changes.
         """
         if source_id is None or source_id == self.active_id:
+            self._restore_schema_snapshot()
             yield
             return
         active_id, dialect = self.active_id, self.dialect
@@ -687,20 +715,22 @@ class Session:
 
     def register(self, source: DataSource, activate: bool = True) -> None:
         """Register an explicitly built source, replacing its disconnected target."""
-        key = source.connection_key or (self._postgres_profile_id(source.postgres)
-                                       if source.kind == "postgres-live" else
-                                       self._d1_profile_id(source.d1) if source.kind == "d1-live" else source.id)
-        placeholders = [name for name, item in self.sources.items() if item.con is None and self.source_key(name) == key]
+        key = self._source_identity(source)
+        connected = source.con is not None and not getattr(source.con, "closed", False)
+        placeholders = [name for name in self.sources if not self.source_connected(name) and self.source_key(name) == key]
         was_active = self.active_id in placeholders
         with self._value_cache_lock:
             for name in placeholders:
-                self.clear_value_cache(name)
+                if connected:
+                    self.clear_value_cache(name)
                 del self.sources[name]
             previous = self.sources.get(source.id)
             if previous is not None and previous is not source:
-                self.clear_value_cache(source.id)
+                if connected or self._source_identity(previous) != key:
+                    self.clear_value_cache(source.id)
                 close_source(previous)
             self.sources[source.id] = source
+        self.cache_source_schema(source)
         if activate:
             self.set_active(source.id)
         elif was_active:
@@ -708,9 +738,56 @@ class Session:
         elif source.id == self.active_id:
             self.refresh_schema()
 
+    def cache_source_schema(self, source: DataSource) -> None:
+        """Save completed native discovery, never from completion's snapshot path."""
+        if self.sources.get(source.id) is not source:
+            return
+        try:
+            snapshot = capture_schema(source)
+            if snapshot is None:
+                return
+            key = self._source_identity(source)
+            with self._schema_cache_lock:
+                if self.sources.get(source.id) is not source:
+                    return
+                self._cached_schemas[key] = snapshot
+                self._schema_cache.save_snapshot(key, snapshot)
+                self.metadata_cache_warning = ""
+        except ValueError as exc:
+            self.metadata_cache_warning = "Metadata cache not saved: " + str(exc)
+        except Exception:
+            self.metadata_cache_warning = "Metadata cache could not be saved; live metadata remains available."
+
+    def _hydrate_cached_schema(self, source: DataSource) -> None:
+        """Attach last-known catalog metadata to an offline source, without I/O."""
+        if source.con is not None and not getattr(source.con, "closed", False):
+            return
+        snapshot = self._cached_schemas.get(self._source_identity(source))
+        if snapshot is None or snapshot.dialect != source.dialect:
+            return
+        hydrated = self._hydrated_schemas.get(source.id)
+        if (hydrated is not None and hydrated[0] is source and hydrated[1] is snapshot
+                and hydrated[2] is source.datasets and source.routines is snapshot.routines):
+            return
+        source.datasets = snapshot.datasets()
+        source.routines = snapshot.routines
+        source.default_schema = snapshot.default_schema
+        source.server_version = snapshot.server_version
+        self._hydrated_schemas[source.id] = (source, snapshot, source.datasets)
+
+    def schema_cache_info(self, source_id: str | None = None) -> str:
+        source = self.sources.get(self.active_id if source_id is None else source_id)
+        if source is None or self.source_connected(source.id):
+            return ""
+        snapshot = self._cached_schemas.get(self._source_identity(source))
+        if snapshot is None or snapshot.dialect != source.dialect:
+            return ""
+        return f"Cached metadata from {snapshot.captured_at} · may be stale"
+
     def refresh_schema(self) -> None:
         """Replace this session's snapshot; in-flight parses retain the old one."""
         source = self.source
+        self._hydrate_cached_schema(source)
         self.schema = SchemaContext(
             tables=tuple(tables_of(source)), fns=tuple(self.fns.values()),
             default_schema=source.default_schema or source.postgres.get("schema"),
@@ -721,6 +798,7 @@ class Session:
     def _restore_schema_snapshot(self) -> None:
         """Switch completion targets without rebuilding unchanged catalog metadata."""
         source = self.source
+        self._hydrate_cached_schema(source)
         cached = self._schema_snapshots.get(source.id)
         if (cached is not None and cached[0] is source and cached[1] is source.datasets
                 and cached[2].routines is source.routines
@@ -740,9 +818,12 @@ class Session:
         for relation in context.relations:
             for field in relation.fields:
                 if field.table == dataset and field.column == column:
-                    prefix = relation.reference + "." if relation.reference else ""
+                    prefix = relation.reference + "." if relation.reference and context.clause != "identifier" else ""
                     return prefix + quote_identifier(field.name)
-        return quote_identifier(column)
+        if context.clause == "identifier":
+            return quote_identifier(column)
+        parts = relation_parts(dataset, dialect=self.source.dialect) or (dataset,)
+        return ".".join(quote_identifier(part) for part in (*parts, column))
 
     def completion_usage(self) -> dict[tuple[str, str, str], int]:
         """Rank cached relation/column/function offers by successful SQL history."""
@@ -789,10 +870,33 @@ class Session:
 
     def validate_fn(self, name: str, params_text: str, body: str, doc: str) -> FnDef:
         """Check function lexical/expansion rules, not server syntax or schemas."""
-        params = tuple(part.strip() for part in params_text.split(",")) if params_text.strip() else ()
-        fn = FnDef(name=name.strip(), params=params, body=body, doc=doc.strip())
+        params, param_types = parse_parameters(params_text)
+        fn = FnDef(name=name.strip(), params=params, body=body, doc=doc.strip(), param_types=param_types)
         validate_function(fn, self.fns, dialect=self.source.dialect)
         return fn
+
+    def install_quality_functions(self) -> int:
+        """Install this dialect's SQL library atomically, without executing SQL."""
+        from d8r.quality import quality_functions
+
+        functions = dict(self.fns)
+        existing = {name.casefold(): fn for name, fn in functions.items()}
+        additions = []
+        for fn in quality_functions(self.source.dialect):
+            previous = existing.get(fn.name.casefold())
+            if previous is not None:
+                if previous != fn:
+                    raise SqlError(f'Function "{fn.name}" already exists; rename it before installing the quality library.')
+                continue
+            additions.append(fn)
+            functions[fn.name] = fn
+        for fn in additions:
+            validate_function(fn, functions, dialect=self.source.dialect)
+        if additions:
+            self._save_memory(functions)
+            self.fns.update({fn.name: fn for fn in additions})
+            self.refresh_schema()
+        return len(additions)
 
     def delete_fn(self, name: str) -> None:
         """Persist deletion before removing the function from the live registry."""
@@ -830,9 +934,10 @@ class Session:
             if source_id is None:
                 self._value_cache.clear()
             else:
+                target = self.source_key(source_id)
                 self._value_cache = {
                     key: entry for key, entry in self._value_cache.items()
-                    if entry[0].id != source_id
+                    if key[0] != target
                 }
             self.value_cache_epoch += 1
 
@@ -843,8 +948,8 @@ class Session:
         with self._value_cache_lock:
             if not self.value_cache_enabled:
                 return None
-            entry = self._value_cache.get((id(source), dataset, column))
-            return None if entry is None else entry[1]
+            entry = self._value_cache.get((self._source_identity(source), dataset, column))
+            return None if entry is None or entry[0].dialect != source.dialect else entry[1]
 
     def distinct_values(
         self, source: DataSource, dataset: str, column: str, *, epoch: int | None = None,
@@ -861,9 +966,9 @@ class Session:
             enabled = self.value_cache_enabled
         values = column_values(source, dataset, column, limit)
         with self._value_cache_lock:
-            if enabled and self.value_cache_enabled and epoch == self.value_cache_epoch:
-                # Keep the object alive as well as its id: ids can be reused after GC.
-                self._value_cache[(id(source), dataset, column)] = (source, values)
+            if (enabled and self.value_cache_enabled and epoch == self.value_cache_epoch
+                    and self.sources.get(source.id) is source):
+                self._value_cache[(self._source_identity(source), dataset, column)] = (source, values)
         return values
 
 
@@ -978,13 +1083,17 @@ class Session:
             result = execute_sql(source, sql, max_rows=min(self.default_rows or PREVIEW_ROW_CAP, PREVIEW_ROW_CAP))
         except Exception as exc:
             message = self.execution_error(exc)
+            if not self.source_connected(source.id) and source is self.source:
+                self.refresh_schema()
             return RunOutcome(status=message, error=message, source=source.id,
                               dialect=source.dialect, sql=sql, doc=doc)
-        self.clear_value_cache(source.id)
+        self.clear_value_cache(self._source_identity(source))
         schema_warning = ""
         if result["schema_changed"]:
             try:
                 refresh_source_schema(source)
+                self.cache_source_schema(source)
+                schema_warning = self.metadata_cache_warning
                 if source is self.source:
                     self.refresh_schema()
             except Exception as exc:

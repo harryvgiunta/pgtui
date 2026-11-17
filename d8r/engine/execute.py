@@ -221,6 +221,7 @@ def column_values(source: DataSource, dataset: str, column: str, limit=100) -> t
     if column not in {item.name for item in source.datasets[dataset]["columns"]}:
         raise EngineError("Select an exact registered column name")
     cap = _row_limit(limit)
-    result = execute_sql(source, f"SELECT DISTINCT {quote_identifier(column)} FROM {quoted_table} ORDER BY 1",
+    result = execute_sql(source,
+                         f"SELECT DISTINCT {quote_identifier(column)} FROM {quoted_table} ORDER BY 1 LIMIT {cap + 1}",
                          max_rows=cap, readonly=True)
     return [row[0] for row in result["rows"]], result["total"] > len(result["rows"])

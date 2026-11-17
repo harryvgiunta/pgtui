@@ -39,6 +39,17 @@ uv sync --locked
 uv run pgtui
 ```
 
+If the global `pgtui` command was installed with `uv tool`, close running instances
+before updating it from this checkout:
+
+```sh
+uv tool install --force --editable .
+```
+
+The editable installation keeps the global command on the checkout's code. Older
+installed builds can reject workspace fields written by a newer checkout; update
+the launcher before treating `workspace.json` as corrupt or moving it aside.
+
 A new workspace starts blank and disconnected. **Ctrl+O** opens the source form:
 
 - **PostgreSQL**: host, port, database, user, password, schema, SSL mode.
@@ -117,14 +128,18 @@ the workspace to PostgreSQL.
 ## Saved SQL functions
 
 The reusable function layer is retained as **source-scoped SQL query templates**.
-A definition has a name, ordered parameter names, a SQL body, and a description.
-Its body is one SELECT, WITH, VALUES or TABLE query. Parameters use `@name` in
-expression positions. A call in FROM or JOIN expands into a lateral subquery on
+A definition has a name, ordered parameters, a SQL body, and a description.
+Its body is one SELECT, WITH, VALUES or TABLE query. Plain parameters use `@name`
+in expression positions. Declare `name:relation` for a qualified schema/table name,
+or `name:identifier` for one schema, table or column identifier. Typed arguments
+must be SQL identifiers, not string literals or arbitrary SQL; expansion quotes
+them safely. Separate identifier parameters can form `@schema.@table`.
+A call in FROM or JOIN expands into a lateral subquery on
 PostgreSQL/DuckDB or an ordinary derived table on D1. D1 templates cannot reference
 outer relations through correlated arguments; no correlation translation is attempted.
-Arguments are parenthesized SQL expressions and explicit aliases are preserved.
+Expression arguments are parenthesized and explicit aliases are preserved.
 Quoted text, comments, quoted identifiers and dollar bodies are never substituted.
-Cycles, arity mismatches, identifier substitution and excessive expansion are refused.
+Cycles, arity/type mismatches, untyped identifier substitution and excessive expansion are refused.
 `WITH ORDINALITY` is not supported on local template calls; schema-qualified native
 server function calls are passed through unchanged.
 
@@ -133,27 +148,131 @@ parameter binding on untrusted application input. PostgreSQL supports bound quer
 parameters; this layer supplies reusable parameterized relations without requiring
 server deployment. Native CREATE FUNCTION statements remain ordinary SQL.
 
-The Functions explorer opens the retained editor. Save persists a definition;
-Run preview saves and executes its call without adding query history. Apply from
-AI in the function form edits the draft only.
+`\fn` (or `\functions`) opens the searchable Functions pane without replacing the editor.
+Type to filter names, signatures or descriptions. Down enters the list; Up from its
+first row (or an empty list) returns to search without clearing the filter. Enter
+inserts the selected call at the original caret. For a new call at the start of a
+statement, the picker creates `SELECT * FROM name();`, reusing an existing semicolon.
+Inside FROM/JOIN it inserts only the relation call. Scalar-expression and argument
+positions are left unchanged rather than inserting an invalid nested call.
+Required arguments leave the caret inside the parentheses. Edit selected, New and Use
+current query page as function are explicit management actions. Save persists a
+definition; Run preview saves and executes its call without adding query history.
+The preview's Arguments field takes only the argument list, not the function name or
+a complete SQL statement. AI Apply changes the form draft only.
+
+Reconnecting to the same saved source while the picker is open preserves its insertion
+target. Changing or reloading the target document, moving its caret, or switching its
+page, function draft or source requires reopening Functions before inserting.
+
+In AI chat, typing `\fn` opens a searchable picker for the current source's saved
+functions. Filter, press Down, then Enter to replace just the command with `name()`;
+the caret lands inside the parentheses when arguments are required. Surrounding
+message text and the SQL/function editors stay unchanged. Escape cancels the picker
+and returns focus to the query editor without changing the chat draft. A restored
+or pasted command does not open the picker by itself;
+Enter or Ctrl+Enter activates it instead of sending. Choosing a function only edits
+the local chat draft: it never sends a provider request, runs SQL or saves a definition.
+
+### Data-quality library
+
+Functions → **Install quality templates** stores a source-local native SQL library.
+Installation never executes SQL and never runs automatically. Identical installations
+are idempotent; a conflicting function name cancels the entire install without overwriting it.
+Choose a template through the same searchable picker, provide its arguments, inspect
+expanded SQL with Ctrl+K, then explicitly Run. In a hand-written query use
+`SELECT * FROM name(...)`, not a bare call or a scalar SELECT expression: these are
+local relation templates, not server-installed functions.
+
+The `dq_` library covers row counts/deltas; NULL missingness and completeness;
+predicate-based validity; distinct, excess duplicate and singleton metrics; min/max/
+sum/average and range checks; string lengths, blanks and LIKE patterns; single-column
+referential integrity; freshness in seconds; and visible column/schema metadata.
+PostgreSQL and DuckDB additionally provide native regex and population/sample variance
+and standard deviation. D1 SQLite does not pretend that extension-only functions exist.
+
+Metrics return a `value` column, except `dq_schema_columns`, which returns names, types
+and positions. Empty percentage denominators return NULL; duplicate metrics exclude
+NULL; blank strings are distinct from missing values. Timestamp, regex, LIKE and type
+spellings follow the selected engine. Metadata checks use string-valued schema/table
+names and cannot distinguish an absent table from one the role cannot see.
+
+These independently authored queries draw on [Soda's quality-check categories](https://github.com/sodadata/soda-core).
+They are not a Soda contract runner or anomaly-detection service. Computation stays
+inside PostgreSQL, D1 SQLite or the local DuckDB engine; no full dataset is fetched
+into Python, and no server-installed routines or Soda dependency are required.
+
+## dbt project exchange
+
+Use `\dbt` or Settings → dbt project. Open a local directory containing
+`dbt_project.yml`; its home is saved for the selected source workspace, independently
+of other connections. Opening PGTUI does not scan the project or run dbt.
+
+- **Import:** choose a model and Load model SQL. Review its native SQL, materialization,
+  description and configuration before Apply imported SQL. Apply is one undoable edit;
+  Cancel leaves the editor unchanged. Neither action executes SQL.
+- **Export:** review the current SQL (Use expanded editor SQL expands local functions),
+  choose the model name/materialization/description, then Export model files. Writes
+  model SQL and model YAML under configured model paths. Existing files require the
+  explicit overwrite checkbox. Unrelated YAML values are preserved semantically,
+  but YAML comments and formatting can change.
+- Physical relation names convert to `ref()`/`source()` only through unambiguous,
+  exact manifest relation names or literal source YAML. Aliases, SQL comments, strings
+  and CTE scope are preserved. No schema/search-path guesses are made.
+- Literal `ref`, `source` and `config` calls resolve offline. Advanced Jinja, macros
+  and ephemeral dependencies require actual compiled SQL artifacts with matching
+  model source; generate/refresh them with your dbt tooling outside PGTUI. Arbitrary
+  Jinja is never evaluated here.
+
+Model paths, target paths and file destinations stay inside the selected project;
+symlink escapes and traversal are refused. No dbt runtime, adapters, subprocesses,
+network calls or `profiles.yml` credential access are added. The slim IDE workflow
+follows [Power User's documented SQL conversion](https://github.com/AltimateAI/vscode-dbt-power-user/blob/master/documentation/docs/develop/genmodelSQL.md)
+and dbt's [manifest](https://docs.getdbt.com/reference/artifacts/manifest-json),
+[ref](https://docs.getdbt.com/reference/dbt-jinja-functions/ref) and
+[source](https://docs.getdbt.com/reference/dbt-jinja-functions/source) contracts.
+
 
 ## IntelliSense
 
-Local completion is source-scoped and entirely offline. It analyzes the active SQL
+Local SQL analysis and ranking are source-scoped and offline, using cached metadata.
+Bounded predicate-value reads are the explicit exception described below. Completion analyzes the active SQL
 statement and query scope rather than listing every catalog column. It understands
 aliases and shadowing, nested queries, CTE projections and explicit CTE column lists,
 derived tables, local query-function outputs, and legal correlated outer references.
 Incomplete quoted identifiers and unrelated unfinished SQL no longer disable the
 whole list. Unknown derived names/types stay unknown rather than being invented.
 
+The last successful catalog snapshot is saved per connection identity in
+`schema_cache.json`. After disconnect or restart, table-first completion, columns,
+foreign keys, PostgreSQL enum labels and native routine signatures use that snapshot
+without contacting the database. The source header, completion details and permitted
+AI schema context mark it **cached, with its capture time; it may be stale**.
+Reconnect replaces the snapshot with freshly discovered metadata, including an
+empty catalog if permissions or objects changed. No SQL is executed to restore it.
+
+Only committed catalog metadata is saved. Temporary PostgreSQL objects and routines,
+transactions, result rows, distinct-value pools and credentials are excluded. For
+local Parquet, only the selected file's `data` schema survives restart, not in-memory
+tables/macros. Cache-save errors preserve live metadata and never relabel a successful
+connection or SQL statement as failed. A first successful connection is required:
+older builds did not write a durable snapshot that could be recovered retroactively.
+
 - Prefix, word-boundary and abbreviation matches lead; typo/subsequence matches
   are fallbacks. Legal clause continuations outrank unrelated routines: `inn` after
   a relation proposes `INNER JOIN`. A changed prefix selects the new best match.
-- Qualified names stay in their scope. Ambiguous columns are qualified. Accepting
-  a FROM/JOIN table inserts a short collision-free alias by default, without duplicating
-  an existing alias or adding one to DML/DDL targets. Mid-token edits undo once.
-  Explorer insertions use the same caret scope, rather than an alias from an earlier
-  statement; schema-qualified table selections preserve their namespace.
+- Starting a fresh PostgreSQL statement, including after a semicolon, with a table
+  or schema prefix automatically offers matching tables: `etl`, `etl.` and
+  `etl.dataset_sy` all work without Ctrl+Space. Acceptance inserts
+  `SELECT  FROM "schema"."table" AS alias` with the caret between SELECT and FROM.
+  Escape dismisses the current popup; the next real edit resumes local suggestions,
+  while dismissed automatic AI requests stay revoked until explicitly requested again
+  or a different document is loaded. New query pages never inherit a suppressed popup.
+- Column suggestions use their visible relation alias/qualifier, not just ambiguous
+  columns. SQL-required bare target/USING columns and projection aliases remain bare.
+  FROM/JOIN table acceptance inserts a short collision-free alias, preserving an
+  existing alias and avoiding illegal aliases on DML/DDL targets. Mid-token edits undo once.
+  Explorer insertions use the same caret scope and preserve schema-qualified names.
   Typing an alias prefix offers the relation and its qualified fields; a dot narrows
   completion to that relation without duplicating the dot or surrounding quotes.
 - Declared foreign keys supply JOIN predicates while choosing a joined table and
@@ -169,9 +288,24 @@ whole list. Unknown derived names/types stay unknown rather than being invented.
   documentation; D1 uses native SQLite aids. Active-argument help prioritizes useful
   fields without pretending to be a complete SQL type checker. Native catalogs are
   captured on connection and successful schema changes, never while typing.
+- Saved-function `relation` arguments offer tables and CTEs without adding aliases.
+  Subsequent `identifier` arguments offer columns from the supplied preceding
+  relations, not the function's output or unrelated query sources. Acceptance inserts
+  a single identifier, preserving required quotes; explorer insertion follows the
+  same rule. Unknown or ambiguous input relations do not supply guessed columns.
+  These suggestions use cached metadata only.
 - PostgreSQL enum/domain labels come from catalog metadata, without reading rows.
-  Other predicate values use already-populated in-memory value caches. Completion
-  never fetches rows; expand a column in the explorer to inspect/cache values explicitly.
+  For other WHERE values, a real predicate edit or Ctrl+Space requests a bounded,
+  read-only `SELECT DISTINCT ... LIMIT ...` in the background if the column is not
+  cached. The value cache setting and per-column limit control these reads; values
+  remain memory-only and are reused offline within the same session, including
+  through an offline source handoff. Restart starts with no cached row values.
+  Reconnect, successful SQL execution, settings changes and Clear cache invalidate
+  value pools. Startup, document loads and caret-only movement never fetch values.
+  Busy connections do not block local suggestions. Escape/blur/retarget
+  prevent late reads from reopening a popup; typing within the same predicate uses
+  its current literal. Explorer expansion shares the same cache and in-flight read.
+  Limits bound returned values, not scan cost.
 
 The popup shows kind, type, provenance and documentation. Long details and AI edit
 previews scroll with Alt+Up/Down while keyboard focus stays in the editor. Local
@@ -203,9 +337,9 @@ execute SQL or save a function. For larger replacements, use the existing Ask AI
 
 ## Workspace and keys
 
-Schema, Pages, Functions, Results, SQL preview, History and AI/Agents retain their
-existing workspace layout. Local IntelliSense is offline; optional inline AI follows
-the explicit controls above. Pages,
+Schema, Pages, Functions, Results, SQL preview, History and Conversations retain the
+workspace's resizable layout. Metadata IntelliSense remains offline; predicate
+value reads and optional inline AI follow the controls above. Pages,
 functions, history and chats are isolated by connection identity. Pane resizing,
 result selection, clipboard copying and CSV export remain available.
 Hover a button to see its bound keyboard shortcut. New Query preserves the current
@@ -215,20 +349,23 @@ draft; connection forms retain field focus and selection across edits and connec
 |---|---|
 | Ctrl+Enter / F5 | Run native SQL |
 | Ctrl+K / F6 | Preview expanded SQL, execute nothing |
-| Ctrl+N | New blank query; preserve current query/function/chat drafts |
+| Ctrl+N | New query; new conversation when conversation tabs have focus |
 | Ctrl+O | Add PostgreSQL, Cloudflare D1 or local Parquet |
 | Ctrl+, | Settings |
-| Ctrl+J | AI agent/chat roster |
+| Ctrl+J | Focus recent conversation tabs |
 | Ctrl+R in function mode | Save and run function preview |
 | Ctrl+Space | Open local SQL completion |
 | F4 / Ctrl+Shift+Space | Request AI completion |
 | Alt+Up / Alt+Down | Scroll completion documentation/preview |
 | Tab / Enter with completion open | Accept completion |
-| Escape in the editor | Dismiss/cancel completion; press again to reopen local offers |
+| Escape in the query editor | Dismiss/cancel completion; press again to reopen local offers |
+| Escape in Functions or chat | Return to the query editor, preserving unsaved drafts |
 | Ctrl+Q | Return from function mode; otherwise quit |
 
-Backslash entries are **workspace actions only**: settings, functions, pages, pane
-visibility and AI. They are never query clauses. The query language is SQL.
+Backslash entries are **editor actions**, available mid-query as well as at the start:
+settings, functions, dbt, pages, pane visibility and AI. Only the command span is
+removed; surrounding SQL stays intact. Commands inside SQL strings/comments are not
+interpreted. These actions are never query clauses. The query language is SQL.
 
 ## PostgreSQL release and local service
 
@@ -255,10 +392,45 @@ production targets; the development role is not a production security policy.
 The server and configured extension modules are rebuilt into a clean staging prefix;
 the final image does not inherit older PostgreSQL module binaries.
 
+### Optional Pagila test data
+
+For manual testing, load the DVD-rental dataset from
+[Pagila v3.1.0](https://github.com/devrimgunduz/pagila/tree/fef9675714cfba1756df4719b5e36075a7ddf90e)
+into a separate `pagila` database. This pinned dataset needs no third-party
+extensions; the server remains PostgreSQL 18.7. Seeding is explicit, never part of
+application startup or the default container image.
+
+On a fresh service, create a `postgres NOLOGIN` role for the dump's object ownership,
+then create `pagila` owned by `pgtui`. Download `pagila-schema.sql` and
+`pagila-data.sql` from the pinned revision into a temporary directory outside the
+checkout. Copy them into the container's `/tmp` directory with
+`docker compose --env-file .env.postgres cp`, then import schema and data together:
+
+```powershell
+docker compose --env-file .env.postgres exec -T postgres psql -X -U pgtui -d pagila -v ON_ERROR_STOP=1 --single-transaction -f /tmp/pagila-schema.sql -f /tmp/pagila-data.sql
+```
+
+Do not also import `pagila-insert-data.sql`; it contains the same data.
+Run `ANALYZE` after import.
+
+Connect from PGTUI with host `127.0.0.1`, port `55434`, database `pagila`, user
+`pgtui`, schema `public`, SSL mode `disable`, and the password from `.env.postgres`.
+The dataset includes 1,000 films, 200 actors, 599 customers, 16,044 rentals,
+16,049 payments, views, foreign keys and server routines. Data stays in the
+`pgtui_postgres-data` volume across container stops; removing that volume deletes it.
+
 ## AI assistance and privacy
 
-Configure an OpenAI-compatible provider in Settings. AI is optional. The assistant
-receives native PostgreSQL/D1 SQLite/DuckDB guidance, the actual engine version, the current
+Configure an OpenAI-compatible provider in Settings. AI is optional.
+
+Save always persists provider URL, model, limits and the Remember choice. Remember
+controls only API-key storage in the OS keyring; an unchecked key remains session-only,
+including across later preference/function saves. Reopening the form retains that choice.
+Limits can be saved before configuring a provider. If a previously saved key is locked
+or unavailable, option changes preserve its credential reference and AI use stays blocked
+until the key is available; secrets never fall back to plaintext.
+
+The assistant receives native PostgreSQL/D1 SQLite/DuckDB guidance, the actual engine version, the current
 draft, and permitted schema/history/function context. Complete proposals use SQL
 fences. Manual Apply is required unless Auto accept AI updates is enabled; neither
 path executes SQL. Explicitly requested workspace function saves can persist through
@@ -274,10 +446,34 @@ limits are not query-cost guarantees, and D1 checks do not create a remote sessi
 Streaming, questions, steering, cancellation, source/definition guards and saved
 chat history remain available. No app HTTP server or browser is involved.
 
+Recent conversations appear as horizontal closable tabs with names and status-colored
+dots. Ctrl+J focuses the strip; arrows navigate, Enter selects, and Delete/Ctrl+W closes
+a tab. Closing or switching tabs retains its draft, history and background request;
+History reopens closed chats. Only explicit permanent deletion removes history and
+cancels the request. Conversations remain source-scoped.
+
+AI status sayings follow real connection, generation, schema, history, functions and
+validation stages rather than a rotating timer. Validation statuses explicitly mean
+offline lexical/template checks, not server validation. Retry, cancellation and errors
+retain accurate status messages.
+
+### Future AI — roadmap only
+
+- Dreaming: identify the queries used most often.
+- Surface the queries taking the longest.
+- Suggest indexes from relevant query evidence.
+- Review potentially unused indexes with usage-history/reset caveats.
+
+These are not background jobs or implemented index-management features. No indexes
+are created or dropped automatically.
+
+### Local state
+
 State is independent of the original application: `~/.pgtui`, overridden by
 `PGTUI_DATA_DIR`. PostgreSQL passwords, D1 tokens and AI keys use the native OS keyring;
-JSON stores references only. Preferences, source metadata, SQL drafts, functions,
-history and chats remain sensitive plaintext. Protect the data directory and
+JSON stores credential references only. Preferences, source metadata (including cached
+catalog names, types, documentation and enum labels), SQL drafts, functions, history
+and chats remain sensitive plaintext. Protect the data directory and
 backups. Old anyql configuration is not imported or rewritten. Invalid files and
 stale concurrent writers block unsafe saves rather than overwriting data.
 

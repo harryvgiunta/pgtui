@@ -94,7 +94,7 @@ async def test_sql_function_save_and_preview(parquet_source):
     session = Session({parquet_source.id: parquet_source})
     app = D8RApp(session)
     async with app.run_test(size=(140, 45)) as pilot:
-        app.action_fn()
+        app.action_query_to_fn()
         await pilot.pause()
         form = app.function_editor
         form.query_one("#fn-name", Input).value = "rows_above"
@@ -356,7 +356,7 @@ async def test_new_query_shortcut_preserves_query_function_and_chat_drafts():
         await pilot.pause()
         assert app.editor.text == ""
         assert any(chat.input == "Keep this unsent question" for chat in app.ai_chats.chats.values())
-        app.action_fn()
+        app.action_query_to_fn()
         await pilot.pause()
         app.function_editor.query_one("#fn-name", Input).value = "unsaved_function"
         app.function_editor.query_one("#fn-body", TextArea).load_text("SELECT 42")
@@ -383,7 +383,7 @@ async def test_bound_button_hover_displays_real_shortcuts():
         tooltip = app.screen.query_one(Tooltip)
         assert tooltip.display
         assert "Ctrl+N" in str(tooltip.content)
-        app.action_fn()
+        app.action_query_to_fn()
         await pilot.pause()
         await pilot.hover("#fn-preview")
         await pilot.pause(0.1)

@@ -61,6 +61,7 @@ def test_visible_scope_excludes_other_catalog_columns_and_tables(monkeypatch, sc
     result = candidates(monkeypatch, context, schema)
     assert not any(item.label in {"secret_payload", "orders", "audit_log"} for item in result.items)
     assert by_label(result, "display_name").kind == "column"
+    assert by_label(result, "display_name").insert == "u.display_name"
 
 
 def test_ambiguous_columns_always_offer_explicit_relations(monkeypatch, schema):
@@ -82,6 +83,7 @@ def test_derived_fields_not_physical_parent_columns(monkeypatch, schema):
 def test_global_columns_remain_useful_before_a_source(monkeypatch, schema):
     result = candidates(monkeypatch, Context(7, 10, "dis", clause="select"), schema)
     assert "users" in by_label(result, "display_name").detail
+    assert by_label(result, "display_name").insert == "users.display_name"
 
 
 @pytest.mark.parametrize("token,name", [("dspnam", "display_name"), ("dn", "display_name"),
@@ -136,7 +138,7 @@ def test_schema_qualification_replaces_component_only(monkeypatch):
 def test_identifier_quote_style_preserved(monkeypatch, quote, expected):
     scope = Relation("r", "r", (Field("select"),))
     context = Context(7, 10, "sel", quote=quote, clause="select", relations=(scope,))
-    assert by_label(candidates(monkeypatch, context, SchemaContext()), "select").insert == expected
+    assert by_label(candidates(monkeypatch, context, SchemaContext()), "select").insert == "r." + expected
 
 
 def test_alias_insertions_avoid_collisions_and_existing_suffix(monkeypatch, schema):
@@ -369,7 +371,7 @@ def test_quoted_identifier_has_no_bare_keywords(monkeypatch, schema):
     context = Context(7, 10, "sel", quote='"', clause="select",
                       relations=(Relation("r", "r", (Field("select"),)),))
     result = candidates(monkeypatch, context, schema)
-    assert by_label(result, "select").insert == '"select"'
+    assert by_label(result, "select").insert == 'r."select"'
     assert not any(item.kind in {"keyword", "snippet"} for item in result.items)
 
 

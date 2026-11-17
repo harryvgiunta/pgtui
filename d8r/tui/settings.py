@@ -25,6 +25,7 @@ from d8r.credentials import CredentialError
 from d8r.themes import THEMES, theme_label
 
 from .add_source import AddSourceModal
+from .dbt import DBTScreen
 from .palette import prompt
 
 if TYPE_CHECKING:
@@ -37,6 +38,7 @@ MENUS: dict[str, str] = {
     "theme": "Theme",
     "values": "Value cache",
     "sources": "Data source",
+    "dbt": "DBT",
     "ai": "AI provider",
     "keys": "Keybindings",
 }
@@ -86,8 +88,9 @@ def binding_rows() -> list[Row]:
         ("add source", AddSourceModal.BINDINGS),
         ("AI", AIPanel.BINDINGS),
         ("AI logs", AIDiagnosticsScreen.BINDINGS),
-        ("page / agent lists", DeleteOptionList.BINDINGS),
+        ("page / conversation lists", DeleteOptionList.BINDINGS),
         ("export", ExportModal.BINDINGS),
+        ("dbt exchange", DBTScreen.BINDINGS),
         ("default rows", DefaultRowsScreen.BINDINGS),
         ("value cache limit", ValueCacheLimitScreen.BINDINGS),
         ("AI provider", AIProviderScreen.BINDINGS),
@@ -177,6 +180,8 @@ class SettingsScreen(ModalScreen[None]):
                       "Completion uses cached metadata only and never queries while typing. "
                       "Values never go to disk and are cleared at exit. Changing these settings clears cached values.",
             "sources": "Connect PostgreSQL, Cloudflare D1 or a local Parquet file. SQL dialect and engine version follow the selected source.",
+            "dbt": "Exchange native SQL and local dbt models. Project home belongs to this source workspace. "
+                   "No dbt installation, execution, network or credential profiles; imports require manual Apply.",
             "ai": "Provider changes require Save. Permission toggles save immediately. Schema refreshes control AI metadata lookups, not IDE indexing. "
                   "Test AI Queries permits read-only execution with bounded result rows; aggregates can still scan many source rows. "
                   "Query-check failures and bounded row counts are shared even when Allow Sample Data is off; result samples are sent only when it is on. "
@@ -198,6 +203,7 @@ class SettingsScreen(ModalScreen[None]):
             "theme": "enter / click apply and save theme",
             "values": "enter / click toggle, edit or clear",
             "sources": "enter / click select or add",
+            "dbt": "enter / click open project exchange",
             "ai": "enter / click toggle or edit",
             "keys": "read-only reference",
         }[self.menu]
@@ -253,6 +259,8 @@ class SettingsScreen(ModalScreen[None]):
                 )
                 for label, source_id in self.session.source_options()
             ]
+        if self.menu == "dbt":
+            return [Row("Project home / import / export", self.session.dbt_project_dir or "not configured", "dbt")]
         if self.menu == "ai":
             config = self.session.ai_config
             return [
@@ -343,6 +351,9 @@ class SettingsScreen(ModalScreen[None]):
                 self.action_details()
 
             self.app.push_screen(DefaultRowsScreen(self.ide), rows_saved)
+            return
+        elif row.action == "dbt":
+            self.app.push_screen(DBTScreen(self.ide), lambda _: self._draw(event.option_index))
             return
         elif row.action == "ai":
             self.app.push_screen(
@@ -516,8 +527,8 @@ class AIProviderScreen(ModalScreen[None]):
         with VerticalScroll(id="ai-settings"):
             yield Static("AI provider · OpenAI chat completions")
             yield Static(
-                "Remember stores the API key in your system keyring and provider settings locally. "
-                "Uncheck Remember to use this entire configuration for this session only. "
+                "Save always stores the provider URL, model and options locally. "
+                "Remember controls only API-key storage in your system keyring; unchecked keys stay in this session. "
                 "Completed chats and drafts are saved locally. Sending a message shares the document, "
                 "history and permitted schema/sample reads and query-check evidence with this provider. Use HTTPS for remote providers.", markup=False,
             )
@@ -527,7 +538,8 @@ class AIProviderScreen(ModalScreen[None]):
             yield Input(config.model, placeholder="yolo", id="ai-model")
             yield Static("API key (leave blank for an unauthenticated local provider)")
             yield Input(config.api_key, password=True, id="ai-api-key")
-            yield Checkbox("Remember key in system keyring and provider settings", value=True, id="ai-remember-credentials")
+            yield Checkbox("Remember API key in system keyring", value=self.ide.session.ai_remember_key,
+                           id="ai-remember-credentials")
             yield Static(self.ide.session.credential_warning, markup=False)
             yield Static("AI turns/tool rounds (1–50)")
             yield Input(str(config.max_tool_rounds), type="integer", id="ai-tool-rounds")
@@ -579,23 +591,23 @@ class AIProviderScreen(ModalScreen[None]):
             )
             return
         try:
-            config.validate()
-            if (self.ide.session.ai_credentials_missing and not config.api_key
-                    and config.base_url == self.ide.session.ai_config.base_url):
-                raise CredentialError("Re-enter the missing API key before applying this provider.")
+            if any((config.base_url, config.model, config.api_key)):
+                config.validate()
+            else:
+                config.validate_limits()
             remember = self.query_one("#ai-remember-credentials", Checkbox).value
-            self.ide.session.update_settings(ai=config, persist_ai=remember)
+            self.ide.session.update_settings(ai=config, remember_ai_key=remember)
         except CredentialError as exc:
             self.query_one("#ai-settings-error", Static).update(
-                f"{exc} Unlock your system keyring and retry, or uncheck Remember for this session only."
+                f"{exc} Unlock your system keyring and retry, or uncheck Remember to save settings with a session-only key."
             )
             return
         except ValueError as exc:
             self.query_one("#ai-settings-error", Static).update(str(exc))
             return
-        self.ide.notify("API key saved in system keyring; provider settings saved locally." if remember and config.api_key else
-                        "Provider settings saved locally." if remember else
-                        "Provider configuration applied for this session only; nothing saved.", title="AI provider")
+        self.ide.notify("Provider settings saved; API key saved in the system keyring." if remember and config.api_key else
+                        "Provider settings saved; API key is session-only." if config.api_key else
+                        "Provider settings saved locally.", title="AI provider")
         self.dismiss(None)
 
     @on(Button.Pressed, "#ai-settings-import")
@@ -609,7 +621,7 @@ class AIProviderScreen(ModalScreen[None]):
         self.query_one("#ai-model", Input).value = config.model
         self.query_one("#ai-api-key", Input).value = config.api_key
         self.query_one("#ai-settings-error", Static).update(
-            "Imported into this form only; Save applies your Remember or session-only choice."
+            "Imported into this form only; Save stores provider settings. Remember controls API-key storage."
         )
 
     @on(Button.Pressed, "#ai-settings-cancel")

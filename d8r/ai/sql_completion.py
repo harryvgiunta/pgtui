@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 import json
 import re
 
-from d8r.sql import SchemaContext, relation_parts
+from d8r.sql import SchemaContext, format_parameters, relation_parts
 from .client import AIConfig, AIError, run_turn
 
 MAX_INSERT_CHARS = 2048
@@ -26,6 +26,7 @@ class CompletionRequest:
     schema: SchemaContext
     parameters: tuple[str, ...] = ()
     allow_schema: bool = True
+    metadata_cache_info: str = ""
 
 
 @dataclass(frozen=True)
@@ -48,8 +49,11 @@ current SQL intent; never invent tables/columns or change a read into a write.
 Use native syntax for the specified dialect and server version, not translation.
 When a PostgreSQL source is disconnected, target PostgreSQL 18.7; an actual connected
 server_version takes precedence. Never assume PostgreSQL syntax works on other sources.
+If metadata_cache_info is nonempty, the schema and reported version come from an
+offline snapshot and may be stale; never describe them as live or verified.
 Cloudflare D1 uses SQLite: no LATERAL, session transactions, temp objects or CREATE
-FUNCTION. Local saved query functions use @parameter expression placeholders.
+FUNCTION. Local saved query functions use @parameter placeholders; declarations
+may use :identifier for one column/name or :relation for a qualified table.
 If essential metadata is absent, return an empty suggestions array rather than
 inventing names. Do not ask questions or request tools. Each insert is at most
 2048 characters; detail is at most 240. No Markdown fences or explanatory prose.
@@ -92,6 +96,7 @@ def _request_data(request: CompletionRequest) -> dict:
     }
     if not request.allow_schema:
         return packet
+    packet["metadata_cache_info"] = request.metadata_cache_info
     from d8r.completion.context import analyze
 
     context = analyze(request.document, request.cursor, request.schema,
@@ -116,8 +121,9 @@ def _request_data(request: CompletionRequest) -> dict:
     packet["visible_relations"] = [{"name": relation.name, "reference": relation.reference,
         "columns": [{"name": field.name, "type": field.type} for field in relation.fields[:80]]}
         for relation in context.relations[:16]]
-    packet["functions"] = [{"name": fn.name, "parameters": list(fn.params), "description": fn.doc[:240]}
-                           for fn in request.schema.fns[:24]]
+    packet["functions"] = [{"name": fn.name,
+                            "parameters": format_parameters(fn).split(", ") if fn.params else [],
+                            "description": fn.doc[:240]} for fn in request.schema.fns[:24]]
     name = context.call.name.casefold() if context.call is not None else prefix
     routines = [routine for routine in request.schema.routines
                 if name and name in routine.name.casefold()][:16]

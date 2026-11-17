@@ -240,6 +240,7 @@ def test_current_nested_argument(schema, sql, name, argument):
     ("SELECT sum(id) OVER (PARTITION BY |) FROM users", "window"),
     ("SELECT CAST(id AS |) FROM users", "type"),
     ("SELECT id::| FROM users", "type"),
+    ("UPDATE users SET name = | WHERE id = 1", "set_expression"),
 ])
 def test_native_clause_context(schema, sql, clause):
     assert at(sql, schema).clause == clause
@@ -397,3 +398,21 @@ def test_join_transition_ignores_incomplete_next_source(schema):
     assert at("SELECT * FROM users u inn|", schema).relation_transition
     assert not at("SELECT * FROM users u, ord|", schema).relation_transition
     assert not at("SELECT * FROM users u JOIN ord|", schema).relation_transition
+
+
+@pytest.mark.parametrize("operator", ["IS DISTINCT FROM", "IS NOT DISTINCT FROM", "BETWEEN 'a' AND"])
+def test_extended_predicates_keep_physical_lineage(schema, operator):
+    context = at(f"SELECT * FROM users u WHERE u.name {operator} 'O|ld'", schema)
+    assert context.clause == "where"
+    assert context.value_field.table == "users"
+    assert context.value_field.column == "name"
+    assert not context.blocked
+
+
+def test_update_expression_keeps_from_relations_but_targets_do_not(schema):
+    rhs = at("UPDATE users u SET name = o.| FROM orders o WHERE u.id = o.user_id", schema)
+    assert rhs.clause == "set_expression"
+    assert set(refs(rhs)) == {"u", "o"}
+    lhs = at("UPDATE users u SET | FROM orders o WHERE u.id = o.user_id", schema)
+    assert lhs.clause == "update_set"
+    assert set(refs(lhs)) == {"u"}
