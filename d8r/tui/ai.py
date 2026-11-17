@@ -106,7 +106,8 @@ class AIDiagnosticsScreen(ModalScreen):
             yield Static("AI diagnostics · current chat", classes="pane-title")
             yield Static("In memory only. May contain query text and data values; review before sharing.\n"
                          "Known AI and database credentials are redacted. Each chat keeps its own logs.\n"
-                         "Validation is offline. Opt-in Test AI Queries runs bounded read-only checks; see test_query tool results for execution evidence.",
+                         "Validation is offline. Opt-in Test AI Queries enables bounded read-only checks and PostgreSQL plans. "
+                         "test_query reports execution evidence; explain_query reports estimates only, with ANALYZE disabled.",
                          id="ai-log-notice", markup=False)
             yield TextArea("", read_only=True, soft_wrap=True, id="ai-log-text")
             with Horizontal(id="ai-log-buttons"):
@@ -177,6 +178,7 @@ class AIChat:
     validation_error: str | None = None
     worker: Worker | None = None
     generation: int = 0
+    provider_snapshot: tuple | None = field(default=None, repr=False)
     pending_prompt: str = ""
     request_messages: list[dict] = field(default_factory=list)
     partial: str = ""
@@ -377,6 +379,7 @@ class AIChats:
         config = self.session.ai_config
         chat.diagnostics.protect([
             config.api_key,
+            config.headers,
             *(profile.get("password", "") for profile in self.session.postgres_profiles),
             *(source.postgres.get("password", "") for source in self.session.sources.values()),
             *(profile.get("api_token", "") for profile in self.session.d1_profiles),
@@ -393,6 +396,7 @@ class AIChats:
             chat.status_text = "Configure Settings → AI provider with a valid URL, model and request options."
             self.changed(chat)
             return False
+        chat.diagnostics.protect(list(client.parse_headers(config.headers).values()))
         if not self.session.source_connected(target.source_id):
             chat.status_text = "This source is disconnected. Reconnect it before sending an AI request."
             self.changed(chat)
@@ -422,6 +426,7 @@ class AIChats:
         chat.proposal = None
         chat.validation_error = None
         chat.generation += 1
+        chat.provider_snapshot = (self.session.ai_provider_revision, config)
         chat.turns += 1
         if chat.title == "New chat":
             chat.title = " ".join(prompt.split())[:80]
@@ -466,10 +471,27 @@ class AIChats:
         self._clear_question(chat)
         chat.worker.cancel()
 
+    def _provider_current(self, chat: AIChat) -> bool:
+        return chat.provider_snapshot == (self.session.ai_provider_revision, self.session.ai_config)
+
+    def providers_changed(self) -> None:
+        """Revoke pending work and unapplied proposals after an explicit provider change."""
+        for chat in self.chats.values():
+            if self._provider_current(chat):
+                continue
+            if chat.worker is not None:
+                self.cancel(chat)
+            if chat.proposal is not None:
+                chat.proposal = None
+                chat.status_text = "AI provider changed. Send a fresh request before applying a proposal."
+                self.changed(chat)
+
     def _mutation_guard(self, chat: AIChat, generation: int) -> str | None:
         if (self.closing or self.chats.get(chat.id) is not chat
                 or chat.generation != generation or chat.status != "working"):
             return "The request was cancelled or replaced; nothing was changed."
+        if not self._provider_current(chat):
+            return "The AI provider changed; send a fresh request before changing the document."
         if not any(panel.snapshot() == chat.target for panel in self.panels()):
             return "The editor target changed; send a fresh request before changing it."
         return None
@@ -505,7 +527,7 @@ class AIChats:
 
     async def _ask_user(self, chat: AIChat, generation: int, question: AIQuestion) -> str:
         """Wait on this chat's answer without owning the database connection lane."""
-        if self.closing or generation != chat.generation:
+        if self.closing or generation != chat.generation or not self._provider_current(chat):
             raise asyncio.CancelledError
         answer = asyncio.get_running_loop().create_future()
         chat.question = question
@@ -566,7 +588,7 @@ class AIChats:
 
     async def _call_tool(self, chat: AIChat, context: AIContext, name: str, args: dict, generation: int) -> str:
         """Serialize shared-connection access, not independent provider requests."""
-        if self.closing or generation != chat.generation:
+        if self.closing or generation != chat.generation or not self._provider_current(chat):
             raise asyncio.CancelledError
         if name == "ask_user":
             return await context.call_tool(name, args)
@@ -609,6 +631,8 @@ class AIChats:
         task.add_done_callback(self._context_finished)
         # A cancelled request cannot release a sample/check still running in a thread.
         result = await asyncio.shield(task)
+        if generation != chat.generation or not self._provider_current(chat):
+            raise asyncio.CancelledError
         self.set_stage(chat, "generating", generation)
         return result
 
@@ -630,6 +654,8 @@ class AIChats:
                 await asyncio.shield(asyncio.gather(*self.context_tasks, return_exceptions=True))
             if self.closing or generation != chat.generation:
                 return
+            if not self._provider_current(chat):
+                raise asyncio.CancelledError
             if self.session.busy:
                 raise client.AIError(f"{self.session.busy}; send again after it finishes.")
             self.set_stage(chat, "general", generation)
@@ -639,6 +665,8 @@ class AIChats:
             ):
                 if generation != chat.generation:
                     return
+                if not self._provider_current(chat):
+                    raise asyncio.CancelledError
                 if event.kind == "text":
                     if chat.stage != "generating" or chat.status_text != stage_saying("generating", chat.turns):
                         self.set_stage(chat, "generating", generation)
@@ -652,6 +680,8 @@ class AIChats:
                     chat.diagnostics.record("Provider / tools", event.text)
             if generation != chat.generation:
                 return
+            if not self._provider_current(chat):
+                raise asyncio.CancelledError
             # Preserve the full completed exchange even if its target changed or
             # its view disappeared while the provider was working.
             answer = messages[-1].get("content") or ""
@@ -750,6 +780,11 @@ class AIChats:
     def apply(self, chat: AIChat, panel: AIPanel, *, automatic: bool = False) -> bool:
         if (self.chats.get(chat.id) is not chat or chat.worker is not None
                 or chat.proposal is None or chat.target is None or chat.context is None):
+            return False
+        if not self._provider_current(chat):
+            chat.proposal = None
+            chat.status_text = "AI provider changed. Send a fresh request before applying a proposal."
+            self.changed(chat)
             return False
         if automatic and chat.saves_function:
             return False
@@ -1320,7 +1355,7 @@ class AIPanel(Vertical):
             return
         current = self.snapshot()
         matching = chat.target_key == current.key
-        stale = chat.target is not None and chat.target != current
+        stale = chat.target is not None and (chat.target != current or not self.manager._provider_current(chat))
         guard_error = (chat.context.replacement_guard(chat.proposal)
                        if chat.context is not None and chat.proposal is not None else None)
         self.query_one("#ai-title", Static).update(f"{chat.title} · {chat.label}")

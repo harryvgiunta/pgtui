@@ -14,7 +14,7 @@ from dataclasses import asdict
 from pathlib import Path
 import tempfile
 import time
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from d8r.ai.client import AIConfig
 from d8r.credentials import CredentialError, CredentialVault
@@ -142,7 +142,7 @@ def _validate(value: object) -> dict:
 def _settings(value: object) -> dict:
     """Validate editable settings and fill omitted keys without retaining aliases."""
     defaults = {
-        "version": 1, "intellisense": True,
+        "version": 3, "intellisense": True,
         "entry_screen": False,
         "theme": DEFAULT_THEME,
         "panes": {"results": True, "sql": True, "history": True, "schema": True, "ai": False},
@@ -156,14 +156,14 @@ def _settings(value: object) -> dict:
         "ai_allow_schema_refreshes": True,
         "ai_test_queries": False,
         "ai_completion": False,
-        "ai_remember_key": True,
-        "ai": asdict(AIConfig()),
+        "ai_providers": [],
+        "ai_active_provider": "",
     }
     if not isinstance(value, dict) or not value.keys() <= defaults.keys():
         raise ValueError("invalid settings fields")
     document = defaults | value
-    if type(document["version"]) is not int or document["version"] != 1:
-        raise ValueError("unsupported settings version (expected 1)")
+    if type(document["version"]) is not int or document["version"] != 3:
+        raise ValueError("unsupported settings version (expected 3)")
     if type(document["intellisense"]) is not bool:
         raise ValueError("intellisense must be a boolean")
     if type(document["entry_screen"]) is not bool:
@@ -172,14 +172,14 @@ def _settings(value: object) -> dict:
         raise ValueError("Choose a supported theme from Settings → Theme.")
     if type(document["ai_auto_accept"]) is not bool:
         raise ValueError("ai_auto_accept must be a boolean")
-    for field in ("ai_allow_sample_data", "ai_allow_schema_refreshes", "ai_test_queries", "ai_completion", "ai_remember_key"):
+    for field in ("ai_allow_sample_data", "ai_allow_schema_refreshes", "ai_test_queries", "ai_completion"):
         if type(document[field]) is not bool:
             raise ValueError(f"{field} must be a boolean")
     if type(document["value_cache_enabled"]) is not bool:
         raise ValueError("Cache column values must be a boolean.")
     if type(document["value_cache_limit"]) is not int or not 1 <= document["value_cache_limit"] <= 10_000:
         raise ValueError("Values per column must be an integer between 1 and 10000.")
-    for field in ("panes", "pane_sizes", "ai"):
+    for field in ("panes", "pane_sizes"):
         provided = document[field]
         if field == "panes" and isinstance(provided, dict) and "agents" in provided:
             provided = dict(provided)
@@ -197,13 +197,43 @@ def _settings(value: object) -> dict:
     _text(document["source"], "source", nonempty=True)
     if type(document["default_rows"]) is not int or not 0 <= document["default_rows"] <= 1_000_000:
         raise ValueError("Default rows returned must be an integer between 0 and 1000000 (0 uses the preview cap).")
-    ai = document["ai"]
-    for field in ("base_url", "model", "api_key"):
-        _text(ai[field], f"AI {field}")
-    if any(ai[field] for field in ("base_url", "model", "api_key")):
-        AIConfig(**ai).validate()
-    else:
-        AIConfig(**ai).validate_limits()
+    if not isinstance(document["ai_providers"], list):
+        raise ValueError("invalid AI provider profiles")
+    ids, names = set(), set()
+    profiles = []
+    config_defaults = asdict(AIConfig())
+    for value in document["ai_providers"]:
+        profile = deepcopy(_record(value, {"id", "name", "config", "remember"}, "AI provider"))
+        _text(profile["id"], "AI provider id", nonempty=True)
+        if str(UUID(profile["id"])) != profile["id"] or profile["id"] in ids:
+            raise ValueError("invalid or duplicate AI provider id")
+        _text(profile["name"], "AI provider name", nonempty=True)
+        profile["name"] = profile["name"].strip()
+        if len(profile["name"]) > 80 or any(ord(char) < 32 or ord(char) == 127 for char in profile["name"]):
+            raise ValueError("AI provider name must be at most 80 characters without control characters.")
+        if profile["name"].casefold() in names:
+            raise ValueError("AI provider names must be unique.")
+        if type(profile["remember"]) is not bool:
+            raise ValueError("AI provider remember must be a boolean")
+        ai = profile["config"]
+        if not isinstance(ai, dict) or not ai.keys() <= config_defaults.keys():
+            raise ValueError("invalid AI config fields")
+        ai = config_defaults | ai
+        for field in ("base_url", "model", "api_key", "headers"):
+            _text(ai[field], f"AI {field}")
+        config = AIConfig(**ai)
+        if any(ai[field] for field in ("base_url", "model", "api_key", "headers")):
+            config.validate()
+        else:
+            config.validate_limits()
+        profile["config"] = ai
+        profiles.append(profile)
+        ids.add(profile["id"])
+        names.add(profile["name"].casefold())
+    _text(document["ai_active_provider"], "active AI provider")
+    if document["ai_active_provider"] not in ids and (ids or document["ai_active_provider"]):
+        raise ValueError("active AI provider is not registered")
+    document["ai_providers"] = profiles
     return document
 
 
@@ -237,18 +267,39 @@ def _memory_document(value: object) -> dict:
 
 
 def _settings_document(value: object) -> dict:
-    if not isinstance(value, dict) or type(value.get("version")) is not int or value["version"] != 2:
-        raise ValueError("unsupported saved settings version (expected 2)")
-    ai = value.get("ai")
-    if not isinstance(ai, dict) or "api_key_ref" not in ai or "api_key" in ai:
-        raise ValueError("invalid AI credential metadata")
-    _reference(ai["api_key_ref"])
-    document = _settings({**value, "version": 1, "ai": {
-        **{key: item for key, item in ai.items() if key != "api_key_ref"}, "api_key": "",
-    }})
-    document["version"] = 2
-    document["ai"].pop("api_key")
-    document["ai"]["api_key_ref"] = ai["api_key_ref"]
+    if not isinstance(value, dict) or type(value.get("version")) is not int or value["version"] not in (2, 3):
+        raise ValueError("unsupported saved settings version (expected 2 or 3)")
+    value = deepcopy(value)
+    if value["version"] == 2:
+        ai = value.pop("ai", None)
+        if not isinstance(ai, dict) or "api_key_ref" not in ai or any(key in ai for key in ("api_key", "headers", "headers_ref")):
+            raise ValueError("invalid AI credential metadata")
+        if "ai_providers" in value or "ai_active_provider" in value:
+            raise ValueError("invalid legacy AI provider fields")
+        identity = str(uuid5(NAMESPACE_URL, "pgtui:legacy-ai-provider"))
+        value["ai_providers"] = [{"id": identity, "name": "Default", "config": {**ai, "headers_ref": None},
+                                  "remember": value.pop("ai_remember_key", True)}]
+        value["ai_active_provider"] = identity
+        value["version"] = 3
+    profiles = value.get("ai_providers")
+    if not isinstance(profiles, list):
+        raise ValueError("invalid saved AI provider profiles")
+    runtime = deepcopy(value)
+    for profile in runtime["ai_providers"]:
+        if not isinstance(profile, dict) or not isinstance(profile.get("config"), dict):
+            raise ValueError("invalid AI provider metadata")
+        ai = profile["config"]
+        for secret in ("api_key", "headers"):
+            reference = f"{secret}_ref"
+            if secret in ai or reference not in ai:
+                raise ValueError("invalid AI credential metadata")
+            _reference(ai.pop(reference))
+            ai[secret] = ""
+    document = _settings(runtime)
+    for profile, stored in zip(document["ai_providers"], profiles):
+        for secret in ("api_key", "headers"):
+            profile["config"].pop(secret)
+            profile["config"][f"{secret}_ref"] = stored["config"][f"{secret}_ref"]
     return document
 
 
@@ -440,9 +491,9 @@ class _CredentialStore(_JSONStore):
 
     @staticmethod
     def _references(document: dict) -> set[str]:
-        if "ai" in document:
-            reference = document["ai"]["api_key_ref"]
-            return {reference} if reference is not None else set()
+        if "ai_providers" in document:
+            return {profile["config"][field] for profile in document["ai_providers"]
+                    for field in ("api_key_ref", "headers_ref") if profile["config"][field] is not None}
         return {profile["credential_ref"]
                 for group in ("postgres_profiles", "d1_profiles") for profile in document[group]
                 if profile["credential_ref"] is not None}
@@ -548,51 +599,66 @@ class MemoryStore(_CredentialStore):
 
 
 class SettingsStore(_CredentialStore):
-    """Editable preferences; provider API keys never enter the JSON snapshot."""
+    """Provider metadata is durable; keys and header values live only in the vault."""
 
     def __init__(self, data_dir: Path | None = None) -> None:
-        default = _settings({})
-        default["version"] = 2
-        default["ai"].pop("api_key")
-        default["ai"]["api_key_ref"] = None
-        super().__init__(data_dir, "settings", default, _settings_document)
+        super().__init__(data_dir, "settings", _settings({}), _settings_document)
         self._credential_state()
-        self.ai_credentials_missing = False
+        self.missing_ai_credentials: dict[str, set[str]] = {}
         if self.error:
             self.document = _settings({})
             return
-        reference = self.document["ai"]["api_key_ref"]
-        value = self._get(reference)
-        self.ai_credentials_missing = reference is not None and value is None
-        ai = {key: item for key, item in self.document["ai"].items() if key != "api_key_ref"}
-        self.document = {**self.document, "version": 1, "ai": {**ai, "api_key": value if value is not None else ""}}
+        runtime = deepcopy(self.document)
+        for profile in runtime["ai_providers"]:
+            for secret in ("api_key", "headers"):
+                reference = profile["config"].pop(f"{secret}_ref")
+                value = self._get(reference)
+                profile["config"][secret] = value if value is not None else ""
+                if reference is not None and value is None:
+                    self.missing_ai_credentials.setdefault(profile["id"], set()).add(secret)
+        self.document = runtime
 
-    def save(self, document: dict, *, replace_ai: bool = False) -> None:
+    @property
+    def ai_credentials_missing(self) -> bool:
+        return bool(self.missing_ai_credentials.get(self.document["ai_active_provider"]))
+
+    def save(self, document: dict) -> None:
         if self.error:
             raise ValueError(self.error)
         runtime = _settings(document)
-        ai = runtime["ai"]
-        unchanged = (not replace_ai and ai == self.document["ai"]) or (
-            self.ai_credentials_missing and runtime["ai_remember_key"] and not ai["api_key"]
-            and all(ai[key] == self.document["ai"][key] for key in ("base_url", "model"))
-        )
-        public = {key: value for key, value in ai.items() if key != "api_key"}
-        disk = {**runtime, "version": 2, "ai": {**public, "api_key_ref": None}}
+        disk = deepcopy(runtime)
+        old = {profile["id"]: profile for profile in self._disk["ai_providers"]}
+        missing: dict[str, set[str]] = {}
+        pending = []
+        for profile in disk["ai_providers"]:
+            previous = old.get(profile["id"])
+            same_origin = previous is not None and previous["config"]["base_url"] == profile["config"]["base_url"]
+            for secret in ("api_key", "headers"):
+                payload = profile["config"].pop(secret)
+                field = f"{secret}_ref"
+                reference = previous["config"][field] if same_origin else None
+                unresolved = secret in self.missing_ai_credentials.get(profile["id"], ()) and not payload
+                if unresolved and not same_origin:
+                    raise CredentialError("Re-enter missing AI credentials before changing the provider URL.")
+                if unresolved:
+                    missing.setdefault(profile["id"], set()).add(secret)
+                if profile["remember"] and unresolved:
+                    profile["config"][field] = reference
+                else:
+                    profile["config"][field] = None
+                    if profile["remember"]:
+                        pending.append((profile["config"], field, payload, reference))
+        _settings_document(disk)
         created: set[str] = set()
         try:
-            if unchanged:
-                disk["ai"]["api_key_ref"] = self._disk["ai"]["api_key_ref"]
-            elif ai["base_url"] or ai["model"] or ai["api_key"]:
-                previous = self._disk["ai"]["api_key_ref"] if public == {
-                    key: value for key, value in self._disk["ai"].items() if key != "api_key_ref"
-                } else None
-                disk["ai"]["api_key_ref"] = self._reference_for(ai["api_key"], previous, created)
+            for config, field, payload, reference in pending:
+                config[field] = self._reference_for(payload, reference, created)
             self._commit(disk, runtime)
         except Exception:
             self._discard(created)
             raise
-        if not unchanged:
-            self.ai_credentials_missing = False
+        self.missing_ai_credentials = missing
+        if not missing:
             self._clear_missing()
 
 

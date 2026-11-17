@@ -289,7 +289,8 @@ def test_apply_guards_target_lane_and_automatic_function_saves(session, monkeypa
     target = AITarget((session.source_key(), "page"), session.active_id, context.document)
     manager = AIChats(SimpleNamespace(screen_stack=[]), session)
     chat = AIChat("chat", target.key, target=target, context=context,
-                  proposal=AIProposal("SELECT id FROM data"))
+                  proposal=AIProposal("SELECT id FROM data"),
+                  provider_snapshot=(session.ai_provider_revision, session.ai_config))
     manager.chats[chat.id] = chat
     applied = []
     panel = SimpleNamespace(snapshot=lambda: target, apply_document=applied.append)

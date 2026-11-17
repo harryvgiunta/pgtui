@@ -248,7 +248,7 @@ class CommandPalette(OptionList):
                     getattr(self.app, "function_mode", False), self.session.intellisense,
                     self.session.ai_completion, self.session.ai_allow_schema_refreshes,
                     getattr(editor, "user_edit_serial", 0), getattr(editor, "document_load_serial", 0),
-                    getattr(editor, "selection_revision", 0), self._close_generation)
+                    getattr(editor, "selection_revision", 0), self._close_generation, self.session.ai_provider_revision)
 
     def _eligible(self, *, ai: bool = False) -> bool:
         editor = self.editor

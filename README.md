@@ -421,14 +421,37 @@ The dataset includes 1,000 films, 200 actors, 599 customers, 16,044 rentals,
 
 ## AI assistance and privacy
 
-Configure an OpenAI-compatible provider in Settings. AI is optional.
+Configure OpenAI-compatible providers in **Settings → AI providers → Providers**.
+AI is optional. Keep named profiles for internal gateways, hosted providers and
+local endpoints. Select a profile to edit it, or choose **New provider**. **Save & use**
+persists and activates the profile for chat, inline completion and page details;
+Cancel discards form edits. Delete provider requires a second confirmation click.
+Switching providers revokes pending responses and unapplied proposals.
 
-Save always persists provider URL, model, limits and the Remember choice. Remember
-controls only API-key storage in the OS keyring; an unchecked key remains session-only,
-including across later preference/function saves. Reopening the form retains that choice.
-Limits can be saved before configuring a provider. If a previously saved key is locked
-or unavailable, option changes preserve its credential reference and AI use stays blocked
-until the key is available; secrets never fall back to plaintext.
+Enter the base URL (including `/v1` and any gateway path), API key, and optional
+request headers. The headers field is free text: one `Name: value` per line, such
+as `x-ntnx-harness-device-id: your-device-token`. Header text is visible while editing.
+The API-key field takes the token only and sends `Authorization: Bearer …`.
+For a custom Authorization header, leave API key blank. Duplicate header names,
+control characters and HTTP routing/framing overrides are rejected.
+
+Then choose **Populate models** to issue `GET /models` using that draft's URL, key
+and headers, and select an ID from the dropdown. A full `/chat/completions` URL is
+also accepted; discovery uses the corresponding `/models` path. Discovery sends
+no SQL, follows no redirects, makes one bounded request, and never runs on startup
+or while typing. Cancel or edit the connection fields to discard an in-flight
+lookup. Manual model-ID entry remains available when discovery is unsupported.
+Listing a model does not prove Chat Completions streaming or tool-call support.
+
+Save stores profile names, URLs, selected model IDs, limits and Remember choices
+locally. Remember stores **both API keys and header text only in the OS keyring**;
+unchecked credentials remain session-only, including across provider switches and
+later preference/function saves. JSON contains only credential references.
+Limits can be saved before configuring an endpoint. Locked or unavailable saved
+credentials block requests; metadata-only edits preserve their references rather
+than silently deleting them. Re-enter missing credentials, or unlock the vault and
+restart. Existing single-provider settings load as a Default profile without
+rewriting the file until an explicit settings save; secrets never fall back to plaintext.
 
 The assistant receives native PostgreSQL/D1 SQLite/DuckDB guidance, the actual engine version, the current
 draft, and permitted schema/history/function context. Complete proposals use SQL

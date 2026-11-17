@@ -216,7 +216,7 @@ async def test_automatic_ai_only_after_real_typing_idle(parquet_source, monkeypa
 
 
 @pytest.mark.parametrize("change", ["escape", "text", "caret", "source", "schema", "functions",
-                                    "provider", "page", "mode", "off", "automatic-off", "blur"])
+                                    "provider", "provider-roundtrip", "headers", "page", "mode", "off", "automatic-off", "blur"])
 @async_test
 async def test_late_ai_response_is_never_published(parquet_source, monkeypatch, change):
     started, release, completed = asyncio.Event(), asyncio.Event(), asyncio.Event()
@@ -252,6 +252,12 @@ async def test_late_ai_response_is_never_published(parquet_source, monkeypatch, 
             session.save_fn("local_rows", "", "SELECT id FROM data", "")
         elif change == "provider":
             session.ai_config = replace(session.ai_config, model="other-provider-model")
+        elif change == "provider-roundtrip":
+            original = session.active_ai_provider
+            session.save_ai_provider("Other provider", session.ai_config, remember=False)
+            session.select_ai_provider(original)
+        elif change == "headers":
+            session.update_settings(ai=replace(session.ai_config, headers="X-Device: changed"))
         elif change == "page":
             app._document_identity = "different-page-with-identical-text"
         elif change == "mode":

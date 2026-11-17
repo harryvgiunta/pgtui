@@ -75,7 +75,7 @@ class PageDetails(Vertical):
 
     def _target(self) -> tuple:
         return (self.ide._document_identity, self.ide.session.source_key(),
-                self.ide.editor.text, self.values())
+                self.ide.editor.text, self.values(), self.ide.session.ai_config, self.ide.session.ai_provider_revision)
 
     @on(Button.Pressed, "#page-details-generate")
     def generate(self) -> None:
@@ -95,11 +95,11 @@ class PageDetails(Vertical):
 
     async def _generate(self, target: tuple) -> None:
         try:
-            title, description = await generate_details(self.ide.session.ai_config, target[2])
+            title, description = await generate_details(target[4], target[2])
             if self.ide._closing or not self.is_mounted:
                 return
-            if self.ide.function_mode or self._target() != target:
-                self._status("Page, query or details changed; generated details discarded. Generate again.")
+            if self.worker is not get_current_worker() or self.ide.function_mode or self._target() != target:
+                self._status("Page, query, details or AI provider changed; generated details discarded. Generate again.")
                 return
             self._fill(title, description)
             self.ide._flush_workspace()

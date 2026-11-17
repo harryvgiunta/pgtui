@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from functools import wraps
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import pytest
 from textual import on
 from textual.app import App, ComposeResult
 from textual.widgets import Button, Static, TextArea
+from textual.worker import WorkerCancelled
 
 from d8r.ai import client
 from d8r.ai.client import AIConfig, AIEvent
@@ -273,3 +275,38 @@ async def test_cancel_and_provider_error_remain_honest(session, monkeypatch):
         assert app.panel.chat.status == "error"
         assert "The AI connection failed. Retry manually." in app.panel.chat.status_text
         assert not app.applied
+
+
+@async_test
+async def test_provider_roundtrip_revokes_chat_tools_and_redacts_headers(session, monkeypatch):
+    started, release = asyncio.Event(), asyncio.Event()
+    session.update_settings(ai=replace(session.ai_config, headers="X-Device: synthetic-header-secret"))
+
+    async def provider(config, messages, tools, callback):
+        yield AIEvent("diagnostic", "Gateway echoed synthetic-header-secret")
+        started.set()
+        await release.wait()
+        await callback("schema", {})
+        answer = "```sql\nSELECT 99\n```"
+        messages.append({"role": "assistant", "content": answer})
+        yield AIEvent("text", answer)
+
+    monkeypatch.setattr(client, "run_turn", provider)
+    app = ConversationHost(session)
+    async with app.run_test(size=(100, 42)) as pilot:
+        chat = await send(app, pilot)
+        await asyncio.wait_for(started.wait(), 2)
+        assert "synthetic-header-secret" not in chat.diagnostics.text
+        original = session.active_ai_provider
+        session.save_ai_provider("Another provider", session.ai_config, remember=False)
+        session.select_ai_provider(original)
+        release.set()
+        try:
+            await app.workers.wait_for_complete()
+        except WorkerCancelled:
+            pass
+        await pilot.pause()
+        assert chat.status == "cancelled"
+        assert chat.proposal is None and not app.applied
+        assert "SELECT 99" not in chat.transcript
+        assert app.query_one("#editor", TextArea).text == "SELECT 1"

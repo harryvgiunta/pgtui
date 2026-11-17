@@ -131,8 +131,11 @@ class TxState:
 class _MissingAIConfig(AIConfig):
     """Keep provider metadata editable while rejecting every network request."""
 
+    def validate_connection(self) -> None:
+        raise CredentialError("Saved AI credentials are unavailable. Unlock the OS vault or re-enter the key and headers in Settings → AI provider.")
+
     def validate(self) -> None:
-        raise CredentialError("The saved AI API key is unavailable. Unlock the OS vault or re-enter it in Settings → AI provider.")
+        self.validate_connection()
 
 
 class Session:
@@ -175,8 +178,9 @@ class Session:
         self.value_cache_limit: int = settings["value_cache_limit"]
         self.pane_visibility: dict[str, bool] = dict(settings["panes"])
         self.pane_sizes: dict[str, int] = dict(settings["pane_sizes"])
+        self.ai_provider_revision = 0
         self.ai_credentials_missing = self._settings.ai_credentials_missing
-        self.ai_config = (_MissingAIConfig if self.ai_credentials_missing else AIConfig)(**settings["ai"])
+        self.ai_config = self.ai_provider_config(self.active_ai_provider) if self.active_ai_provider else AIConfig()
         self._workspace = WorkspaceStore(self._memory.path.parent)
         self._workspace_lock = RLock()
         self.workspace = deepcopy(self._workspace.document)
@@ -342,8 +346,74 @@ class Session:
 
     @property
     def ai_remember_key(self) -> bool:
-        """Whether explicit provider saves may persist the key in the OS vault."""
-        return self._settings.document["ai_remember_key"]
+        """Whether the selected provider's key and headers may enter the OS vault."""
+        return self._ai_provider(self.active_ai_provider)["remember"] if self.active_ai_provider else True
+
+    @property
+    def ai_providers(self) -> list[dict]:
+        """Saved provider profiles, including session-only secrets, as isolated copies."""
+        return deepcopy(self._settings.document["ai_providers"])
+
+    @property
+    def active_ai_provider(self) -> str:
+        return self._settings.document["ai_active_provider"]
+
+    def _ai_provider(self, provider_id: str) -> dict:
+        for profile in self._settings.document["ai_providers"]:
+            if profile["id"] == provider_id:
+                return profile
+        raise ValueError("The selected AI provider is not registered.")
+
+    def ai_provider_missing_secrets(self, provider_id: str) -> frozenset[str]:
+        self._ai_provider(provider_id)
+        return frozenset(self._settings.missing_ai_credentials.get(provider_id, ()))
+
+    def ai_provider_config(self, provider_id: str) -> AIConfig:
+        profile = self._ai_provider(provider_id)
+        config_type = _MissingAIConfig if self.ai_provider_missing_secrets(provider_id) else AIConfig
+        return config_type(**profile["config"])
+
+    def _save_provider_settings(self, document: dict) -> None:
+        before = (self.active_ai_provider, asdict(self.ai_config), self.ai_credentials_missing)
+        self._settings.save(document)
+        self.ai_credentials_missing = self._settings.ai_credentials_missing
+        self.ai_config = self.ai_provider_config(self.active_ai_provider) if self.active_ai_provider else AIConfig()
+        after = (self.active_ai_provider, asdict(self.ai_config), self.ai_credentials_missing)
+        if before != after:
+            self.ai_provider_revision += 1
+
+    def save_ai_provider(
+        self, name: str, config: AIConfig, *, provider_id: str | None = None, remember: bool = True,
+    ) -> str:
+        """Atomically create/update and activate a named provider without network IO."""
+        document = deepcopy(self._settings.document)
+        if provider_id is not None:
+            self._ai_provider(provider_id)
+        else:
+            provider_id = str(uuid4())
+        profile = {"id": provider_id, "name": name, "config": asdict(config), "remember": remember}
+        for index, previous in enumerate(document["ai_providers"]):
+            if previous["id"] == provider_id:
+                document["ai_providers"][index] = profile
+                break
+        else:
+            document["ai_providers"].append(profile)
+        document["ai_active_provider"] = provider_id
+        self._save_provider_settings(document)
+        return provider_id
+
+    def select_ai_provider(self, provider_id: str) -> None:
+        self._ai_provider(provider_id)
+        if provider_id != self.active_ai_provider:
+            self._save_provider_settings({**self._settings.document, "ai_active_provider": provider_id})
+
+    def delete_ai_provider(self, provider_id: str) -> None:
+        self._ai_provider(provider_id)
+        document = deepcopy(self._settings.document)
+        document["ai_providers"] = [profile for profile in document["ai_providers"] if profile["id"] != provider_id]
+        if document["ai_active_provider"] == provider_id:
+            document["ai_active_provider"] = document["ai_providers"][0]["id"] if document["ai_providers"] else ""
+        self._save_provider_settings(document)
 
     def update_settings(
         self, *, intellisense: bool | None = None,
@@ -366,7 +436,7 @@ class Session:
         Temporary source contexts and unsaved provider forms never call this.
         A failed write leaves both the live state and the saved file untouched.
         """
-        document = dict(self._settings.document)
+        document = deepcopy(self._settings.document)
         if intellisense is not None:
             document["intellisense"] = intellisense
         if entry_screen is not None:
@@ -384,16 +454,17 @@ class Session:
         intrinsic = self.sources[source].dialect if source is not None else self.source.dialect
         if dialect is not None and dialect != intrinsic:
             raise ValueError("SQL dialect is intrinsic to the selected source.")
-        if ai is not None:
-            if any((ai.base_url, ai.model, ai.api_key)):
-                ai.validate()
+        if ai is not None or remember_ai_key is not None:
+            if self.active_ai_provider:
+                profile = next(profile for profile in document["ai_providers"] if profile["id"] == self.active_ai_provider)
             else:
-                ai.validate_limits()
+                profile = {"id": str(uuid4()), "name": "Default", "config": asdict(AIConfig()), "remember": True}
+                document["ai_providers"].append(profile)
+                document["ai_active_provider"] = profile["id"]
+            if ai is not None:
+                profile["config"] = asdict(ai)
             if remember_ai_key is not None:
-                document["ai_remember_key"] = remember_ai_key
-            document["ai"] = asdict(ai)
-            if not document["ai_remember_key"]:
-                document["ai"]["api_key"] = ""
+                profile["remember"] = remember_ai_key
         if default_rows is not None:
             document["default_rows"] = default_rows
         if ai_auto_accept is not None:
@@ -410,7 +481,7 @@ class Session:
             document["value_cache_enabled"] = value_cache_enabled
         if value_cache_limit is not None:
             document["value_cache_limit"] = value_cache_limit
-        self._settings.save(document, replace_ai=ai is not None)
+        self._save_provider_settings(document)
         with self._value_cache_lock:
             enabled = self._settings.document["value_cache_enabled"]
             limit = self._settings.document["value_cache_limit"]
@@ -425,9 +496,6 @@ class Session:
             self.pane_sizes = dict(self._settings.document["pane_sizes"])
         if source is not None:
             self.set_active(source)
-        if ai is not None:
-            self.ai_credentials_missing = self._settings.ai_credentials_missing
-            self.ai_config = _MissingAIConfig(**asdict(ai)) if self.ai_credentials_missing else ai
         if default_rows is not None:
             self.default_rows = default_rows
 

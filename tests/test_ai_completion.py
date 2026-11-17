@@ -208,9 +208,12 @@ async def test_oversized_schema_drops_whole_records_without_inventing_names(requ
         assert all(column['name'].endswith('n' * 160) for column in table['columns'])
 
 
+@pytest.mark.parametrize("credential", ["api_key", "headers"])
 @run_async
-async def test_provider_echoed_key_is_not_exposed_as_an_edit(request_context, provider):
-    provider(stream_response(completed(json.dumps({'suggestions':[{'insert':CONFIG.api_key}]}))))
+async def test_provider_echoed_key_is_not_exposed_as_an_edit(request_context, provider, credential):
+    secret = "synthetic-header-credential" if credential == "headers" else CONFIG.api_key
+    config = replace(CONFIG, headers="X-Device: " + secret) if credential == "headers" else CONFIG
+    provider(stream_response(completed(json.dumps({'suggestions':[{'insert':secret}]}))))
     with pytest.raises(AIError) as failure:
-        await complete_sql(CONFIG, request_context)
-    assert CONFIG.api_key not in str(failure.value)
+        await complete_sql(config, request_context)
+    assert secret not in str(failure.value)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -19,6 +20,50 @@ MAX_CONTENT_BYTES = 262_144
 MAX_ARGUMENT_BYTES = 65_536
 MAX_TOOL_RESULT_BYTES = 262_144
 MAX_RETRY_DELAY = 30.0
+MAX_HEADER_BYTES = 16_384
+MAX_HEADERS = 32
+MAX_MODELS = 1000
+MAX_DISCOVERY_TIMEOUT = 30.0
+_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+_RESERVED_HEADERS = frozenset({
+    "host", "content-length", "transfer-encoding", "connection", "content-type",
+    "accept", "accept-encoding", "content-encoding", "keep-alive", "te", "trailer",
+    "upgrade", "expect", "proxy-authenticate", "proxy-authorization", "proxy-connection",
+    "forwarded", "x-original-url", "x-rewrite-url",
+})
+
+
+def parse_headers(text: str) -> dict[str, str]:
+    """Parse confidential Header: value lines; errors never include their input."""
+    if not isinstance(text, str):
+        raise ValueError("AI request headers must be text.")
+    try:
+        size = len(text.encode("ascii"))
+    except UnicodeError:
+        raise ValueError("AI request headers must contain printable ASCII text and line breaks.") from None
+    if size > MAX_HEADER_BYTES:
+        raise ValueError("AI request headers must not exceed 16 KiB.")
+    normalized = text.replace("\r\n", "\n")
+    if any((ord(c) < 32 and c != "\n") or ord(c) == 127 for c in normalized):
+        raise ValueError("AI request headers contain invalid control characters.")
+    headers: dict[str, str] = {}
+    seen: set[str] = set()
+    for line in normalized.split("\n"):
+        if not line.strip():
+            continue
+        name, separator, value = line.partition(":")
+        if not separator or not _HEADER_NAME.fullmatch(name):
+            raise ValueError("Use one Header-Name: value per AI request header line.")
+        lower = name.lower()
+        if lower in _RESERVED_HEADERS or lower.startswith("x-forwarded-"):
+            raise ValueError("AI request headers cannot override protocol or routing headers.")
+        if lower in seen:
+            raise ValueError("AI request header names must be unique, ignoring case.")
+        if len(headers) >= MAX_HEADERS:
+            raise ValueError("Configure at most 32 AI request headers.")
+        seen.add(lower)
+        headers[name] = value.strip(" ")
+    return headers
 
 
 @dataclass(frozen=True)
@@ -31,9 +76,21 @@ class AIConfig:
     max_tool_rounds: int = 10
     max_tool_calls: int = 16
     sample_rows: int = 5
+    headers: str = field(default="", repr=False)
 
     def validate(self) -> None:
         """Reject invalid settings without including their values in errors."""
+        self.validate_connection()
+        if (
+            not isinstance(self.model, str)
+            or not self.model.strip()
+            or len(self.model) > 256
+            or any(ord(c) < 32 or ord(c) == 127 for c in self.model)
+        ):
+            raise ValueError("An AI model name of at most 256 characters is required.")
+
+    def validate_connection(self) -> None:
+        """Validate a provider connection without requiring a selected model."""
         if not isinstance(self.base_url, str) or not self.base_url.strip():
             raise ValueError("An AI provider base URL is required.")
         url = self.base_url.strip()
@@ -57,18 +114,14 @@ class AIConfig:
         if not valid:
             raise ValueError("Use an HTTP(S) AI provider URL without credentials, query, or fragment.")
         if (
-            not isinstance(self.model, str)
-            or not self.model.strip()
-            or len(self.model) > 256
-            or any(ord(c) < 32 or ord(c) == 127 for c in self.model)
-        ):
-            raise ValueError("An AI model name of at most 256 characters is required.")
-        if (
             not isinstance(self.api_key, str)
             or len(self.api_key) > 8192
             or any(not 33 <= ord(c) <= 126 for c in self.api_key)
         ):
             raise ValueError("The AI API key must contain only printable non-space ASCII characters.")
+        headers = parse_headers(self.headers)
+        if self.api_key and any(name.lower() == "authorization" for name in headers):
+            raise ValueError("Use either an AI API key or an Authorization header, not both.")
         self.validate_limits()
 
     def validate_limits(self) -> None:
@@ -103,6 +156,66 @@ class AIEvent:
 def create_client(config: AIConfig) -> httpx.AsyncClient:
     """The injection point for offline transports; redirects never receive keys."""
     return httpx.AsyncClient(timeout=config.timeout, follow_redirects=False)
+
+
+def _request_headers(config: AIConfig, accept: str) -> dict[str, str]:
+    headers = parse_headers(config.headers)
+    headers["Accept"] = accept
+    if config.api_key:
+        headers["Authorization"] = f"Bearer {config.api_key}"
+    return headers
+
+
+async def discover_models(config: AIConfig) -> tuple[str, ...]:
+    """Explicit, single-attempt model discovery without chat or SQL context."""
+    try:
+        config.validate_connection()
+    except ValueError as exc:
+        raise AIError(str(exc)) from None
+    url = config.base_url.strip().rstrip("/").removesuffix("/chat/completions") + "/models"
+    headers = _request_headers(config, "application/json")
+    # Refuse compressed responses so decoding cannot allocate an unbounded body.
+    headers["Accept-Encoding"] = "identity"
+    try:
+        async with asyncio.timeout(min(config.timeout, MAX_DISCOVERY_TIMEOUT)):
+            async with create_client(config) as client:
+                async with client.stream("GET", url, headers=headers, follow_redirects=False) as response:
+                    status = response.status_code
+                    if status in {401, 403}:
+                        raise AIError(f"The AI provider rejected authentication (HTTP {status}). Check credentials and required headers.")
+                    if status != 200:
+                        raise AIError(f"The AI provider rejected model discovery (HTTP {status}). Check its URL and model-list support.")
+                    if response.headers.get("content-encoding", "identity").strip().lower() != "identity":
+                        raise AIError("The AI provider returned an unsupported compressed model list.")
+                    body = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        if len(body) + len(chunk) > MAX_RESPONSE_BYTES:
+                            raise AIError("The AI provider model list exceeded the response size limit.")
+                        body.extend(chunk)
+                    try:
+                        payload = _object(body.decode("utf-8"))
+                    except UnicodeError:
+                        raise AIError("The AI provider returned invalid model-list text.") from None
+                    data = payload.get("data")
+                    if not isinstance(data, list) or not data or len(data) > MAX_MODELS:
+                        raise AIError("The AI provider must return a nonempty model list of at most 1000 entries.")
+                    models: dict[str, None] = {}
+                    for entry in data:
+                        model = entry.get("id") if isinstance(entry, dict) else None
+                        if (
+                            not isinstance(model, str)
+                            or not model.strip()
+                            or len(model) > 256
+                            or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in model)
+                        ):
+                            raise AIError("The AI provider returned an invalid model identifier.")
+                        _size(model)
+                        models[model] = None
+                    return tuple(models)
+    except (httpx.TimeoutException, TimeoutError):
+        raise AIError("AI model discovery timed out.") from None
+    except httpx.HTTPError:
+        raise AIError("AI model discovery failed to connect or read the response.") from None
 
 
 def _size(text: str) -> int:
@@ -362,9 +475,7 @@ async def run_turn(
     url = config.base_url.strip().rstrip("/")
     if not url.endswith("/chat/completions"):
         url += "/chat/completions"
-    headers = {"Accept": "text/event-stream"}
-    if config.api_key:
-        headers["Authorization"] = f"Bearer {config.api_key}"
+    headers = _request_headers(config, "text/event-stream")
     retries = rounds = 0
     request_number = 0
     loop = asyncio.get_running_loop()
@@ -417,7 +528,7 @@ async def run_turn(
                                 _retry_after(response.headers.get("retry-after")),
                             )
                         if status in {401, 403}:
-                            raise AIError(f"The AI provider rejected authentication (HTTP {status}). Check the API key.")
+                            raise AIError(f"The AI provider rejected authentication (HTTP {status}). Check credentials and required headers.")
                         if status != 200:
                             raise AIError(f"The AI provider rejected the request (HTTP {status}). Check its URL and model.")
                         if response.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "text/event-stream":

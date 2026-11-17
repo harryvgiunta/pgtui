@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import replace
 from threading import Event
 
 import pytest
 
+from d8r import credentials
+from d8r.credentials import CredentialError
 from d8r.completion.engine import complete
 from d8r.ai.client import AIConfig
 from d8r.engine import EngineError, add_parquet_source, close_source, execute_sql
@@ -245,16 +248,18 @@ def test_session_only_override_preserves_remembered_credentials():
 
 def test_ai_remember_off_saves_settings_but_never_persists_key(credential_backend):
     session = Session()
-    config = AIConfig(base_url="https://example.com/v1", model="example", api_key="temporary-ai-secret")
+    config = AIConfig(base_url="https://example.com/v1", model="example", api_key="temporary-ai-secret",
+                      headers="X-Token: temporary-header-secret")
     session.update_settings(ai=config, remember_ai_key=False)
     session.update_settings(default_rows=25)
     session.save_fn("one", "", "SELECT 1", "")
     assert session.ai_config.api_key == "temporary-ai-secret"
     restored = Session()
-    assert restored.ai_config == replace(config, api_key="")
+    assert restored.ai_config == replace(config, api_key="", headers="")
     assert not restored.ai_remember_key
     assert not credential_backend.values
     assert "temporary-ai-secret" not in session.settings_path.read_text(encoding="utf-8")
+    assert "temporary-header-secret" not in session.settings_path.read_text(encoding="utf-8")
 
 
 def test_connection_labels_and_errors_do_not_leak_driver_secrets():
@@ -369,3 +374,196 @@ def test_completion_target_snapshots_follow_schema_functions_and_reconnections(p
     with session.target_source(d1_source.id):
         assert not offers("SELECT r. FROM records r WHERE r.")
     assert any(item.insert == "label" for item in offers("SELECT d. FROM data d WHERE d."))
+
+
+def provider_config(key="provider-key", headers="X-Token: provider-header"):
+    return AIConfig(base_url="https://provider.example.test/v1", model="model", api_key=key, headers=headers)
+
+
+def test_provider_selection_identity_and_revision(credential_backend):
+    session = Session()
+    assert session.ai_providers == []
+    assert session.active_ai_provider == ""
+    assert session.ai_config == AIConfig()
+    assert session.ai_remember_key
+    assert session.ai_provider_revision == 0
+    first = session.save_ai_provider("First", provider_config())
+    assert session.ai_provider_revision == 1
+    second = session.save_ai_provider("Second", provider_config("second-key", "X-Token: second-header"))
+    assert first != second
+    assert session.active_ai_provider == second
+    assert session.ai_provider_revision == 2
+    session.select_ai_provider(first)
+    assert session.ai_config == provider_config()
+    assert session.ai_provider_revision == 3
+    session.select_ai_provider(first)
+    assert session.ai_provider_revision == 3
+    session.select_ai_provider(second)
+    assert session.ai_provider_revision == 4
+    assert Session().active_ai_provider == second
+    session.save_ai_provider("Renamed", session.ai_config, provider_id=second)
+    assert session.ai_provider_revision == 4
+    session.save_ai_provider("Renamed", replace(session.ai_config, model="other"), provider_id=second)
+    assert session.ai_provider_revision == 5
+    profiles = session.ai_providers
+    profiles[0]["config"]["api_key"] = "external-mutation"
+    profiles.clear()
+    assert session.ai_provider_config(first).api_key == "provider-key"
+    session.delete_ai_provider(second)
+    assert session.active_ai_provider == first
+    assert session.ai_provider_revision == 6
+    session.delete_ai_provider(first)
+    assert session.active_ai_provider == ""
+    assert session.ai_config == AIConfig()
+    assert session.ai_provider_revision == 7
+    assert not credential_backend.values
+
+
+@pytest.mark.parametrize("name", ["", "   ", "x" * 81, "bad\nname", " first "])
+def test_invalid_provider_names_leave_state_unchanged(name, credential_backend):
+    session = Session()
+    session.save_ai_provider("First", provider_config())
+    original = session.settings_path.read_bytes()
+    values = dict(credential_backend.values)
+    with pytest.raises(ValueError):
+        session.save_ai_provider(name, provider_config("another-key"))
+    assert session.settings_path.read_bytes() == original
+    assert credential_backend.values == values
+    assert session.ai_provider_revision == 1
+
+
+def test_memory_only_provider_secrets_survive_switches_and_saves(credential_backend):
+    session = Session()
+    temporary = provider_config("temporary-key", "X-Token: temporary-header")
+    first = session.save_ai_provider("Temporary", temporary, remember=False)
+    second = session.save_ai_provider("Remembered", provider_config())
+    saved_values = dict(credential_backend.values)
+    session.update_settings(default_rows=75, ai_completion=True)
+    session.select_ai_provider(first)
+    assert session.ai_config == temporary
+    session.save_ai_provider("Renamed temporary", session.ai_config, provider_id=first, remember=False)
+    session.select_ai_provider(second)
+    session.select_ai_provider(first)
+    assert session.ai_config == temporary
+    assert not session.ai_remember_key
+    assert credential_backend.values == saved_values
+    serialized = session.settings_path.read_text()
+    assert "temporary-key" not in serialized and "temporary-header" not in serialized
+    restored = Session()
+    assert restored.ai_provider_config(first) == replace(temporary, api_key="", headers="")
+    assert restored.ai_provider_config(second) == provider_config()
+    session.update_settings(remember_ai_key=True)
+    assert Session().ai_provider_config(first) == temporary
+    session.update_settings(remember_ai_key=False)
+    assert session.ai_config == temporary
+    assert Session().ai_provider_config(first) == replace(temporary, api_key="", headers="")
+    assert credential_backend.values == saved_values
+
+
+@pytest.mark.parametrize("missing", ["api_key", "headers", "both"])
+def test_missing_provider_credentials_guard_every_network_path(missing, credential_backend):
+    session = Session()
+    first = session.save_ai_provider("First", provider_config())
+    second = session.save_ai_provider("Second", provider_config("second-key", "X-Token: second-header"))
+    secrets = {"api_key": "provider-key", "headers": "X-Token: provider-header"}
+    expected = frozenset(secrets if missing == "both" else [missing])
+    for key, value in list(credential_backend.values.items()):
+        if value in {secrets[field] for field in expected}:
+            del credential_backend.values[key]
+    loaded = Session()
+    assert not loaded.ai_credentials_missing
+    assert loaded.ai_provider_missing_secrets(first) == expected
+    assert loaded.ai_provider_missing_secrets(second) == frozenset()
+    blocked = loaded.ai_provider_config(first)
+    for validate in (blocked.validate, blocked.validate_connection):
+        with pytest.raises(CredentialError):
+            validate()
+    loaded.select_ai_provider(first)
+    assert loaded.ai_credentials_missing
+    before = json.loads(loaded.settings_path.read_text())["ai_providers"][0]["config"]
+    loaded.save_ai_provider("Renamed", replace(blocked, model="updated-model"), provider_id=first)
+    loaded.update_settings(default_rows=35)
+    after = json.loads(loaded.settings_path.read_text())["ai_providers"][0]["config"]
+    assert after["api_key_ref"] == before["api_key_ref"]
+    assert after["headers_ref"] == before["headers_ref"]
+    assert loaded.ai_credentials_missing
+    with pytest.raises(CredentialError):
+        loaded.ai_config.validate_connection()
+    with pytest.raises(CredentialError):
+        loaded.save_ai_provider("Moved", replace(blocked, base_url="https://other.example.test/v1"), provider_id=first)
+    loaded.save_ai_provider("Recovered", provider_config(), provider_id=first)
+    assert not loaded.ai_credentials_missing
+    assert loaded.ai_provider_missing_secrets(first) == frozenset()
+    loaded.ai_config.validate_connection()
+
+
+def test_locked_vault_allows_memory_only_provider_without_losing_other_refs(monkeypatch):
+    session = Session()
+    first = session.save_ai_provider("Remembered", provider_config())
+    original = json.loads(session.settings_path.read_text())["ai_providers"][0]["config"]
+
+    def locked():
+        raise CredentialError("vault locked")
+
+    monkeypatch.setattr(credentials, "_secure_backend", locked)
+    loaded = Session()
+    second = loaded.save_ai_provider("Temporary", provider_config("temporary", "X-Token: temporary"), remember=False)
+    assert not loaded.ai_credentials_missing
+    loaded.select_ai_provider(first)
+    assert loaded.ai_credentials_missing
+    loaded.select_ai_provider(second)
+    assert loaded.ai_config.api_key == "temporary"
+    loaded.update_settings(default_rows=80)
+    assert json.loads(loaded.settings_path.read_text())["ai_providers"][0]["config"] == original
+
+
+def test_blank_ai_limits_create_default_profile_without_credentials(credential_backend):
+    session = Session()
+    config = AIConfig(max_attempts=1, sample_rows=9, timeout=45)
+    session.update_settings(ai=config, remember_ai_key=False)
+    assert session.ai_config == config
+    assert session.ai_providers[0]["name"] == "Default"
+    assert Session().ai_config == config
+    assert not credential_backend.values
+
+
+def test_stale_provider_save_preserves_live_selection_and_revision(credential_backend):
+    session, stale = Session(), Session()
+    session.save_ai_provider("First", provider_config())
+    with pytest.raises(ValueError, match="changed outside"):
+        stale.save_ai_provider("Other", provider_config("other", "X-Token: other"))
+    assert stale.ai_provider_revision == 0
+    assert stale.active_ai_provider == ""
+    assert stale.ai_config == AIConfig()
+    assert stale.ai_providers == []
+
+
+def test_unknown_provider_identity_never_creates_or_selects_profiles():
+    session = Session()
+    for action in (
+        lambda: session.select_ai_provider("unknown"),
+        lambda: session.delete_ai_provider("unknown"),
+        lambda: session.ai_provider_config("unknown"),
+        lambda: session.ai_provider_missing_secrets("unknown"),
+        lambda: session.save_ai_provider("Unknown", provider_config(), provider_id="unknown"),
+    ):
+        with pytest.raises(ValueError, match="not registered"):
+            action()
+    assert session.ai_providers == []
+    assert not session.settings_path.exists()
+
+
+def test_deleting_provider_retires_only_its_own_secret_references(credential_backend):
+    session = Session()
+    first = session.save_ai_provider("First", provider_config())
+    second_config = provider_config("other-key", "X-Token: other-header")
+    second = session.save_ai_provider("Second", second_config)
+    assert len(credential_backend.values) == 4
+    revision = session.ai_provider_revision
+    session.delete_ai_provider(first)
+    assert session.active_ai_provider == second
+    assert session.ai_provider_revision == revision
+    assert len(credential_backend.values) == 2
+    assert Session().ai_config == second_config
+    session.delete_ai_provider(second)
+    assert not credential_backend.values

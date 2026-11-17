@@ -6,6 +6,7 @@ immediately; connection and provider forms retain their explicit Add/Save steps.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -15,9 +16,10 @@ from textual.binding import Binding
 from textual.content import Content
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Checkbox, Input, OptionList, Static
+from textual.widgets import Button, Checkbox, Input, OptionList, Select, Static, TextArea
 from textual.widgets.option_list import Option
 
+from d8r.ai import client as ai_client
 from d8r.ai.client import AIConfig
 from d8r.ai.config import import_yolo_config
 
@@ -39,7 +41,7 @@ MENUS: dict[str, str] = {
     "values": "Value cache",
     "sources": "Data source",
     "dbt": "DBT",
-    "ai": "AI provider",
+    "ai": "AI providers",
     "keys": "Keybindings",
 }
 
@@ -182,10 +184,10 @@ class SettingsScreen(ModalScreen[None]):
             "sources": "Connect PostgreSQL, Cloudflare D1 or a local Parquet file. SQL dialect and engine version follow the selected source.",
             "dbt": "Exchange native SQL and local dbt models. Project home belongs to this source workspace. "
                    "No dbt installation, execution, network or credential profiles; imports require manual Apply.",
-            "ai": "Provider changes require Save. Permission toggles save immediately. Schema refreshes control AI metadata lookups, not IDE indexing. "
-                  "Test AI Queries permits read-only execution with bounded result rows; aggregates can still scan many source rows. "
-                  "Query-check failures and bounded row counts are shared even when Allow Sample Data is off; result samples are sent only when it is on. "
-                  "Sample records per read and Request timeout also govern query checks. "
+            "ai": "Provider forms require Save & use to activate changes. Permission toggles save immediately. Schema refreshes control AI metadata lookups, not IDE indexing. "
+                  "Test AI Queries permits bounded read-only execution and PostgreSQL estimated plans with ANALYZE disabled; reads can still be expensive. "
+                  "Plans may expose schema details and literals even when Allow Sample Data is off. Query-check failures and bounded row counts are also shared; result samples require Allow Sample Data. "
+                  "Sample records per read governs query checks, not plans. Request timeout also caps checks and plans at 30 seconds. "
                   "Automatically applied edits update validated, unchanged drafts only; they never run queries or save functions. "
                   "AI completion while typing sends the current SQL window and permitted cached schema after an idle pause; "
                   "it never samples rows or auto-applies; SQL literals may contain sensitive data. F4 or Ctrl+Shift+Space requests it manually. "
@@ -264,18 +266,22 @@ class SettingsScreen(ModalScreen[None]):
         if self.menu == "ai":
             config = self.session.ai_config
             return [
+                Row("Providers", next((profile["name"] for profile in self.session.ai_providers
+                                       if profile["id"] == self.session.active_ai_provider), "not configured"),
+                    "ai", "ai-provider"),
                 Row("Endpoint", config.base_url or "not configured", "ai", "ai-base-url"),
                 Row("Model", config.model or "not configured", "ai", "ai-model"),
                 Row("API key", "configured" if config.api_key else "not set", "ai", "ai-api-key"),
+                Row("Request headers", "configured" if config.headers else "not set", "ai", "ai-headers"),
                 Row("AI turns/tool rounds", str(config.max_tool_rounds), "ai", "ai-tool-rounds"),
                 Row("Tool calls per round", str(config.max_tool_calls), "ai", "ai-tool-calls"),
                 Row("Sample records per read", f"{config.sample_rows} · samples and query checks", "ai", "ai-sample-rows"),
                 Row("Maximum attempts", str(config.max_attempts), "ai", "ai-attempts"),
-                Row("Request timeout", f"{config.timeout:g} seconds · requests and query checks", "ai", "ai-timeout"),
+                Row("Request timeout", f"{config.timeout:g} seconds · requests, checks and plans", "ai", "ai-timeout"),
                 Row("Allow Sample Data", "on" if self.session.ai_allow_sample_data else "off", "ai-sample-data"),
                 Row("Allow Schema Refreshes", "on" if self.session.ai_allow_schema_refreshes else "off", "ai-schema-refreshes"),
-                Row("Test AI Queries", "on · bounded read-only checks" if self.session.ai_test_queries else
-                    "off · no query-check execution", "ai-test-queries"),
+                Row("Test AI Queries", "on · read-only checks + PostgreSQL plans" if self.session.ai_test_queries else
+                    "off · no query checks or plans", "ai-test-queries"),
                 Row("Automatically Apply AI Edits", "on · validated drafts only" if self.session.ai_auto_accept else
                     "off · review and Apply manually", "ai-auto-accept"),
                 Row("AI completion while typing", "on · sends SQL/cached schema after pauses" if self.session.ai_completion else
@@ -505,15 +511,16 @@ class ValueCacheLimitScreen(ModalScreen[None]):
 
 
 class AIProviderScreen(ModalScreen[None]):
-    """OpenAI-compatible chat settings, persisted only on explicit Save."""
+    """Named provider drafts; discovery is explicit and never commits settings."""
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
     DEFAULT_CSS = """
     AIProviderScreen { align: center middle; background: $background; }
-    #ai-settings { width: 80; max-width: 100%; height: auto; max-height: 100%; padding: 1 2; border: round $accent; }
+    #ai-settings { width: 90; max-width: 100%; height: auto; max-height: 100%; padding: 1 2; border: round $accent; }
     #ai-settings Static { height: auto; margin-top: 1; }
-    #ai-settings-buttons { height: auto; margin-top: 1; }
-    #ai-settings-buttons Button { margin-right: 1; min-width: 10; }
+    #ai-settings-buttons, #ai-profile-buttons, #ai-model-buttons { height: auto; margin-top: 1; }
+    #ai-settings Button { margin-right: 1; min-width: 10; }
+    #ai-headers { height: 5; }
     #ai-settings-error { color: $error; }
     """
 
@@ -521,26 +528,53 @@ class AIProviderScreen(ModalScreen[None]):
         super().__init__(**kwargs)
         self.ide = ide
         self.focus_field = focus_field
+        self._profile_id = ide.session.active_ai_provider
+        self._discovery_worker = None
+        self._discovery_generation = 0
+        self._provider_form_closed = False
+        self._delete_pending = False
+
+    def _provider_options(self) -> list[tuple[Content, str]]:
+        return [(Content(profile["name"] + (" · active" if profile["id"] == self.ide.session.active_ai_provider else "")),
+                 profile["id"]) for profile in self.ide.session.ai_providers]
 
     def compose(self) -> ComposeResult:
         config = self.ide.session.ai_config
+        name = next((profile["name"] for profile in self.ide.session.ai_providers
+                     if profile["id"] == self._profile_id), "Default")
         with VerticalScroll(id="ai-settings"):
-            yield Static("AI provider · OpenAI chat completions")
+            yield Static("AI providers · OpenAI chat completions")
             yield Static(
-                "Save always stores the provider URL, model and options locally. "
-                "Remember controls only API-key storage in your system keyring; unchecked keys stay in this session. "
-                "Completed chats and drafts are saved locally. Sending a message shares the document, "
-                "history and permitted schema/sample reads and query-check evidence with this provider. Use HTTPS for remote providers.", markup=False,
+                "Choose a saved provider or create one. Save & use activates this draft; Cancel discards it. "
+                "Only Populate models contacts the endpoint from this form, sending no SQL. "
+                "Remember stores API keys and header text in your system keyring; otherwise both stay session-only. "
+                "Header values are visible while editing. Use HTTPS for remote providers.", markup=False,
             )
+            yield Static("Saved providers")
+            yield Select(self._provider_options(), value=self._profile_id or Select.NULL,
+                         prompt="New provider", id="ai-provider")
+            with Horizontal(id="ai-profile-buttons"):
+                yield Button("New provider", id="ai-provider-new")
+                yield Button("Delete provider", id="ai-provider-delete", disabled=not self._profile_id)
+            yield Static("Provider name")
+            yield Input(name, id="ai-provider-name")
             yield Static("Base URL (including /v1), or full /chat/completions URL")
-            yield Input(config.base_url, placeholder="https://yolo-auto.com/v1", id="ai-base-url")
-            yield Static("Model")
-            yield Input(config.model, placeholder="yolo", id="ai-model")
-            yield Static("API key (leave blank for an unauthenticated local provider)")
+            yield Input(config.base_url, placeholder="https://provider.example/v1", id="ai-base-url")
+            yield Static("API key (token only; leave blank for header-only or unauthenticated providers)")
             yield Input(config.api_key, password=True, id="ai-api-key")
-            yield Checkbox("Remember API key in system keyring", value=self.ide.session.ai_remember_key,
+            yield Static("Request headers · one Name: value per line")
+            yield TextArea(config.headers, soft_wrap=True, tab_behavior="focus", id="ai-headers")
+            yield Checkbox("Remember API key and headers in system keyring", value=self.ide.session.ai_remember_key,
                            id="ai-remember-credentials")
             yield Static(self.ide.session.credential_warning, markup=False)
+            with Horizontal(id="ai-model-buttons"):
+                yield Button("Populate models", id="ai-models-populate")
+                yield Button("Cancel lookup", id="ai-models-cancel", disabled=True)
+            yield Static("Uses GET /models with the URL, key and headers above. No automatic discovery.",
+                         id="ai-models-status", markup=False)
+            yield Select([], prompt="Populate models to choose an ID", id="ai-model-list")
+            yield Static("Model ID · choose above or enter manually")
+            yield Input(config.model, placeholder="Exact provider model ID", id="ai-model")
             yield Static("AI turns/tool rounds (1–50)")
             yield Input(str(config.max_tool_rounds), type="integer", id="ai-tool-rounds")
             yield Static("Rounds count model context batches, not chat messages. After the round budget, "
@@ -557,27 +591,27 @@ class AIProviderScreen(ModalScreen[None]):
             yield Static("Maximum attempts (1–5; transient failures only)")
             yield Input(str(config.max_attempts), type="integer", id="ai-attempts")
             yield Static("1 initial attempt + remaining attempts as shared retries per message, "
-                         "independent of the round budget.", markup=False)
+                         "independent of the round budget. Model discovery makes one attempt.", markup=False)
             yield Static("Request timeout in seconds (without stream progress)")
             yield Input(str(config.timeout), type="number", id="ai-timeout")
             yield Static("Active streams may take longer; keepalive comments do not count as progress. "
-                         "Each context-tool read or query check still has this total deadline.", markup=False)
+                         "Model discovery and each context-tool read or query check have a total deadline of at most 30 seconds.", markup=False)
             yield Static("", id="ai-settings-error", markup=False)
             with Horizontal(id="ai-settings-buttons"):
-                yield Button("Save", id="ai-settings-save", variant="primary")
+                yield Button("Save & use", id="ai-settings-save", variant="primary")
                 yield Button("Import yolo key", id="ai-settings-import")
                 yield Button("Cancel", id="ai-settings-cancel", tooltip=binding_tooltip(self.BINDINGS, "cancel"))
 
     def on_mount(self) -> None:
-        self.query_one(f"#{self.focus_field}", Input).focus()
+        self.query_one(f"#{self.focus_field}").focus()
 
-    @on(Button.Pressed, "#ai-settings-save")
-    def _save_ai(self) -> None:
+    def _read_config(self) -> AIConfig:
         try:
-            config = AIConfig(
+            return AIConfig(
                 base_url=self.query_one("#ai-base-url", Input).value.strip(),
                 model=self.query_one("#ai-model", Input).value.strip(),
                 api_key=self.query_one("#ai-api-key", Input).value.strip(),
+                headers=self.query_one("#ai-headers", TextArea).text,
                 max_attempts=int(self.query_one("#ai-attempts", Input).value),
                 timeout=float(self.query_one("#ai-timeout", Input).value),
                 max_tool_rounds=int(self.query_one("#ai-tool-rounds", Input).value),
@@ -585,30 +619,167 @@ class AIProviderScreen(ModalScreen[None]):
                 sample_rows=int(self.query_one("#ai-sample-rows", Input).value),
             )
         except ValueError:
-            self.query_one("#ai-settings-error", Static).update(
-                "Enter whole numbers for attempts, tool rounds, tool calls and sample records, "
-                "and a number for the timeout."
-            )
+            raise ValueError("Enter whole numbers for attempts, tool rounds, tool calls and sample records, "
+                             "and a number for the timeout.") from None
+
+    def _connection_snapshot(self) -> tuple:
+        return (self._profile_id, *(self.query_one("#" + field, Input).value for field in
+                                  ("ai-base-url", "ai-api-key", "ai-timeout")),
+                self.query_one("#ai-headers", TextArea).text)
+
+    def _invalidate_discovery(self, *, clear_models: bool = True) -> None:
+        self._discovery_generation += 1
+        if self._discovery_worker is not None:
+            self._discovery_worker.cancel()
+            self._discovery_worker = None
+        if self.is_mounted and not self._provider_form_closed:
+            self.query_one("#ai-models-populate", Button).disabled = False
+            self.query_one("#ai-models-cancel", Button).disabled = True
+            if clear_models:
+                with self.prevent(Select.Changed):
+                    self.query_one("#ai-model-list", Select).set_options([])
+                self.query_one("#ai-models-status", Static).update("Populate models to list this provider's models; manual IDs also work.")
+
+    @on(Input.Changed, "#ai-base-url, #ai-api-key, #ai-timeout")
+    @on(TextArea.Changed, "#ai-headers")
+    def _connection_changed(self) -> None:
+        self._invalidate_discovery()
+        self._delete_pending = False
+        self.query_one("#ai-provider-delete", Button).label = "Delete provider"
+        self.query_one("#ai-settings-error", Static).update("")
+
+    def _load_profile(self, provider_id: str) -> None:
+        self._invalidate_discovery()
+        self._profile_id = provider_id
+        profile = next((item for item in self.ide.session.ai_providers if item["id"] == provider_id), None)
+        config = self.ide.session.ai_provider_config(provider_id) if profile else AIConfig()
+        with self.prevent(Input.Changed, TextArea.Changed, Select.Changed):
+            self.query_one("#ai-provider", Select).value = provider_id or Select.NULL
+            self.query_one("#ai-provider-name", Input).value = profile["name"] if profile else "New provider"
+            for field, value in (("ai-base-url", config.base_url), ("ai-api-key", config.api_key),
+                                 ("ai-model", config.model), ("ai-tool-rounds", config.max_tool_rounds),
+                                 ("ai-tool-calls", config.max_tool_calls), ("ai-sample-rows", config.sample_rows),
+                                 ("ai-attempts", config.max_attempts), ("ai-timeout", config.timeout)):
+                self.query_one("#" + field, Input).value = str(value)
+            self.query_one("#ai-headers", TextArea).load_text(config.headers)
+            self.query_one("#ai-remember-credentials", Checkbox).value = profile["remember"] if profile else True
+        self._delete_pending = False
+        self.query_one("#ai-provider-delete", Button).label = "Delete provider"
+        self.query_one("#ai-provider-delete", Button).disabled = not provider_id
+        self.query_one("#ai-settings-error", Static).update("")
+
+    @on(Select.Changed, "#ai-provider")
+    def _provider_selected(self, event: Select.Changed) -> None:
+        provider_id = event.value if isinstance(event.value, str) else ""
+        if provider_id != self._profile_id:
+            self._load_profile(provider_id)
+
+    @on(Button.Pressed, "#ai-provider-new")
+    def _new_provider(self) -> None:
+        self._load_profile("")
+        self.query_one("#ai-provider-name", Input).focus()
+
+    @on(Button.Pressed, "#ai-provider-delete")
+    def _delete_provider(self) -> None:
+        if not self._profile_id:
+            return
+        if not self._delete_pending:
+            self._delete_pending = True
+            self.query_one("#ai-provider-delete", Button).label = "Confirm delete"
+            self.query_one("#ai-settings-error", Static).update("Delete this saved provider and its remembered credentials? Click Confirm delete.")
             return
         try:
-            if any((config.base_url, config.model, config.api_key)):
-                config.validate()
-            else:
-                config.validate_limits()
+            self.ide.session.delete_ai_provider(self._profile_id)
+            self.ide.ai_chats.providers_changed()
+        except ValueError as exc:
+            self.query_one("#ai-settings-error", Static).update(str(exc))
+            return
+        with self.prevent(Select.Changed):
+            self.query_one("#ai-provider", Select).set_options(self._provider_options())
+        self._load_profile(self.ide.session.active_ai_provider)
+
+    @on(Button.Pressed, "#ai-models-populate")
+    def _populate_models(self) -> None:
+        self._invalidate_discovery()
+        try:
+            config = self._read_config()
+            config.validate_connection()
+            if self._profile_id and any(not getattr(config, field) for field in
+                                       self.ide.session.ai_provider_missing_secrets(self._profile_id)):
+                raise CredentialError("Saved AI credentials are unavailable. Unlock the vault and reopen PGTUI, or re-enter the key and headers before discovery.")
+        except ValueError as exc:
+            self.query_one("#ai-settings-error", Static).update(str(exc))
+            return
+        self.query_one("#ai-settings-error", Static).update("")
+        self.query_one("#ai-models-status", Static).update("Loading models…")
+        self.query_one("#ai-models-populate", Button).disabled = True
+        self.query_one("#ai-models-cancel", Button).disabled = False
+        self._discovery_worker = self.run_worker(
+            self._discover(config, self._discovery_generation, self._connection_snapshot()), exit_on_error=False,
+        )
+
+    def _discovery_current(self, generation: int, snapshot: tuple) -> bool:
+        return (not self._provider_form_closed and self.is_mounted and generation == self._discovery_generation
+                and snapshot == self._connection_snapshot())
+
+    async def _discover(self, config: AIConfig, generation: int, snapshot: tuple) -> None:
+        try:
+            models = await ai_client.discover_models(config)
+            if not self._discovery_current(generation, snapshot):
+                return
+            with self.prevent(Select.Changed):
+                choices = self.query_one("#ai-model-list", Select)
+                choices.set_options([(Content(model), model) for model in models])
+                current = self.query_one("#ai-model", Input).value
+                choices.value = current if current in models else Select.NULL
+            self.query_one("#ai-models-status", Static).update(f"{len(models)} models available. Choose one below or enter an ID manually.")
+            choices.focus()
+        except asyncio.CancelledError:
+            raise
+        except ai_client.AIError as exc:
+            if self._discovery_current(generation, snapshot):
+                self.query_one("#ai-models-status", Static).update("Discovery failed; manual model entry remains available.")
+                self.query_one("#ai-settings-error", Static).update(str(exc))
+        except Exception:
+            if self._discovery_current(generation, snapshot):
+                self.query_one("#ai-settings-error", Static).update("Unable to load models. Check the provider settings or enter a model ID manually.")
+        finally:
+            if self._discovery_current(generation, snapshot):
+                self._discovery_worker = None
+                self.query_one("#ai-models-populate", Button).disabled = False
+                self.query_one("#ai-models-cancel", Button).disabled = True
+
+    @on(Button.Pressed, "#ai-models-cancel")
+    def _cancel_discovery(self) -> None:
+        self._invalidate_discovery()
+        self.query_one("#ai-models-status", Static).update("Model lookup cancelled. Manual model entry remains available.")
+
+    @on(Select.Changed, "#ai-model-list")
+    def _model_selected(self, event: Select.Changed) -> None:
+        if isinstance(event.value, str):
+            self.query_one("#ai-model", Input).value = event.value
+
+    @on(Button.Pressed, "#ai-settings-save")
+    def _save_ai(self) -> None:
+        try:
+            config = self._read_config()
             remember = self.query_one("#ai-remember-credentials", Checkbox).value
-            self.ide.session.update_settings(ai=config, remember_ai_key=remember)
+            self.ide.session.save_ai_provider(
+                self.query_one("#ai-provider-name", Input).value.strip(), config,
+                provider_id=self._profile_id or None, remember=remember,
+            )
         except CredentialError as exc:
             self.query_one("#ai-settings-error", Static).update(
-                f"{exc} Unlock your system keyring and retry, or uncheck Remember to save settings with a session-only key."
+                f"{exc} Unlock your system keyring and retry, or uncheck Remember to use session-only credentials."
             )
             return
         except ValueError as exc:
             self.query_one("#ai-settings-error", Static).update(str(exc))
             return
-        self.ide.notify("Provider settings saved; API key saved in the system keyring." if remember and config.api_key else
-                        "Provider settings saved; API key is session-only." if config.api_key else
-                        "Provider settings saved locally.", title="AI provider")
-        self.dismiss(None)
+        self.ide.ai_chats.providers_changed()
+        self.ide.notify("Provider saved and selected; credentials use the system keyring." if remember else
+                        "Provider saved and selected; credentials are session-only.", title="AI provider")
+        self.action_cancel()
 
     @on(Button.Pressed, "#ai-settings-import")
     def _import_ai(self) -> None:
@@ -617,13 +788,19 @@ class AIProviderScreen(ModalScreen[None]):
         except ValueError as exc:
             self.query_one("#ai-settings-error", Static).update(str(exc))
             return
+        self._load_profile("")
+        self.query_one("#ai-provider-name", Input).value = "YOLO"
         self.query_one("#ai-base-url", Input).value = config.base_url
         self.query_one("#ai-model", Input).value = config.model
         self.query_one("#ai-api-key", Input).value = config.api_key
-        self.query_one("#ai-settings-error", Static).update(
-            "Imported into this form only; Save stores provider settings. Remember controls API-key storage."
-        )
+        self.query_one("#ai-settings-error", Static).update("Imported into a new draft only; Save & use commits it.")
+
+    def on_unmount(self) -> None:
+        self._provider_form_closed = True
+        self._invalidate_discovery(clear_models=False)
 
     @on(Button.Pressed, "#ai-settings-cancel")
     def action_cancel(self) -> None:
+        self._provider_form_closed = True
+        self._invalidate_discovery(clear_models=False)
         self.dismiss(None)

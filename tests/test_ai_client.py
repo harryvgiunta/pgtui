@@ -656,3 +656,250 @@ def test_invalid_settings_fail_without_exposing_values(changes):
     with pytest.raises(ValueError) as error:
         replace(CONFIG, **changes).validate()
     assert SECRET not in str(error.value)
+
+
+def test_header_parser_accepts_line_endings_and_preserves_values():
+    assert ai.parse_headers("\nX-Token: secret:with:colons\r\n\r\nX-Empty:\nX-Scope:  team one  \n") == {
+        "X-Token": "secret:with:colons", "X-Empty": "", "X-Scope": "team one",
+    }
+    config = replace(CONFIG, headers=f"X-Token: {SECRET}")
+    config.validate()
+    assert SECRET not in repr(config)
+
+
+@pytest.mark.parametrize("headers", [
+    None, 1, "Missing colon", ": empty-name", " X-Token: folded", "X Token: bad",
+    "X-Token: value\rInjected: value", "X-Token: value\n injected: value",
+    "X-Token: value\t", "X-Token: value\x00", "X-Token: value\x7f",
+    "X-Token: value\x85", "X-Token: value\u2028", "X-Token: value\ud800",
+    "X-Token: first\nx-token: second", "X-Token: " + "a" * 16_384,
+    "\n".join(f"X-{index}: value" for index in range(33)),
+])
+def test_header_parser_rejects_unsafe_input_without_echoing(headers):
+    if isinstance(headers, str):
+        headers += f"\nX-Sensitive: {SECRET}"
+    with pytest.raises(ValueError) as error:
+        ai.parse_headers(headers)
+    assert SECRET not in str(error.value)
+
+
+@pytest.mark.parametrize("name", [
+    "Host", "CONTENT-LENGTH", "Transfer-Encoding", "Connection", "Content-Type", "Accept",
+    "Accept-Encoding", "Content-Encoding", "Keep-Alive", "TE", "Trailer", "Upgrade", "Expect",
+    "Proxy-Authorization", "Proxy-Connection", "Forwarded", "X-Forwarded-Host", "X-Rewrite-URL",
+])
+def test_header_parser_refuses_protocol_and_routing_overrides(name):
+    with pytest.raises(ValueError):
+        ai.parse_headers(f"{name}: {SECRET}")
+
+
+def test_header_parser_exact_limits():
+    text = "X: " + "a" * (ai.MAX_HEADER_BYTES - 3)
+    assert ai.parse_headers(text) == {"X": text[3:]}
+    assert len(ai.parse_headers("\n".join(f"X-{index}: a" for index in range(32)))) == 32
+
+
+def test_connection_validation_does_not_require_model_but_checks_limits():
+    config = replace(CONFIG, model="")
+    config.validate_connection()
+    with pytest.raises(ValueError):
+        config.validate()
+    with pytest.raises(ValueError):
+        replace(config, timeout=0).validate_connection()
+
+
+@pytest.mark.parametrize("discovery", [False, True])
+def test_ambiguous_authorization_is_rejected_before_network(transport, discovery):
+    requests = transport(lambda request: pytest.fail("Invalid credentials must remain offline"))
+    config = replace(CONFIG, headers=f"aUtHoRiZaTiOn: Basic {SECRET}")
+    with pytest.raises(ai.AIError) as error:
+        asyncio.run(ai.discover_models(config) if discovery else collect([], config=config))
+    assert requests == []
+    assert SECRET not in "".join(traceback.format_exception(error.value))
+
+
+@pytest.mark.parametrize("custom_auth", [False, True])
+def test_chat_and_inline_share_custom_headers(transport, custom_auth):
+    from d8r.ai.sql_completion import CompletionRequest, complete_sql
+    from d8r.sql import SchemaContext
+
+    headers = f"X-Private-Token: {SECRET}\r\nX-Scope: team"
+    if custom_auth:
+        headers += f"\r\nAuthorization: Basic {SECRET}"
+    config = replace(CONFIG, api_key="" if custom_auth else SECRET, headers=headers)
+
+    def handler(request):
+        assert request.headers["x-private-token"] == SECRET
+        assert request.headers["x-scope"] == "team"
+        assert request.headers["authorization"] == ("Basic " if custom_auth else "Bearer ") + SECRET
+        assert request.headers["accept"] == "text/event-stream"
+        assert request.headers["content-type"] == "application/json"
+        return stream_response(completed('{"suggestions": [{"insert": "SELECT 1"}]}'))
+
+    requests = transport(handler)
+    asyncio.run(collect([], config=config))
+    context = CompletionRequest("SEL", 3, 0, 3, "postgres", "18.7", SchemaContext())
+    assert asyncio.run(complete_sql(config, context))[0].insert == "SELECT 1"
+    assert len(requests) == 2
+
+
+@pytest.mark.parametrize("base_url", [
+    "https://provider.invalid/v1", "https://provider.invalid/v1/",
+    "https://provider.invalid/v1/chat/completions", "https://provider.invalid/v1/chat/completions/",
+])
+@pytest.mark.parametrize("custom_auth", [False, True])
+def test_discovery_derives_url_and_deduplicates_without_model(transport, base_url, custom_auth):
+    def handler(request):
+        assert request.method == "GET"
+        assert str(request.url) == "https://provider.invalid/v1/models"
+        assert request.content == b""
+        assert request.headers["accept"] == "application/json"
+        assert request.headers["accept-encoding"] == "identity"
+        assert request.headers["x-private-token"] == SECRET
+        assert request.headers["authorization"] == ("Basic " if custom_auth else "Bearer ") + SECRET
+        return httpx.Response(200, json={"data": [{"id": "beta"}, {"id": "[red]alpha"}, {"id": "beta"}]})
+
+    requests = transport(handler)
+    headers = f"X-Private-Token: {SECRET}"
+    if custom_auth:
+        headers += f"\nAuthorization: Basic {SECRET}"
+    config = replace(CONFIG, base_url=base_url, model="", api_key="" if custom_auth else SECRET, headers=headers)
+    assert asyncio.run(ai.discover_models(config)) == ("beta", "[red]alpha")
+    assert len(requests) == 1
+
+
+def test_keyless_discovery_does_not_add_authorization(transport):
+    requests = transport(lambda request: httpx.Response(200, json={"data": [{"id": "local"}]}))
+    assert asyncio.run(ai.discover_models(ai.AIConfig("http://localhost:8080/v1"))) == ("local",)
+    assert "authorization" not in requests[0].headers
+
+
+@pytest.mark.parametrize("status", [301, 302, 307, 308, 401, 403, 404, 408, 429, 500, 503])
+def test_discovery_never_retries_redirects_or_reveals_error_body(transport, status):
+    stream = Parts(SECRET.encode())
+    requests = transport(lambda request: httpx.Response(
+        status, headers={"Location": "https://other.invalid/models", "Retry-After": "1"}, stream=stream,
+    ))
+    with pytest.raises(ai.AIError) as error:
+        asyncio.run(ai.discover_models(replace(CONFIG, headers=f"X-Token: {SECRET}")))
+    assert len(requests) == 1
+    assert stream.closed
+    assert SECRET not in "".join(traceback.format_exception(error.value))
+    if status in {401, 403}:
+        assert "required headers" in str(error.value)
+
+
+@pytest.mark.parametrize("body", [
+    b"not JSON", b"\xff", b"[]", b"{}", b'{"data": null}', b'{"data": []}',
+    b'{"data": {"id": "model"}}', b'{"data": [null]}', b'{"data": ["model"]}',
+    b'{"data": [{}]}', b'{"data": [{"id": 12}]}', b'{"data": [{"id": " "}]}',
+    b'{"data": [{"id": "x\\n"}]}', b'{"data": [{"id": "\\ud800"}]}',
+    b'{"data": [{"id": NaN}]}', b"[" * 2000,
+    json.dumps({"data": [{"id": "a" * 257}]}).encode(),
+    json.dumps({"data": [{"id": "duplicate"}] * 1001}).encode(),
+    json.dumps({"data": [{"id": "good"}, {"id": None}]}).encode(),
+])
+def test_discovery_rejects_malformed_empty_or_oversized_models(transport, body):
+    stream = Parts(body)
+    requests = transport(lambda request: httpx.Response(200, stream=stream))
+    with pytest.raises(ai.AIError):
+        asyncio.run(ai.discover_models(CONFIG))
+    assert len(requests) == 1
+    assert stream.closed
+
+
+def test_discovery_accepts_model_count_and_identifier_boundaries(transport):
+    ids = ["a" * 256] + [f"model-{index}" for index in range(999)]
+    transport(lambda request: httpx.Response(200, json={"data": [{"id": value} for value in ids]}))
+    assert asyncio.run(ai.discover_models(CONFIG)) == tuple(ids)
+
+
+def test_discovery_bounds_streamed_body_and_stops_reading(transport):
+    class Oversized(Parts):
+        async def __aiter__(self):
+            yield b" " * (ai.MAX_RESPONSE_BYTES // 2)
+            yield b" " * (ai.MAX_RESPONSE_BYTES // 2 + 1)
+            pytest.fail("Oversized body must not be drained")
+
+    stream = Oversized()
+    transport(lambda request: httpx.Response(200, stream=stream))
+    with pytest.raises(ai.AIError, match="size limit"):
+        asyncio.run(ai.discover_models(CONFIG))
+    assert stream.closed
+
+
+def test_discovery_rejects_compression_without_reading_body(transport):
+    class Compressed(Parts):
+        async def __aiter__(self):
+            pytest.fail("Compressed body must not be decoded")
+            yield b""
+
+    stream = Compressed()
+    transport(lambda request: httpx.Response(200, headers={"Content-Encoding": "gzip"}, stream=stream))
+    with pytest.raises(ai.AIError, match="compressed"):
+        asyncio.run(ai.discover_models(CONFIG))
+    assert stream.closed
+
+
+def test_discovery_uses_whole_request_deadline_not_progress_timeout(transport, monkeypatch):
+    class Trickle(Parts):
+        async def __aiter__(self):
+            while True:
+                yield b" "
+                await asyncio.sleep(0.002)
+
+    monkeypatch.setattr(ai, "MAX_DISCOVERY_TIMEOUT", 0.02)
+    stream = Trickle()
+    requests = transport(lambda request: httpx.Response(200, stream=stream))
+    with pytest.raises(ai.AIError, match="timed out"):
+        asyncio.run(asyncio.wait_for(ai.discover_models(CONFIG), timeout=1))
+    assert len(requests) == 1
+    assert stream.closed
+
+
+def test_discovery_respects_shorter_configured_timeout(transport):
+    class Idle(Parts):
+        async def __aiter__(self):
+            await asyncio.Event().wait()
+            yield b""
+
+    stream = Idle()
+    requests = transport(lambda request: httpx.Response(200, stream=stream))
+    with pytest.raises(ai.AIError, match="timed out"):
+        asyncio.run(asyncio.wait_for(ai.discover_models(replace(CONFIG, timeout=0.01)), timeout=1))
+    assert stream.closed
+    assert len(requests) == 1
+
+
+def test_discovery_cancellation_closes_stream(transport):
+    async def scenario():
+        waiting = asyncio.Event()
+
+        class Blocking(Parts):
+            async def __aiter__(self):
+                waiting.set()
+                await asyncio.Event().wait()
+                yield b""
+
+        stream = Blocking()
+        requests = transport(lambda request: httpx.Response(200, stream=stream))
+        task = asyncio.create_task(ai.discover_models(CONFIG))
+        await asyncio.wait_for(waiting.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert stream.closed
+        assert len(requests) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure", [httpx.ConnectError, httpx.ReadError, httpx.ReadTimeout, httpx.DecodingError])
+def test_discovery_transport_errors_are_safe_and_never_retry(transport, failure):
+    stream = Parts(failure(SECRET))
+    requests = transport(lambda request: httpx.Response(200, stream=stream))
+    with pytest.raises(ai.AIError) as error:
+        asyncio.run(ai.discover_models(CONFIG))
+    assert len(requests) == 1
+    assert stream.closed
+    assert SECRET not in "".join(traceback.format_exception(error.value))

@@ -1,13 +1,16 @@
 """Deterministic native SQL persistence and OS-vault boundary tests."""
 from copy import deepcopy
+from dataclasses import asdict
 import hashlib
 import json
 import os
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
 from d8r import credentials, storage
+from d8r.ai.client import AIConfig
 from d8r.credentials import CredentialError, CredentialVault
 from d8r.storage import MemoryStore, SettingsStore, WorkspaceStore
 
@@ -202,9 +205,15 @@ def test_only_stale_temporary_files_are_swept(tmp_path, monkeypatch):
     assert fresh.exists()
 
 
-def ai_settings(store, api_key="ai-secret"):
+def ai_settings(store, api_key="ai-secret", headers="X-Token: header-secret"):
     document = deepcopy(store.document)
-    document["ai"].update(base_url="https://api.example.test/v1", model="test-model", api_key=api_key)
+    config = asdict(AIConfig(base_url="https://api.example.test/v1", model="test-model", api_key=api_key, headers=headers))
+    if document["ai_providers"]:
+        document["ai_providers"][0]["config"] = config
+    else:
+        identity = str(uuid4())
+        document["ai_providers"] = [{"id": identity, "name": "Default", "config": config, "remember": True}]
+        document["ai_active_provider"] = identity
     return document
 
 
@@ -224,20 +233,26 @@ def test_ai_secret_roundtrip_locked_preferences_and_forgetting(tmp_path, monkeyp
     store = SettingsStore(tmp_path)
     store.save(ai_settings(store))
     assert "ai-secret" not in store.path.read_text()
-    assert SettingsStore(tmp_path).document["ai"]["api_key"] == "ai-secret"
-    reference = json.loads(store.path.read_text())["ai"]["api_key_ref"]
+    assert "header-secret" not in store.path.read_text()
+    loaded = SettingsStore(tmp_path)
+    assert loaded.document["ai_providers"][0]["config"]["api_key"] == "ai-secret"
+    assert loaded.document["ai_providers"][0]["config"]["headers"] == "X-Token: header-secret"
+    config = json.loads(store.path.read_text())["ai_providers"][0]["config"]
     with monkeypatch.context() as locked:
         locked_backend(locked)
         loaded = SettingsStore(tmp_path)
         assert loaded.ai_credentials_missing
-        assert loaded.document["ai"]["api_key"] == ""
+        assert loaded.document["ai_providers"][0]["config"]["api_key"] == ""
+        assert loaded.document["ai_providers"][0]["config"]["headers"] == ""
         loaded.save({**loaded.document, "default_rows": 75})
-        assert json.loads(store.path.read_text())["ai"]["api_key_ref"] == reference
+        assert json.loads(store.path.read_text())["ai_providers"][0]["config"] == config
     loaded = SettingsStore(tmp_path)
-    loaded.save(ai_settings(loaded, ""), replace_ai=True)
+    loaded.save(ai_settings(loaded, "", ""))
     assert not loaded.ai_credentials_missing
     assert not credential_backend.values
-    assert json.loads(store.path.read_text())["ai"]["api_key_ref"] is None
+    saved = json.loads(store.path.read_text())["ai_providers"][0]["config"]
+    assert saved["api_key_ref"] is None
+    assert saved["headers_ref"] is None
 
 
 def test_plaintext_settings_rejected_without_migration(tmp_path, credential_backend):
@@ -246,7 +261,7 @@ def test_plaintext_settings_rejected_without_migration(tmp_path, credential_back
     store.path.write_bytes(original)
     loaded = SettingsStore(tmp_path)
     assert loaded.error
-    assert loaded.document["ai"]["api_key"] == ""
+    assert loaded.document["ai_providers"] == []
     assert loaded.path.read_bytes() == original
     assert not credential_backend.values
 
@@ -353,3 +368,136 @@ def test_complete_tool_exchange_roundtrips_without_execution(tmp_path):
     ]
     store.save(document)
     assert WorkspaceStore(tmp_path).document == document
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_legacy_settings_migrate_in_memory_without_rewriting(tmp_path, credential_backend, configured):
+    config = asdict(AIConfig(max_attempts=2, sample_rows=7))
+    config.pop("headers")
+    config.pop("api_key")
+    reference = None
+    if configured:
+        config.update(base_url="https://legacy.example.test/v1", model="legacy-model")
+        reference = CredentialVault(tmp_path).put("legacy-key")
+    config["api_key_ref"] = reference
+    legacy = {"version": 2, "ai": config, "ai_remember_key": True, "default_rows": 87}
+    path = tmp_path / "settings.json"
+    original = json.dumps(legacy).encode()
+    path.write_bytes(original)
+    loaded = SettingsStore(tmp_path)
+    assert not loaded.error
+    assert path.read_bytes() == original
+    profile = loaded.document["ai_providers"][0]
+    assert profile["name"] == "Default"
+    assert profile["config"]["max_attempts"] == 2
+    assert profile["config"]["sample_rows"] == 7
+    assert profile["config"]["api_key"] == ("legacy-key" if configured else "")
+    assert profile["config"]["headers"] == ""
+    assert loaded.document["ai_active_provider"] == profile["id"]
+    assert SettingsStore(tmp_path).document["ai_providers"][0]["id"] == profile["id"]
+    loaded.save(loaded.document)
+    disk = json.loads(path.read_text())
+    assert disk["version"] == 3
+    assert "ai" not in disk and "ai_remember_key" not in disk
+    assert disk["ai_providers"][0]["config"]["api_key_ref"] == reference
+    assert "api_key" not in disk["ai_providers"][0]["config"]
+    assert "headers" not in disk["ai_providers"][0]["config"]
+
+
+def test_locked_legacy_migration_retains_original_reference(tmp_path, monkeypatch):
+    path = tmp_path / "settings.json"
+    legacy = {"version": 2, "ai": {"base_url": "https://legacy.example.test/v1", "model": "legacy",
+                                      "api_key_ref": "legacy-reference"}}
+    original = json.dumps(legacy).encode()
+    path.write_bytes(original)
+    locked_backend(monkeypatch)
+    loaded = SettingsStore(tmp_path)
+    assert not loaded.error
+    assert loaded.ai_credentials_missing
+    assert path.read_bytes() == original
+    loaded.save({**loaded.document, "default_rows": 90})
+    assert json.loads(path.read_text())["ai_providers"][0]["config"]["api_key_ref"] == "legacy-reference"
+
+
+def test_provider_stale_writer_rolls_back_both_new_secrets(tmp_path, credential_backend):
+    first, stale = SettingsStore(tmp_path), SettingsStore(tmp_path)
+    first.save(ai_settings(first))
+    original = first.path.read_bytes()
+    vault = dict(credential_backend.values)
+    with pytest.raises(ValueError, match="changed outside"):
+        stale.save(ai_settings(stale, "stale-key", "X-Token: stale-header"))
+    assert first.path.read_bytes() == original
+    assert credential_backend.values == vault
+    assert stale.document["ai_providers"] == []
+
+
+def test_provider_failed_replace_rolls_back_both_new_secrets(tmp_path, monkeypatch, credential_backend):
+    store = SettingsStore(tmp_path)
+    store.save(ai_settings(store))
+    original, runtime = store.path.read_bytes(), deepcopy(store.document)
+    vault = dict(credential_backend.values)
+
+    def fail_replace(*args):
+        raise OSError("private detail")
+
+    monkeypatch.setattr(storage.os, "replace", fail_replace)
+    with pytest.raises(ValueError, match="Cannot save local settings"):
+        store.save(ai_settings(store, "new-key", "X-Token: new-header"))
+    assert store.path.read_bytes() == original
+    assert store.document == runtime
+    assert credential_backend.values == vault
+
+
+def test_second_secret_vault_failure_rolls_back_first(tmp_path, monkeypatch, credential_backend):
+    store = SettingsStore(tmp_path)
+    put = store._vault.put
+
+    def fail_headers(value):
+        if value.startswith("X-Token:"):
+            raise CredentialError("vault locked")
+        return put(value)
+
+    monkeypatch.setattr(store._vault, "put", fail_headers)
+    with pytest.raises(CredentialError):
+        store.save(ai_settings(store))
+    assert not store.path.exists()
+    assert not credential_backend.values
+    assert store.document["ai_providers"] == []
+
+
+@pytest.mark.parametrize("secret", ["api_key", "headers"])
+def test_v3_plaintext_secret_is_rejected(tmp_path, credential_backend, secret):
+    store = SettingsStore(tmp_path)
+    store.save(ai_settings(store))
+    disk = json.loads(store.path.read_text())
+    disk["ai_providers"][0]["config"][secret] = "plaintext-secret"
+    original = json.dumps(disk).encode()
+    store.path.write_bytes(original)
+    loaded = SettingsStore(tmp_path)
+    assert loaded.error
+    assert loaded.path.read_bytes() == original
+    with pytest.raises(ValueError):
+        loaded.save(loaded.document)
+
+
+def test_provider_references_are_data_directory_scoped(tmp_path, credential_backend):
+    first = SettingsStore(tmp_path / "first")
+    first.save(ai_settings(first))
+    second_dir = tmp_path / "second"
+    second_dir.mkdir()
+    (second_dir / "settings.json").write_bytes(first.path.read_bytes())
+    second = SettingsStore(second_dir)
+    assert not second.error
+    assert second.ai_credentials_missing
+    config = second.document["ai_providers"][0]["config"]
+    assert config["api_key"] == config["headers"] == ""
+    second.save({**second.document, "default_rows": 10})
+    assert SettingsStore(first.path.parent).document["ai_providers"][0]["config"]["api_key"] == "ai-secret"
+
+
+def test_invalid_headers_are_rejected_before_any_vault_write(tmp_path, credential_backend):
+    store = SettingsStore(tmp_path)
+    with pytest.raises(ValueError):
+        store.save(ai_settings(store, headers="Host: unsafe.example.test"))
+    assert not store.path.exists()
+    assert not credential_backend.values

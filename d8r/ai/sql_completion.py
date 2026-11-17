@@ -7,7 +7,7 @@ import json
 import re
 
 from d8r.sql import SchemaContext, format_parameters, relation_parts
-from .client import AIConfig, AIError, run_turn
+from .client import AIConfig, AIError, parse_headers, run_turn
 
 MAX_INSERT_CHARS = 2048
 MAX_RESPONSE_CHARS = 8192
@@ -208,6 +208,7 @@ async def complete_sql(config: AIConfig, request: CompletionRequest) -> tuple[AI
     except TimeoutError:
         raise AIError("SQL completion timed out; nothing was inserted.") from None
     suggestions = _decode("".join(answer))
-    if config.api_key and any(config.api_key in item.insert or config.api_key in item.detail for item in suggestions):
+    secrets = (config.api_key, *parse_headers(config.headers).values())
+    if any(secret and (secret in item.insert or secret in item.detail) for secret in secrets for item in suggestions):
         raise AIError("The SQL completion contained a credential and was discarded.")
     return suggestions

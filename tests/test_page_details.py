@@ -51,7 +51,7 @@ def test_details_generation_saves_metadata_without_changing_or_running_query(tmp
     assert page["description"] == "Edited description"
 
 
-@pytest.mark.parametrize("interrupt", ["edit", "switch", "cancel"])
+@pytest.mark.parametrize("interrupt", ["edit", "switch", "cancel", "provider-roundtrip"])
 def test_inflight_metadata_never_overwrites_changed_or_cancelled_target(tmp_path, monkeypatch, interrupt):
     async def scenario():
         started = asyncio.Event()
@@ -77,6 +77,10 @@ def test_inflight_metadata_never_overwrites_changed_or_cancelled_target(tmp_path
                 app.query_one("#page-name", Input).value = "My edit"
             elif interrupt == "switch":
                 app.action_new_query()
+            elif interrupt == "provider-roundtrip":
+                first = session.save_ai_provider("First", CONFIG, remember=False)
+                session.save_ai_provider("Second", CONFIG, remember=False)
+                session.select_ai_provider(first)
             else:
                 await pilot.click("#page-details-cancel")
             release.set()
@@ -87,7 +91,7 @@ def test_inflight_metadata_never_overwrites_changed_or_cancelled_target(tmp_path
             await pilot.pause()
             app._flush_workspace()
             assert all(page["title"] != "Late title" for page in session.workspace["pages"])
-            expected = {"edit": "My edit", "switch": "", "cancel": "Keep this"}[interrupt]
+            expected = {"edit": "My edit", "switch": "", "cancel": "Keep this", "provider-roundtrip": "Keep this"}[interrupt]
             assert app.query_one("#page-name", Input).value == expected
             assert not session.history
 
