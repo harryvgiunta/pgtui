@@ -242,7 +242,8 @@ async def test_d1_editor_completion_highlighting_and_native_results(d1_source, d
             quoted = view_for(session, doc, doc, len(doc))
             assert quoted is not None
             close_quote = "]" if quote == "[" else quote
-            assert any(entry.insert == quote + "label" + close_quote for entry in quoted.entries)
+            assert any(entry.insert == "records." + quote + "label" + close_quote
+                       for entry in quoted.entries)
         doc = "SELECT r.la FROM [records] AS r"
         offered = view_for(session, doc, doc, len("SELECT r.la"))
         assert offered is not None and "r.label" in offered.labels
