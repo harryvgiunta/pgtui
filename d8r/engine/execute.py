@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import threading
+from contextlib import nullcontext
 from time import perf_counter
 from uuid import uuid4
 
@@ -26,32 +27,71 @@ def _row_limit(value) -> int:
     return value or _DEFAULT_ROWS
 
 
-def _words(sql: str, *, dialect="postgres") -> list[str]:
-    return [token.text.upper() for token in lex_sql(sql, dialect=dialect) if token.kind == "word"]
-
-
-def _check_readonly_functions(sql):
-    tokens = [token for token in lex_sql(sql) if token.kind not in {"whitespace", "comment"}]
+def _read_functions(tokens):
+    """Check explicit calls and collect their names for the native volatility check."""
+    names = set()
     for index, token in enumerate(tokens):
         if token.kind not in {"word", "quoted_identifier"}:
             continue
-        name = token.text.replace('""', '"')[1:-1] if token.kind == "quoted_identifier" else token.text
-        name = name.lower()
+        name = token.text[1:-1].replace('""', '"') if token.kind == "quoted_identifier" else token.text.lower()
         following = tokens[index + 1].text if index + 1 < len(tokens) else ""
-        if name == "u" and following == "&":
+        if name.lower() == "u" and following == "&":
             raise EngineError("Escaped Unicode identifiers are not accepted by read-only tools")
-        if following == "(" and (name in _UNSAFE_FUNCTIONS or name.startswith(_UNSAFE_PREFIXES)):
-            raise EngineError("Read-only tools cannot call file, network, session-control or mutation functions")
+        if following == "(":
+            if name.lower() in _UNSAFE_FUNCTIONS or name.lower().startswith(_UNSAFE_PREFIXES):
+                raise EngineError("Read-only tools cannot call file, network, session-control or mutation functions")
+            names.add(name)
+    return names
 
 
-def _pg_result(con, sql, cap, readonly):
-    # Read-only tools already own a transaction, so a server-side cursor also
-    # bounds libpq memory. Normal native writes/transactions use the ordinary
-    # cursor: stopping a stream early could cancel or roll back their effects.
-    cursor = con.cursor(name=f"pgtui_{uuid4().hex}") if readonly else con.cursor()
-    with cursor:
-        if readonly:
-            cursor.execute(sql)
+def _pg_previewable(con, words, tokens):
+    # DECLARE cannot run DML/SELECT INTO. Don't partially apply row locks or
+    # stop a directly called volatile routine (including user functions) early.
+    if not words or words[0] not in _QUERY_WORDS or "FOR" in words or _WRITE_WORDS.intersection(words):
+        return False
+    try:
+        names = _read_functions(tokens)
+    except EngineError:
+        return False
+    if names:
+        # Check all overloads conservatively. No extra round trip for plain scans.
+        with con.cursor() as cursor:
+            cursor.execute("SELECT EXISTS (SELECT FROM pg_catalog.pg_proc "
+                           "WHERE proname = ANY(%s::name[]) AND provolatile = 'v')", (list(names),))
+            if cursor.fetchone()[0]:
+                return False
+    return True
+
+
+def _pg_fetch_page(cursor, sql, cap, offset):
+    """Leave only the fetched PGresult on cursor; release the portal before returning."""
+    import psycopg
+    from psycopg.pq import TransactionStatus
+
+    # Only generated identifiers and validated integers enter the control SQL.
+    # Owning the prefix lets us map DECLARE diagnostics back to the user's text.
+    name = f"pgtui_{uuid4().hex}"
+    prefix = f"DECLARE {name} NO SCROLL CURSOR WITHOUT HOLD FOR "
+    try:
+        cursor.execute(prefix + sql, prepare=False)
+    except psycopg.Error as exc:
+        raise _safe_error(exc, position_offset=len(prefix)) from None
+    try:
+        if offset:
+            cursor.execute(f"MOVE FORWARD {offset} FROM {name}")
+        cursor.execute(f"FETCH FORWARD {cap + 1} FROM {name}")
+    finally:
+        # In a failed transaction PostgreSQL releases the portal on rollback.
+        # Don't mask the error or roll back a transaction owned by the caller.
+        if cursor.connection.info.transaction_status == TransactionStatus.INTRANS:
+            with cursor.connection.cursor() as control:
+                control.execute(f"CLOSE {name}")
+
+
+def _pg_result(con, sql, cap, *, server_cursor, offset):
+    with con.cursor() as cursor:
+        if server_cursor:
+            _pg_fetch_page(cursor, sql, cap, offset)
         else:
             cursor.execute(sql, prepare=False)
         if cursor.description:
@@ -83,8 +123,10 @@ def _pg_explain(con, sql):
             "truncated": truncated, "plan_limit": _PLAN_CHARS}
 
 
-def _duck_result(con, sql, cap, statement_type):
-    cursor = con.execute(sql)
+def _duck_result(con, sql, cap, statement_type, offset):
+    # DuckDB streams normal SELECTs. For a requested later page, skip rows in
+    # the native relation rather than materializing the prefix in Python.
+    cursor = con.sql(sql).limit(cap + 1, offset) if offset else con.execute(sql)
     description = cursor.description
     if description:
         buffered = cursor.fetchmany(cap + 1)
@@ -93,13 +135,16 @@ def _duck_result(con, sql, cap, statement_type):
     return [], [], [], 0, statement_type
 
 
-def execute_sql(source: DataSource, sql: str, *, max_rows=10000, readonly=False, timeout=30.0) -> dict:
+def execute_sql(source: DataSource, sql: str, *, max_rows=10000, readonly=False, timeout=30.0, offset=0) -> dict:
     """Execute one statement with a visible ``max_rows + 1`` lower-bound count.
 
     ``total`` is an exact count only when the result was exhausted; when rows are
     truncated it is the observed lower bound (displayed rows + one). Non-result
     PostgreSQL statements report the driver's affected-row count. A zero preview
     limit means the default 10,000-row cap, never an unbounded allocation.
+    An offset requests a fresh read-only page; totals are relative to that page.
+    Eligible manual PostgreSQL reads use a short-lived server cursor, without
+    retaining an open transaction between pages or rewriting the query.
 
     Read-only PostgreSQL transactions are database protection, not a sandbox for
     privileged server extensions or arbitrary side effects of installed functions.
@@ -110,7 +155,7 @@ def execute_sql(source: DataSource, sql: str, *, max_rows=10000, readonly=False,
     then use an outer LIMIT, not a connection-local read-only transaction. This
     does not bound scan cost. Cancellation/deadlines cannot roll back remote work.
     """
-    return _execute_statement(source, sql, max_rows=max_rows, readonly=readonly, timeout=timeout)
+    return _execute_statement(source, sql, max_rows=max_rows, readonly=readonly, timeout=timeout, offset=offset)
 
 
 def prepare_sql(source: DataSource, sql: str, *, timeout=30.0) -> None:
@@ -129,8 +174,10 @@ def explain_sql(source: DataSource, sql: str, *, timeout=30.0) -> dict:
     return _execute_statement(source, sql, max_rows=1, readonly=True, timeout=timeout, explain=True)
 
 
-def _execute_statement(source, sql, *, max_rows, readonly, timeout, explain=False, prepare_only=False):
+def _execute_statement(source, sql, *, max_rows, readonly, timeout, explain=False, prepare_only=False, offset=0):
     cap = _row_limit(max_rows)
+    if type(offset) is not int or not 0 <= offset <= 2**63 - 1 or (offset and not readonly):
+        raise EngineError("Page offset must be a nonnegative integer and is only supported for read-only queries")
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
         raise EngineError("Query timeout must be a positive finite number")
     if not isinstance(sql, str):
@@ -141,19 +188,22 @@ def _execute_statement(source, sql, *, max_rows, readonly, timeout, explain=Fals
         timeout = min(timeout, 30.0)
     try:
         statements = split_statements(sql, dialect=source.dialect)
-        words = _words(sql, dialect=source.dialect)
+        tokens = [t for t in lex_sql(sql, dialect=source.dialect) if t.kind not in {"whitespace", "comment"}]
+        words = [t.text.upper() for t in tokens if t.kind == "word"]
     except SqlError:
         raise EngineError("SQL contains an unterminated literal or comment. Hint: Check matching quotes and close any block comment.") from None
     if len(statements) != 1:
         raise EngineError("Execute exactly one SQL statement at a time")
     if source.kind == "d1-live":
         from .d1api import execute_d1
-        return execute_d1(source, sql, statements[0], cap=cap, readonly=readonly, timeout=timeout, prepare_only=prepare_only)
+        return execute_d1(source, sql, statements[0], cap=cap, readonly=readonly, timeout=timeout,
+                          prepare_only=prepare_only, offset=offset)
     first = words[0] if words else ""
     with source._lock:
         if source.con is None or source.kind not in {"postgres-live", "parquet"}:
             raise EngineError("Source is disconnected")
-        if readonly and transaction_open(source):
+        user_transaction = transaction_open(source)
+        if readonly and user_transaction:
             raise EngineError("Read-only tools cannot run inside your open transaction")
         started = perf_counter()
         expired = threading.Event()
@@ -181,7 +231,7 @@ def _execute_statement(source, sql, *, max_rows, readonly, timeout, explain=Fals
                 # the server transaction remains the authority for nested writes.
                 raise EngineError("Read-only tools accept a single non-mutating query only")
             if readonly and source.kind == "postgres-live":
-                _check_readonly_functions(sql)
+                _read_functions(tokens)
             if readonly:
                 if source.kind == "postgres-live":
                     with source.con.cursor() as cursor:
@@ -207,9 +257,17 @@ def _execute_statement(source, sql, *, max_rows, readonly, timeout, explain=Fals
                     raise EngineError("Query deadline exceeded")
                 return {**result, "ms": (perf_counter() - started) * 1000}
             if source.kind == "postgres-live":
-                columns, dtypes, rows, total, status = _pg_result(source.con, sql, cap, readonly)
+                server_cursor = readonly or _pg_previewable(source.con, words, tokens)
+                # Never use WITH HOLD (commit would spool the remaining rows),
+                # nor a savepoint that would mask an error in the user's transaction.
+                transaction = source.con.transaction() if server_cursor and not (readonly or user_transaction) else nullcontext()
+                with transaction:
+                    columns, dtypes, rows, total, status = _pg_result(
+                        source.con, sql, cap, server_cursor=server_cursor, offset=offset)
+                pageable = server_cursor and not user_transaction
             else:
-                columns, dtypes, rows, total, status = _duck_result(source.con, sql, cap, statement_type)
+                columns, dtypes, rows, total, status = _duck_result(source.con, sql, cap, statement_type, offset)
+                pageable = statement_type == "SELECT" and not user_transaction
                 if statement_type == "TRANSACTION" and not readonly:
                     if first in {"BEGIN", "START"}:
                         source._transaction = True
@@ -220,7 +278,7 @@ def _execute_statement(source, sql, *, max_rows, readonly, timeout, explain=Fals
             schema_changed = not readonly and (first in {"CREATE", "ALTER", "DROP", "COMMENT", "GRANT", "REVOKE", "SECURITY", "DO", "CALL", "COMMIT", "END", "ROLLBACK", "ABORT"})
             return {"columns": columns, "dtypes": dtypes, "rows": rows, "total": total,
                     "ms": (perf_counter() - started) * 1000, "sql": sql,
-                    "status": status, "schema_changed": schema_changed}
+                    "status": status, "schema_changed": schema_changed, "pageable": pageable}
         except EngineError:
             raise
         except Exception as exc:

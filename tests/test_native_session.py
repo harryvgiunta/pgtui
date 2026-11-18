@@ -93,6 +93,22 @@ def test_default_rows_is_fetch_cap_not_query_limit(parquet_source):
     assert session.run(sql).rows == [[1], [2], [3]]
 
 
+def test_result_page_uses_only_the_expanded_read_and_original_connection(parquet_source):
+    session = session_for(parquet_source)
+    session.update_settings(default_rows=1)
+    session.save_fn("browse", "", "SELECT id FROM data", "")
+    write, first = session.run_all("CREATE TEMP TABLE once_only(i INT); SELECT id FROM browse() ORDER BY id LIMIT 2")
+    assert write.ok and write.page is None
+    session.save_fn("browse", "", "SELECT 99 AS id", "")
+    last = session.result_page(first, 1)
+    assert last.rows == [[2]] and not last.capped
+    assert last.sql == first.sql and session.result_page(last, -1).rows == [[1]]
+    assert len(session.history) == 2
+    session.sources[session.active_id] = replace(parquet_source)
+    with pytest.raises(EngineError, match="current connection"):
+        session.result_page(first, 1)
+
+
 def test_multiple_native_statements_and_transactions(parquet_source):
     session = session_for(parquet_source)
     outcomes = session.run_all(

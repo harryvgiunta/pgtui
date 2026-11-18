@@ -92,6 +92,15 @@ class HistoryEntry:
         return ""
 
 
+@dataclass(frozen=True)
+class ResultPage:
+    """A position in the original expanded query, not a live cursor or transaction."""
+
+    source: DataSource = field(repr=False)
+    size: int
+    offset: int
+
+
 @dataclass
 class RunOutcome:
     """One native statement's result; total is a buffered row-count lower bound."""
@@ -109,11 +118,12 @@ class RunOutcome:
     sql: str = ""
     schema_changed: bool = False
     doc: str = ""
+    page: ResultPage | None = None
 
     @property
     def capped(self) -> bool:
         """True when the preview buffer, not the document, decided the row count."""
-        return self.total > len(self.rows)
+        return bool(self.columns) and self.total > len(self.rows)
 
 
 @dataclass
@@ -1125,7 +1135,7 @@ class Session:
         """Execute the document and return its first outcome; use run_all for all."""
         return self.run_all(doc, record=record)[0]
 
-    def run_all(self, doc: str, record: bool = True) -> list[RunOutcome]:
+    def run_all(self, doc: str, record: bool = True, *, paged_read: bool = False) -> list[RunOutcome]:
         """Execute native statements in order, stopping at the first server error.
 
         Lexical/expansion errors prevent all execution. Native SQL transaction
@@ -1140,30 +1150,46 @@ class Session:
         if not document.statements:
             return [RunOutcome(ok=True, status="nothing to run", source=self.active_id,
                                dialect=self.source.dialect, doc=doc)]
+        if paged_read and len(document.statements) != 1:
+            message = "Select one read-only statement to page through. Nothing was executed."
+            return [RunOutcome(status=message, error=message, doc=doc)]
         if not self.source_connected():
             message = "The saved target is disconnected. Reconnect it or explicitly select another source before running."
             return [RunOutcome(status=message, error=message, doc=doc)]
         authored = split_statements(doc, dialect=self.source.dialect)
         outcomes = []
         for sql, text in zip(document.statements, authored):
-            outcome = self._run_statement(sql, text, record=record)
+            outcome = self._run_statement(sql, text, record=record, readonly=paged_read)
             outcomes.append(outcome)
             if outcome.error:
                 break
         return outcomes
 
+    def result_page(self, previous: RunOutcome, direction: int) -> RunOutcome:
+        """Re-read one page on demand, never the editor, script or a replacement source."""
+        page = previous.page
+        if page is None or page.source is not self.source or not self.source_connected():
+            raise EngineError("This result is not pageable on the current connection")
+        if direction not in (-1, 1) or (direction == 1 and not previous.capped) or (direction == -1 and not page.offset):
+            raise EngineError("No page in that direction")
+        return self._run_statement(previous.sql, previous.doc, record=False, source=page.source,
+                                   readonly=True, size=page.size, offset=page.offset + direction * page.size)
+
     def _run_statement(self, sql: str, doc: str, *, record: bool,
-                       source: DataSource | None = None) -> RunOutcome:
+                       source: DataSource | None = None, readonly=False, size=None, offset=0) -> RunOutcome:
         source = self.source if source is None else source
+        if size is None:
+            size = min(self.default_rows or PREVIEW_ROW_CAP, PREVIEW_ROW_CAP)
         try:
-            result = execute_sql(source, sql, max_rows=min(self.default_rows or PREVIEW_ROW_CAP, PREVIEW_ROW_CAP))
+            result = execute_sql(source, sql, max_rows=size, readonly=readonly, offset=offset)
         except Exception as exc:
             message = self.execution_error(exc)
             if not self.source_connected(source.id) and source is self.source:
                 self.refresh_schema()
             return RunOutcome(status=message, error=message, source=source.id,
                               dialect=source.dialect, sql=sql, doc=doc)
-        self.clear_value_cache(self._source_identity(source))
+        if not readonly:
+            self.clear_value_cache(self._source_identity(source))
         schema_warning = ""
         if result["schema_changed"]:
             try:
@@ -1183,7 +1209,10 @@ class Session:
             columns=result["columns"], dtypes=result["dtypes"], rows=result["rows"],
             total=result["total"], ms=result["ms"], sql=result["sql"],
             schema_changed=result["schema_changed"], doc=doc,
+            page=ResultPage(source, size, offset) if result["pageable"] else None,
         )
+        if not offset and not outcome.capped:
+            outcome.page = None
         outcome.status = " · ".join(part for part in (
             result["status"], self._status_for(outcome), schema_warning,
         ) if part)
@@ -1197,7 +1226,11 @@ class Session:
 
     @staticmethod
     def _status_for(outcome: RunOutcome) -> str:
-        status = f"{len(outcome.rows)} rows · {outcome.ms:.1f} ms · {outcome.source} · {outcome.dialect}"
+        extent = f"{len(outcome.rows)} rows"
+        if outcome.page is not None:
+            start = outcome.page.offset
+            extent = f"rows {start + 1:,}–{start + len(outcome.rows):,}" if outcome.rows else f"no rows at offset {start:,}"
+        status = f"{extent} · {outcome.ms:.1f} ms · {outcome.source} · {outcome.dialect}"
         if outcome.capped:
             status += " · more rows available (preview capped; full count not scanned)"
         return status

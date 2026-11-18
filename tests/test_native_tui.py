@@ -157,6 +157,38 @@ async def test_results_drag_bar_operates_on_current_tab_and_preserves_pins(parqu
 
 
 @async_test
+async def test_paged_d1_read_navigates_grid_not_editor(d1_source, d1_harness):
+    session = Session({d1_source.id: d1_source})
+    session.update_settings(default_rows=1)
+    app = D8RApp(session)
+    async with app.run_test(size=(120, 45)) as pilot:
+        sql = "SELECT id FROM records ORDER BY id LIMIT 2 OFFSET 1"
+        app.editor.load_text(sql)
+        await pilot.press("shift+f5")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        grid = app.query_one("#results-table", ResultsTable)
+        assert grid.raw_rows == ((2,),) and app.query_one("#result-prev", Button).disabled
+        app.editor.load_text("DELETE FROM records")
+        await pilot.click("#result-next")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert grid.raw_rows == ((3,),) and grid.page_offset == 1
+        assert app.query_one("#result-next", Button).disabled
+        grid.action_export()
+        assert isinstance(app.screen, ExportModal) and app.screen.snapshot.rows == ((3,),)
+        await pilot.press("escape")
+        grid.focus()
+        await pilot.press("ctrl+left")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert grid.raw_rows == ((2,),) and grid.page_offset == 0
+        assert [entry.doc for entry in session.history] == [sql]
+        assert app.editor.text == "DELETE FROM records"
+        assert d1_harness.connection.execute("SELECT count(*) FROM records").fetchone() == (3,)
+
+
+@async_test
 async def test_zero_row_summary_appears_only_in_results(parquet_source):
     app = D8RApp(Session({parquet_source.id: parquet_source}))
     async with app.run_test(size=(140, 45)) as pilot:

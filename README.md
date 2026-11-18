@@ -90,12 +90,22 @@ inside strings, comments, dollar-quoted routine bodies, SQL-standard `BEGIN ATOM
 bodies and SQLite trigger bodies are not document boundaries. SQLite bracket and
 backtick identifiers retain their native meaning.
 
-Default rows controls the **fetched preview**, not an injected SQL LIMIT. Its initial
-value is 50; zero uses the 10,000-row preview cap. Authored LIMIT clauses retain
-native semantics. Truncated results report more rows available, never an invented
-full count. CSV export uses only the captured buffer. Fetch limits do not bound
-scan cost; ordinary psycopg cursors may buffer more data internally. Execution has
-a 30-second deadline. PostgreSQL AI reads use server-side cursors.
+**Default rows** is the result page size: 50 initially, at most 10,000 (zero uses
+10,000). Run does not append `LIMIT` to your SQL or issue `COUNT(*)`. For ordinary
+PostgreSQL reads it opens a forward-only server cursor, fetches one page plus one
+row to detect **Next**, then closes the cursor. It does not leave a transaction
+open between pages. Writes (including modifying CTEs and `RETURNING`), locking
+reads and direct calls to volatile routines retain native execution and can buffer
+more in the driver. Reads inside your own transaction do not offer page navigation.
+
+Use **Next / Previous** below an unpinned result, or **Ctrl+Right / Ctrl+Left**
+with the grid focused. Each click re-reads only that statement, read-only, at the
+requested position; it does not rerun the script, modify the editor or add history.
+Authored `LIMIT` and `OFFSET` still apply. Pages are separate reads, not a frozen
+snapshot: use a unique `ORDER BY` for repeatable order; concurrent changes can
+still shift rows. CSV and clipboard use only the displayed buffer. Paging bounds
+the rows fetched, not the cost of sorting, aggregating or skipping a deep offset.
+The query deadline is 30 seconds.
 
 Parquet connections are in-memory and restricted to the selected file. The file
 is never modified. External writes, attachments, extension loading and configuration
@@ -118,11 +128,13 @@ available. Each statement is a separate request. Timeout/cancellation can discar
 the response but cannot guarantee remote rollback; writes are never retried
 automatically. Check the database before manually retrying an uncertain write.
 
-Normal Run sends authored SQL unchanged. Its visible-row cap does not limit the
-remote response; the client caps response bodies at 50 MB and operations at 30
-seconds. Use an authored LIMIT when needed. Token-free workspace identities retain
-drafts after Remember-off use; reconnect prompts for a token without redirecting
-the workspace to PostgreSQL.
+D1’s raw query API has no cursor. For a large D1 query, use **Paged read**
+(**Shift+F5**) instead of ordinary Run. It accepts one read-only statement,
+checks its native `EXPLAIN` program, and requests one page plus a lookahead using
+an outer `LIMIT`/`OFFSET`. Ordinary Run sends authored SQL unchanged; its grid
+cap does not limit the remote result. The 50 MB response and 30-second operation
+limits still apply. Token-free workspace identities retain drafts after
+Remember-off use; reconnect prompts for a token without redirecting to PostgreSQL.
 
 
 ## Saved SQL functions
@@ -358,6 +370,8 @@ draft; connection forms retain field focus and selection across edits and connec
 | Keys | Action |
 |---|---|
 | Ctrl+Enter / F5 | Run native SQL |
+| Shift+F5 | Paged read of one statement (use for large D1 reads) |
+| Ctrl+Right / Ctrl+Left in a result grid | Fetch next / previous page |
 | Ctrl+K / F6 | Preview expanded SQL, execute nothing |
 | Ctrl+N | New query; new conversation when conversation tabs have focus |
 | Ctrl+O | Add PostgreSQL, Cloudflare D1 or local Parquet |

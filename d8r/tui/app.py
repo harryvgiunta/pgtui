@@ -10,6 +10,7 @@ import json
 from time import monotonic
 from collections.abc import Callable
 from copy import deepcopy
+from functools import partial
 from uuid import uuid4
 
 from rich.rule import Rule
@@ -205,6 +206,7 @@ class D8RApp(App):
         Binding("ctrl+j", "conversations", "Conversations", priority=True),
         Binding("ctrl+enter", "run_or_chat", "Run", priority=True),
         Binding("f5", "run", "Run", priority=True, show=False),
+        Binding("shift+f5", "run(True)", "Paged read", priority=True),
         Binding("ctrl+k", "compile", "SQL preview", priority=True),
         Binding("f6", "compile", "SQL preview", priority=True, show=False),
         Binding("ctrl+r", "preview_function", "Preview function", show=False),
@@ -298,6 +300,8 @@ class D8RApp(App):
                             )
                             yield Static("", id="source-version", markup=False)
                         with Horizontal(id="document-actions"):
+                            yield Button("Paged read", id="paged-read", compact=True,
+                                         tooltip=binding_tooltip(self.BINDINGS, "run(True)") + " · One bounded, read-only result page")
                             yield Button("New Query", id="query-new", compact=True,
                                          tooltip=binding_tooltip(self.BINDINGS, "new_query") + " · Keep the current draft")
                             yield Button("Ask AI", id="open-ai", compact=True)
@@ -334,6 +338,11 @@ class D8RApp(App):
                             yield TextArea("", read_only=True, soft_wrap=False, id="sql-text")
                         with TabPane("History", id="tab-history"):
                             yield DataTable(id="history-table", zebra_stripes=True, cursor_type="row")
+                    with Horizontal(id="result-pager"):
+                        yield Button("← Previous", compact=True, id="result-prev",
+                                     tooltip=binding_tooltip(ResultsTable.BINDINGS, "app.result_page(-1)", context="Result focused"))
+                        yield Button("Next →", compact=True, id="result-next",
+                                     tooltip=binding_tooltip(ResultsTable.BINDINGS, "app.result_page(1)", context="Result focused"))
                     with Vertical(id="function-output"):
                         yield Static("Function preview · Run preview saves the definition", classes="pane-title")
                         yield DataTable(id="fn-grid", zebra_stripes=True, cursor_type="cell")
@@ -1043,6 +1052,7 @@ class D8RApp(App):
         )
         self.query_one("#output-controls").display = self.query_one("#result-tabs").display
         self.query_one("#function-output").display = self.function_mode
+        self._sync_result_pager()
         output = self.function_mode or self.query_one("#result-tabs").display
         self.query_one("#output-slot").display = output
         self.query_one("#editor-splitter").display = output
@@ -1140,12 +1150,17 @@ class D8RApp(App):
                     return
         self.action_run()
 
-    def action_run(self) -> None:
+    @on(Button.Pressed, "#paged-read")
+    def _paged_read_clicked(self) -> None:
+        self.action_run(paged_read=True)
+
+    def action_run(self, paged_read: bool = False) -> None:
         """Capture this submission and reserve the session before dispatching it."""
         if self._modal_open() or self.ai_panel.has_focus_within:
             return
         if self.function_mode:
-            self.function_editor.action_preview()
+            if not paged_read:
+                self.function_editor.action_preview()
             return
         if self.refuse_busy("Run"):
             return
@@ -1154,37 +1169,42 @@ class D8RApp(App):
             target = self.session.source_key()
             self.reconnect_source(
                 self.session.active_id,
-                lambda source: self._run_after_connect(source, document, target),
+                lambda source: self._run_after_connect(source, document, target, paged_read),
             )
             return
-        self._start_run(document)
+        self._start_run(document, paged_read)
 
-    def _run_after_connect(self, source: DataSource | None, document: str, target: str) -> None:
+    def _run_after_connect(self, source: DataSource | None, document: str, target: str, paged_read: bool) -> None:
         if source is None:
             return
         self._source_added(source)
         if self.session.source_key() != target:
             self._set_status("Source changed while reconnecting; press Run to query the new target.")
             return
-        self._start_run(document)
+        self._start_run(document, paged_read)
 
-    def _start_run(self, document: str) -> None:
+    def _start_run(self, document: str, paged_read: bool) -> None:
         if self.refuse_busy("Run"):
             return
+        source = self.session.source
+        self._submit_query(partial(self.session.run_all, document, paged_read=paged_read),
+                           partial(self._publish_run, source), "running")
+
+    def _submit_query(self, work: Callable[[], list[RunOutcome]],
+                      publish: Callable[[list[RunOutcome]], None], label: str) -> None:
         self.palette.cancel_ai()
         self.palette.sync()
         self.run_busy = True
         self.session.busy = "Query running"
-        self._set_status(f"running · {self.session.active_id} · {self.session.dialect} · cached SQL completion remains available")
+        self._set_status(f"{label} · {self.session.active_id} · {self.session.dialect} · cached SQL completion remains available")
         self.run_worker(
-            self._run_document(document), name="Run document", group="query",
+            self._run_query(work, publish), name="Run query", group="query",
             exit_on_error=False,
         )
 
-    async def _run_document(self, document: str) -> None:
-        self._run_task = asyncio.create_task(asyncio.to_thread(self.session.run_all, document))
-        source = self.session.source
-        self._run_task.add_done_callback(lambda task: self._run_finished(task, source))
+    async def _run_query(self, work, publish) -> None:
+        self._run_task = asyncio.create_task(asyncio.to_thread(work))
+        self._run_task.add_done_callback(lambda task: self._run_finished(task, publish))
         try:
             # Textual cancels workers on exit, not database writes. Keep the
             # real task alive; its callback releases ownership without touching
@@ -1193,7 +1213,7 @@ class D8RApp(App):
         except Exception:
             pass  # _run_finished reports unexpected failures on the UI thread.
 
-    def _run_finished(self, task: asyncio.Task[list[RunOutcome]], source: DataSource) -> None:
+    def _run_finished(self, task: asyncio.Task[list[RunOutcome]], publish) -> None:
         self._run_task = None
         self.run_busy = False
         self.session.busy = ""
@@ -1205,6 +1225,11 @@ class D8RApp(App):
             message = self.session.execution_error(exc)
             outcomes = [RunOutcome(status=message, error=message)]
         if self._closing or not self.is_running:
+            return
+        publish(outcomes)
+
+    def _publish_run(self, source: DataSource, outcomes: list[RunOutcome]) -> None:
+        if self.session.source is not source:
             return
         outcome = outcomes[0]
         self._set_error(outcome.error)
@@ -1560,6 +1585,7 @@ class D8RApp(App):
         table = self.query_one("#results-table", ResultsTable)
         table.show_result(outcome)
         self.query_one("#results-status", Static).update(outcome.status)
+        self._sync_result_pager()
 
     # -- data tabs ------------------------------------------------------------
 
@@ -1585,7 +1611,7 @@ class D8RApp(App):
             id=tab_id,
         )
         tabs = self.query_one("#result-tabs", TabbedContent)
-        self._data_tabs[tab_id] = {"pinned": pinned, "source": self._workspace_key}
+        self._data_tabs[tab_id] = {"pinned": pinned, "source": self._workspace_key, "outcome": outcome}
         tabs.add_pane(pane, before="tab-sql")
         self.call_after_refresh(table.show_result, outcome)
         return tab_id
@@ -1619,6 +1645,62 @@ class D8RApp(App):
         pinned = tab is not None and tab["pinned"]
         pin.label = "Unpin" if pinned else "Pin"
         pin.tooltip = "Replace this result on the next run" if pinned else "Keep this result across runs"
+        self._sync_result_pager()
+
+    def _result_for_tab(self, tab_id: str) -> RunOutcome | None:
+        if tab_id == "tab-results":
+            return self._main_outcome
+        tab = self._data_tabs.get(tab_id)
+        if tab and not tab["pinned"] and tab["source"] == self._workspace_key:
+            return tab["outcome"]
+        return None
+
+    def _sync_result_pager(self) -> None:
+        tabs = self.query_one("#result-tabs", TabbedContent)
+        outcome = self._result_for_tab(tabs.active)
+        page = outcome.page if outcome else None
+        pager = self.query_one("#result-pager")
+        pager.display = bool(tabs.display and page and page.source is self.session.source)
+        if pager.display:
+            self.query_one("#result-prev", Button).disabled = not page.offset
+            self.query_one("#result-next", Button).disabled = not outcome.capped
+
+    @on(Button.Pressed, "#result-prev")
+    def _previous_result_page(self) -> None:
+        self.action_result_page(-1)
+
+    @on(Button.Pressed, "#result-next")
+    def _next_result_page(self) -> None:
+        self.action_result_page(1)
+
+    def action_result_page(self, direction: int) -> None:
+        tab_id = self.query_one("#result-tabs", TabbedContent).active
+        previous = self._result_for_tab(tab_id)
+        if (self._modal_open() or not previous or not previous.page or previous.page.source is not self.session.source
+                or (direction < 0 and not previous.page.offset) or (direction > 0 and not previous.capped)
+                or self.refuse_busy("Result page")):
+            return
+
+        def publish(outcomes: list[RunOutcome]) -> None:
+            # A closed/pinned/replaced tab must never receive a late page.
+            if self._result_for_tab(tab_id) is not previous or self.session.source is not previous.page.source:
+                self._set_status("Page discarded · result changed")
+                return
+            outcome = outcomes[0]
+            if outcome.error:
+                self._set_status(outcome.status)  # Keep the last good buffer and selection.
+                return
+            if tab_id == "tab-results":
+                self._render_results(outcome)
+            else:
+                tab = self.query_one("#result-tabs", TabbedContent).get_pane(tab_id)
+                self._data_tabs[tab_id]["outcome"] = outcome
+                tab.query_one(ResultsTable).show_result(outcome)
+                tab.query_one(".data-status", Static).update(outcome.status)
+                self._sync_result_pager()
+            self._set_status("Ready")
+
+        self._submit_query(lambda: [self.session.result_page(previous, direction)], publish, "loading page")
 
     @on(Button.Pressed, "#results-pin")
     def _toggle_result_pin(self) -> None:

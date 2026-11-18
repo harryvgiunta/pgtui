@@ -415,12 +415,11 @@ class DefaultRowsScreen(ModalScreen[None]):
         with VerticalScroll(id="rows-settings"):
             yield Static("Default rows returned")
             yield Static(
-                "Caps rows fetched for the results grid; SQL is never rewritten. "
-                "An authored LIMIT remains part of your query. Writes are not capped. "
-                "SQL preview only expands local functions and does not check server grammar. "
-                "AI sample reads keep their own limits.", markup=False,
+                "Page size for the results grid. Run preserves authored LIMIT and OFFSET; writes are not capped. "
+                "PostgreSQL uses a server cursor for eligible reads. Use Paged read for large D1 queries; "
+                "ordinary D1 Run can receive the full response. AI samples keep their own limits.", markup=False,
             )
-            yield Static("Whole number from 0 to 1,000,000; 0 uses the safe 10,000-row preview cap.")
+            yield Static("Whole number from 0 to 1,000,000; zero or values above 10,000 use the 10,000-row cap.")
             yield Input(str(self.ide.session.default_rows), type="integer", id="default-rows")
             yield Static("", id="rows-settings-error", markup=False)
             with Horizontal(id="rows-settings-buttons"):
@@ -439,7 +438,7 @@ class DefaultRowsScreen(ModalScreen[None]):
                 raise ValueError
         except ValueError:
             self.query_one("#rows-settings-error", Static).update(
-                "Enter a whole number from 0 to 1,000,000 (0 means no default limit)."
+                "Enter a whole number from 0 to 1,000,000 (0 uses the 10,000-row cap)."
             )
             field.focus()
             return

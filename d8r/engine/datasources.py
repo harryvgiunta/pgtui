@@ -83,7 +83,7 @@ _DUCK_ERROR_PATTERNS = tuple((re.compile(pattern), state) for pattern, state in 
 ))
 
 
-def _safe_error(exc: Exception, operation: str = "SQL execution") -> EngineError:
+def _safe_error(exc: Exception, operation: str = "SQL execution", *, position_offset: int = 0) -> EngineError:
     # Only real driver diagnostics qualify. Arbitrary exceptions are never read
     # or stringified; DuckDB has no SQLSTATE, so classify bounded known formats.
     import duckdb
@@ -94,8 +94,9 @@ def _safe_error(exc: Exception, operation: str = "SQL execution") -> EngineError
         valid_state = isinstance(state, str) and re.fullmatch(r"[0-9A-Z]{5}", state) is not None
         suffix = f" [SQLSTATE {state}]" if valid_state else ""
         position = exc.diag.statement_position
-        if isinstance(position, str) and re.fullmatch(r"[0-9]{1,10}", position) and 0 < int(position) <= 2147483647:
-            suffix += f" at character {int(position)}"
+        if (isinstance(position, str) and re.fullmatch(r"[0-9]{1,10}", position)
+                and position_offset < int(position) <= 2147483647):
+            suffix += f" at character {int(position) - position_offset}"
         if valid_state and state in _SQL_ERRORS:
             return EngineError(_sql_error_message(state, suffix), sqlstate=state)
         return EngineError(f"{operation} failed" + suffix, sqlstate=state if valid_state else "")

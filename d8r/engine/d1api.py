@@ -409,7 +409,7 @@ def _guard_readonly(con, sql, tokens, operation):
                 raise EngineError("Read-only D1 EXPLAIN rejected an unsafe function")
 
 
-def execute_d1(source, sql, statement, *, cap, readonly, timeout, prepare_only=False):
+def execute_d1(source, sql, statement, *, cap, readonly, timeout, prepare_only=False, offset=0):
     tokens = [token for token in lex_sql(statement, dialect="sqlite") if token.kind not in {"whitespace", "comment"}]
     words = [token.text.upper() for token in tokens if token.kind == "word"]
     first = words[0] if words else ""
@@ -434,9 +434,12 @@ def execute_d1(source, sql, statement, *, cap, readonly, timeout, prepare_only=F
                     return {}  # The guarded EXPLAIN already prepared the exact statement.
                 # The newline protects the closing wrapper from a trailing line comment.
                 native = f"SELECT * FROM (\n{statement}\n) AS _pgtui_read LIMIT {cap + 1}"
+                if offset:
+                    native += f" OFFSET {offset}"
             columns, rows, changes = con.raw(native, operation)
             total = min(len(rows), cap + 1) if columns else changes
             result = {"columns": columns, "dtypes": ["" for _ in columns], "rows": rows[:cap],
                       "total": total, "ms": (perf_counter() - started) * 1000, "sql": sql,
-                      "status": first or "OK", "schema_changed": not readonly and first in {"CREATE", "ALTER", "DROP", "REINDEX"}}
+                      "status": first or "OK", "pageable": readonly,
+                      "schema_changed": not readonly and first in {"CREATE", "ALTER", "DROP", "REINDEX"}}
         return result

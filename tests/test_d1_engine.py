@@ -202,6 +202,17 @@ def test_readonly_real_explain_and_bounded_outer_query(d1_source, d1_harness, sq
     assert queries[1].endswith("LIMIT 3")
 
 
+def test_paged_read_limits_the_remote_engine_not_just_the_grid(d1_source):
+    # SQLite raises integer overflow at row 4. The first FETCH of two rows
+    # plus one lookahead must finish without evaluating it.
+    sql = ("WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<300000000) "
+           "SELECT n, CASE WHEN n=4 THEN abs(-9223372036854775808) ELSE 0 END FROM seq")
+    first = execute_sql(d1_source, sql, readonly=True, max_rows=2)
+    assert first["rows"] == [[1, 0], [2, 0]] and first["total"] == 3
+    with pytest.raises(EngineError):
+        execute_sql(d1_source, sql, readonly=True, max_rows=2, offset=2)
+
+
 @pytest.mark.parametrize("sql", ["DELETE FROM records", "PRAGMA user_version=7", "VACUUM",
     "SELECT load_extension('secret')", 'SELECT "writefile"(\'secret\', label) FROM records',
     "SELECT * FROM pragma_writable_schema(1)", "SELECT 1; DROP TABLE records"])

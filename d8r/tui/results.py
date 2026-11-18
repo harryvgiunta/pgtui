@@ -32,6 +32,7 @@ class ResultSnapshot:
     rows: tuple[tuple[object, ...], ...]
     total: int
     selected: tuple[int, ...]
+    offset: int = 0
 
 
 class ResultsTable(DataTable):
@@ -52,6 +53,8 @@ class ResultsTable(DataTable):
     BINDINGS = [
         Binding("alt+left", "narrow_column", "Narrow column", show=False),
         Binding("alt+right", "widen_column", "Widen column", show=False),
+        Binding("ctrl+left", "app.result_page(-1)", "Previous page", show=False),
+        Binding("ctrl+right", "app.result_page(1)", "Next page", show=False),
         Binding("shift+left", "extend_selection(0,-1)", "Extend selection left", show=False),
         Binding("shift+right", "extend_selection(0,1)", "Extend selection right", show=False),
         Binding("shift+up", "extend_selection(-1,0)", "Extend selection up", show=False),
@@ -68,6 +71,7 @@ class ResultsTable(DataTable):
         self.raw_columns: tuple[str, ...] = ()
         self.raw_rows: tuple[tuple[object, ...], ...] = ()
         self.result_total = 0
+        self.page_offset = 0
         self.selected_rows: set[int] = set()
         self._cell_bounds: tuple[int, int, int, int] | None = None
         self._range_anchor: Coordinate | None = None
@@ -84,6 +88,7 @@ class ResultsTable(DataTable):
         self.raw_columns = tuple(outcome.columns) if not outcome.error else ()
         self.raw_rows = tuple(tuple(row) for row in outcome.rows) if self.raw_columns else ()
         self.result_total = outcome.total if self.raw_columns else 0
+        self.page_offset = outcome.page.offset if outcome.page else 0
         self._end_drag()
         self.action_clear_selection()
         if not self.raw_columns:
@@ -96,7 +101,7 @@ class ResultsTable(DataTable):
         for index, row in enumerate(self.raw_rows):
             self.add_row(*[
                 Text("NULL", style="dim") if value is None else Text(str(value)) for value in row
-            ], label=str(index + 1))
+            ], label=str(self.page_offset + index + 1))
         self.move_cursor(row=0, column=0)
 
     def _selection_caption(self) -> None:
@@ -106,6 +111,8 @@ class ResultsTable(DataTable):
         else:
             selected = f"{len(self.selected_rows):,} rows"
         extent = "more rows available" if self.result_total > len(self.raw_rows) else "all returned rows"
+        if self.page_offset and self.result_total <= len(self.raw_rows):
+            extent = "last page"
         self.border_subtitle = f"{selected} selected · {len(self.raw_rows):,} buffered · {extent}"
 
     def _selection_changed(self) -> None:
@@ -290,6 +297,7 @@ class ResultsTable(DataTable):
         snapshot = ResultSnapshot(
             self.raw_columns, deepcopy(self.raw_rows), self.result_total,
             tuple(self._selected_indices()[0]) if self.selected_rows or self._cell_bounds else (),
+            self.page_offset,
         )
         self.app.push_screen(ExportModal(snapshot))
 
@@ -382,6 +390,8 @@ class ExportModal(ModalScreen):
         snapshot = self.snapshot
         scope = self.query_one("#export-scope", Select).value
         extent = "More rows are available; their total was not counted." if snapshot.total > len(snapshot.rows) else "All returned rows are buffered."
+        if snapshot.offset:
+            extent = f"Current page only, at offset {snapshot.offset:,}."
         self.query_one("#export-summary", Static).update(
             f"Exporting {len(self._indices()):,} {scope} row(s), plus headers.\n"
             f"{len(snapshot.rows):,} buffered rows. {extent}\n"

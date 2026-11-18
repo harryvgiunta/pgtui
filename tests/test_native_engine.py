@@ -241,6 +241,74 @@ def test_postgres_native_dml_ddl_and_server_function(postgres_source):
     assert execute_sql(source, "SELECT pg_temp.double_it(4)")["rows"] == [[8]]
 
 
+def test_postgres_run_does_not_evaluate_the_unfetched_tail(postgres_source):
+    from d8r.tui.session import Session
+
+    session = Session({postgres_source.id: postgres_source})
+    # A ProjectSet can produce 300M rows lazily. A client-side fetchmany still
+    # executes row 52 (and fails); a server fetch of 50 + 1 cannot reach it.
+    sql = "SELECT n, 1 / (52 - n) FROM (SELECT generate_series(1, 300000000) AS n) s"
+    first = session.run(sql)
+    assert first.ok, first.error
+    assert [row[0] for row in first.rows] == list(range(1, 51))
+    assert first.total == 51 and first.sql == sql
+    assert not transaction_open(postgres_source)
+    failed = session.result_page(first, 1)
+    assert "SQLSTATE 22012" in failed.error  # Row 52 is demanded only on Next.
+    assert not transaction_open(postgres_source)
+    assert [entry.doc for entry in session.history] == [sql]
+    assert session.run("SELECT 42").rows == [[42]]
+
+
+def test_postgres_pages_respect_authored_window(postgres_source):
+    from d8r.tui.session import Session
+
+    session = Session({postgres_source.id: postgres_source})
+    session.update_settings(default_rows=2)
+    sql = "SELECT generate_series(1, 8) AS n ORDER BY n LIMIT 5 OFFSET 1"
+    first = session.run(sql)
+    assert first.rows == [[2], [3]] and first.capped
+    session.update_settings(default_rows=50)  # Existing results keep their page size.
+    middle = session.result_page(first, 1)
+    last = session.result_page(middle, 1)
+    assert middle.rows == [[4], [5]] and middle.capped
+    assert last.rows == [[6]] and not last.capped
+    assert session.result_page(last, -1).rows == middle.rows
+    with pytest.raises(EngineError, match="No page"):
+        session.result_page(last, 1)
+    assert not transaction_open(postgres_source)
+    assert [entry.doc for entry in session.history] == [sql]
+
+
+def test_postgres_capped_writes_and_volatile_calls_complete_once(postgres_source):
+    source = postgres_source
+    execute_sql(source, "CREATE TEMP TABLE changes(n int)")
+    changed = execute_sql(source, "WITH added AS (INSERT INTO changes SELECT generate_series(1, 5) RETURNING n) "
+                          "SELECT * FROM added", max_rows=1)
+    assert not changed["pageable"] and len(changed["rows"]) == 1
+    assert execute_sql(source, "SELECT count(*) FROM changes")["rows"] == [[5]]
+    execute_sql(source, "CREATE FUNCTION pg_temp.log_row(i int) RETURNS int LANGUAGE SQL VOLATILE "
+                "AS $$ INSERT INTO changes VALUES (i) RETURNING n $$")
+    logged = execute_sql(source, 'SELECT pg_temp."log_row"(i) FROM generate_series(1, 5) s(i)', max_rows=1)
+    assert not logged["pageable"] and logged["rows"] == [[1]]
+    assert execute_sql(source, "SELECT count(*) FROM changes")["rows"] == [[10]]
+
+
+def test_postgres_preview_does_not_own_user_transaction(postgres_source):
+    source = postgres_source
+    execute_sql(source, "BEGIN")
+    result = execute_sql(source, "SELECT generate_series(1, 5)", max_rows=2)
+    assert result["rows"] == [[1], [2]] and not result["pageable"]
+    assert source.con.execute("SELECT count(*) FROM pg_catalog.pg_cursors").fetchone() == (0,)
+    with pytest.raises(EngineError, match="SQLSTATE 42703.*at character 8"):
+        execute_sql(source, "SELECT nonexistent_column")
+    # The server error aborted the user's transaction, not an internal savepoint.
+    with pytest.raises(EngineError, match="SQLSTATE 25P02"):
+        execute_sql(source, "SELECT 1")
+    execute_sql(source, "ROLLBACK")
+    assert not transaction_open(source)
+
+
 def test_postgres_catalog_metadata_and_composite_fk(postgres_source):
     source = postgres_source
     execute_sql(source, "CREATE TEMP TABLE native_parent(a INTEGER, b INTEGER, PRIMARY KEY (a,b))")
