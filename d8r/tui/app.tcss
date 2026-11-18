@@ -540,6 +540,12 @@ CommandPalette.open {
     padding: 0 1;
 }
 
+#result-page-number {
+    width: auto;
+    height: 1;
+    margin-right: 1;
+}
+
 #result-pager Button {
     width: auto;
     min-width: 0;

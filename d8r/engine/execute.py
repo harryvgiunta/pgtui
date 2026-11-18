@@ -1,4 +1,4 @@
-"""Bounded native execution; ordinary Run never translates or adds SQL LIMIT."""
+"""Bounded native execution, guarded result pages and explicit native runs."""
 from __future__ import annotations
 
 import json
@@ -42,6 +42,18 @@ def _read_functions(tokens):
                 raise EngineError("Read-only tools cannot call file, network, session-control or mutation functions")
             names.add(name)
     return names
+
+
+def _page_read_by_default(words):
+    # Routing only, not a read-only proof. The chosen read still goes through
+    # the engine guard; a rejected read is never retried as native SQL.
+    if not words or words[0] not in _QUERY_WORDS:
+        return False
+    if "INTO" in words or (words[0] == "WITH" and {"INSERT", "DELETE", "UPDATE", "MERGE"}.intersection(words)):
+        return False  # SELECT INTO or a modifying CTE/terminal DML.
+    locks = (["UPDATE"], ["NO", "KEY", "UPDATE"], ["SHARE"], ["KEY", "SHARE"])
+    return not any(words[i + 1:i + 1 + len(clause)] == clause
+                   for i, word in enumerate(words) if word == "FOR" for clause in locks)
 
 
 def _pg_previewable(con, words, tokens):
@@ -135,7 +147,8 @@ def _duck_result(con, sql, cap, statement_type, offset):
     return [], [], [], 0, statement_type
 
 
-def execute_sql(source: DataSource, sql: str, *, max_rows=10000, readonly=False, timeout=30.0, offset=0) -> dict:
+def execute_sql(source: DataSource, sql: str, *, max_rows=10000, readonly=False, timeout=30.0,
+                offset=0, page_reads=False) -> dict:
     """Execute one statement with a visible ``max_rows + 1`` lower-bound count.
 
     ``total`` is an exact count only when the result was exhausted; when rows are
@@ -145,17 +158,20 @@ def execute_sql(source: DataSource, sql: str, *, max_rows=10000, readonly=False,
     An offset requests a fresh read-only page; totals are relative to that page.
     Eligible manual PostgreSQL reads use a short-lived server cursor, without
     retaining an open transaction between pages or rewriting the query.
+    ``page_reads`` selects guarded paging for reads while preserving native
+    writes and caller-owned transactions. ``readonly`` always requires a read.
 
     Read-only PostgreSQL transactions are database protection, not a sandbox for
     privileged server extensions or arbitrary side effects of installed functions.
     DuckDB permits only native SELECT statements for read-only execution and has
     permanently locked external access limited to the original local Parquet file.
     D1 buffers a bounded (50 MB) HTTP response, which can exceed the visible cap;
-    ordinary SQL is unchanged. D1 read tools inspect remote EXPLAIN opcodes and
+    native SQL is unchanged. Paged D1 reads inspect remote EXPLAIN opcodes and
     then use an outer LIMIT, not a connection-local read-only transaction. This
     does not bound scan cost. Cancellation/deadlines cannot roll back remote work.
     """
-    return _execute_statement(source, sql, max_rows=max_rows, readonly=readonly, timeout=timeout, offset=offset)
+    return _execute_statement(source, sql, max_rows=max_rows, readonly=readonly, timeout=timeout,
+                              offset=offset, page_reads=page_reads)
 
 
 def prepare_sql(source: DataSource, sql: str, *, timeout=30.0) -> None:
@@ -174,7 +190,8 @@ def explain_sql(source: DataSource, sql: str, *, timeout=30.0) -> dict:
     return _execute_statement(source, sql, max_rows=1, readonly=True, timeout=timeout, explain=True)
 
 
-def _execute_statement(source, sql, *, max_rows, readonly, timeout, explain=False, prepare_only=False, offset=0):
+def _execute_statement(source, sql, *, max_rows, readonly, timeout, explain=False, prepare_only=False,
+                       offset=0, page_reads=False):
     cap = _row_limit(max_rows)
     if type(offset) is not int or not 0 <= offset <= 2**63 - 1 or (offset and not readonly):
         raise EngineError("Page offset must be a nonnegative integer and is only supported for read-only queries")
@@ -196,6 +213,7 @@ def _execute_statement(source, sql, *, max_rows, readonly, timeout, explain=Fals
         raise EngineError("Execute exactly one SQL statement at a time")
     if source.kind == "d1-live":
         from .d1api import execute_d1
+        readonly = readonly or (page_reads and _page_read_by_default(words))
         return execute_d1(source, sql, statements[0], cap=cap, readonly=readonly, timeout=timeout,
                           prepare_only=prepare_only, offset=offset)
     first = words[0] if words else ""
@@ -205,6 +223,8 @@ def _execute_statement(source, sql, *, max_rows, readonly, timeout, explain=Fals
         user_transaction = transaction_open(source)
         if readonly and user_transaction:
             raise EngineError("Read-only tools cannot run inside your open transaction")
+        if page_reads and not user_transaction and source.kind == "postgres-live":
+            readonly = readonly or _page_read_by_default(words)
         started = perf_counter()
         expired = threading.Event()
         def interrupt():
@@ -223,6 +243,8 @@ def _execute_statement(source, sql, *, max_rows, readonly, timeout, explain=Fals
                 statement_type = statements_native[0].type.name
                 if statement_type in _DUCK_EXTERNAL or first in _DUCK_EXTERNAL:
                     raise EngineError("External writes, attachments, extensions and prepared execution are disabled for Parquet sources")
+                if page_reads and not user_transaction and statement_type == "SELECT":
+                    readonly = True
                 if readonly and statement_type != "SELECT":
                     raise EngineError("Read-only tools accept a single SELECT query only")
             elif readonly and (first not in _QUERY_WORDS or any(word in _WRITE_WORDS for word in words)):

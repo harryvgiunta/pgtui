@@ -201,6 +201,34 @@ def test_d1_trigger_document_splits_and_executes_native_statements(d1_source):
     assert session.history[-2].doc.upper().startswith("CREATE TRIGGER")
 
 
+def test_default_batch_pages_each_read_without_replaying_writes(d1_source):
+    session = Session({d1_source.id: d1_source})
+    session.update_settings(default_rows=1)
+    first, write, second = session.run_all(
+        "SELECT id FROM records ORDER BY id; "
+        "WITH picked AS (SELECT id FROM records WHERE id=2) "
+        "UPDATE records SET label=label||'!' WHERE id IN (SELECT id FROM picked) RETURNING id; "
+        "WITH picked AS (SELECT label FROM records ORDER BY id) SELECT label FROM picked")
+    assert write.ok and write.rows == [[2]] and write.page is None
+    assert session.result_page(first, 1).rows == [[2]]
+    assert session.result_page(second, 1).rows == [["beta!"]]
+    assert len(session.history) == 3
+
+
+def test_default_read_never_falls_back_to_a_full_response(d1_source):
+    session = Session({d1_source.id: d1_source})
+    # The D1 harness's native SQLite engine raises on row 52. Fetching all
+    # rows and then truncating the grid would fail before returning page one.
+    sql = ("WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<300000000) "
+           "SELECT n, CASE WHEN n=52 THEN abs(-9223372036854775808) ELSE 0 END FROM seq")
+    first = session.run(sql)
+    assert first.rows == [[n, 0] for n in range(1, 51)] and first.capped
+    assert session.result_page(first, 1).error
+    # Raw native execution must require an explicit choice.
+    assert session.run_all(sql, paged_read=False)[0].error
+    assert [entry.doc for entry in session.history] == [sql]
+
+
 def test_d1_successful_write_survives_schema_refresh_failure(d1_source, monkeypatch):
     session = Session({d1_source.id: d1_source})
 

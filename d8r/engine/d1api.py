@@ -1,10 +1,10 @@
 """Native Cloudflare D1 REST client; never a local SQLite connection.
 
 Cloudflare documents /raw as positional columns/rows (including duplicate names).
-Normal Run sends authored SQL unchanged: its preview cap does not cap the remote
-response. HTTP bodies are bounded separately at 50 MB. Read tools prepare EXPLAIN
-before a bounded outer SELECT; this does not bound scan cost or provide a session
-transaction. Cancellation/deadlines discard late results, not remote effects.
+Native runs send authored SQL unchanged and can receive the full response (up to
+50 MB). Paged reads prepare EXPLAIN before a bounded outer SELECT; this does
+not bound scan cost or provide a session transaction. Cancellation/deadlines
+discard late results, not remote effects.
 """
 from __future__ import annotations
 

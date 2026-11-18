@@ -90,16 +90,20 @@ inside strings, comments, dollar-quoted routine bodies, SQL-standard `BEGIN ATOM
 bodies and SQLite trigger bodies are not document boundaries. SQLite bracket and
 backtick identifiers retain their native meaning.
 
-**Default rows** is the result page size: 50 initially, at most 10,000 (zero uses
-10,000). Run does not append `LIMIT` to your SQL or issue `COUNT(*)`. For ordinary
-PostgreSQL reads it opens a forward-only server cursor, fetches one page plus one
-row to detect **Next**, then closes the cursor. It does not leave a transaction
-open between pages. Writes (including modifying CTEs and `RETURNING`), locking
-reads and direct calls to volatile routines retain native execution and can buffer
-more in the driver. Reads inside your own transaction do not offer page navigation.
+**Run SQL** (**Ctrl+Enter** or **F5**) pages reads by default on PostgreSQL,
+DuckDB and D1, including reads in a multi-statement script. **Default rows**
+is the page size: 50 initially, at most 10,000 (zero uses 10,000). The editor
+and history retain your SQL. No `COUNT(*)` is added. PostgreSQL fetches one page
+plus one lookahead row through a forward-only cursor, then closes it.
+Writes (including modifying CTEs and `RETURNING`) and locking statements run
+once, natively. Reads inside your own transaction stay in that transaction and
+do not offer navigation. **Shift+F5** requires one read-only statement. Use
+**Ctrl+Shift+F5** for an explicit native run, e.g. for a side-effecting function;
+a rejected paged read is never automatically retried as a native command.
 
-Use **Next / Previous** below an unpinned result, or **Ctrl+Right / Ctrl+Left**
-with the grid focused. Each click re-reads only that statement, read-only, at the
+The pager below each unpinned read result shows **Previous · Page N · Next**.
+Click a button or press **Ctrl+Left / Ctrl+Right** with the grid focused. Each
+page request re-reads only that statement, read-only, at the
 requested position; it does not rerun the script, modify the editor or add history.
 Authored `LIMIT` and `OFFSET` still apply. Pages are separate reads, not a frozen
 snapshot: use a unique `ORDER BY` for repeatable order; concurrent changes can
@@ -128,12 +132,11 @@ available. Each statement is a separate request. Timeout/cancellation can discar
 the response but cannot guarantee remote rollback; writes are never retried
 automatically. Check the database before manually retrying an uncertain write.
 
-D1’s raw query API has no cursor. For a large D1 query, use **Paged read**
-(**Shift+F5**) instead of ordinary Run. It accepts one read-only statement,
-checks its native `EXPLAIN` program, and requests one page plus a lookahead using
-an outer `LIMIT`/`OFFSET`. Ordinary Run sends authored SQL unchanged; its grid
-cap does not limit the remote result. The 50 MB response and 30-second operation
-limits still apply. Token-free workspace identities retain drafts after
+D1’s raw query API has no cursor. Run checks each read's native `EXPLAIN`
+program and requests one bounded page using an outer `LIMIT`/`OFFSET`. Only an
+explicit native run bypasses paging for a regular `SELECT`; the raw API may
+then return the full result. The 50 MB response and 30-second operation limits
+still apply. Token-free workspace identities retain drafts after
 Remember-off use; reconnect prompts for a token without redirecting to PostgreSQL.
 
 
@@ -369,8 +372,9 @@ draft; connection forms retain field focus and selection across edits and connec
 
 | Keys | Action |
 |---|---|
-| Ctrl+Enter / F5 | Run native SQL |
-| Shift+F5 | Paged read of one statement (use for large D1 reads) |
+| Ctrl+Enter / F5 | Run SQL; reads are paged by default |
+| Shift+F5 | Run one guarded read-only statement |
+| Ctrl+Shift+F5 | Explicit native execution instead of guarded paging |
 | Ctrl+Right / Ctrl+Left in a result grid | Fetch next / previous page |
 | Ctrl+K / F6 | Preview expanded SQL, execute nothing |
 | Ctrl+N | New query; new conversation when conversation tabs have focus |

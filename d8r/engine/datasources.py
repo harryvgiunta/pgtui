@@ -59,7 +59,7 @@ _SQL_ERRORS = {
     "22003": ("Numeric value out of range", "Check numeric values and arithmetic against the range of the target type."),
     "22012": ("Division by zero", "Check the divisor; use NULLIF with zero if a NULL result is intended."),
     "42501": ("Permission denied", "Check privileges for the requested operation."),
-    "25006": ("Read-only execution rejected a write", "Use ordinary Run only if the write is intended."),
+    "25006": ("Read-only execution rejected a write", "Choose Run native SQL only if the write is intended."),
     "57014": ("Query cancelled or deadline exceeded", ""),
     "25P02": ("Transaction is aborted; issue ROLLBACK", ""),
     "23505": ("Unique constraint violation", "Check for duplicate values in a unique or primary key."),

@@ -164,17 +164,19 @@ async def test_paged_d1_read_navigates_grid_not_editor(d1_source, d1_harness):
     async with app.run_test(size=(120, 45)) as pilot:
         sql = "SELECT id FROM records ORDER BY id LIMIT 2 OFFSET 1"
         app.editor.load_text(sql)
-        await pilot.press("shift+f5")
+        await pilot.press("ctrl+enter")
         await app.workers.wait_for_complete()
         await pilot.pause()
         grid = app.query_one("#results-table", ResultsTable)
         assert grid.raw_rows == ((2,),) and app.query_one("#result-prev", Button).disabled
+        assert str(app.query_one("#result-page-number", Static).content) == "Page 1"
         app.editor.load_text("DELETE FROM records")
         await pilot.click("#result-next")
         await app.workers.wait_for_complete()
         await pilot.pause()
         assert grid.raw_rows == ((3,),) and grid.page_offset == 1
         assert app.query_one("#result-next", Button).disabled
+        assert str(app.query_one("#result-page-number", Static).content) == "Page 2"
         grid.action_export()
         assert isinstance(app.screen, ExportModal) and app.screen.snapshot.rows == ((3,),)
         await pilot.press("escape")
@@ -185,6 +187,22 @@ async def test_paged_d1_read_navigates_grid_not_editor(d1_source, d1_harness):
         assert grid.raw_rows == ((2,),) and grid.page_offset == 0
         assert [entry.doc for entry in session.history] == [sql]
         assert app.editor.text == "DELETE FROM records"
+        assert d1_harness.connection.execute("SELECT count(*) FROM records").fetchone() == (3,)
+
+        # The same pager remains visible, with both boundaries disabled, for a
+        # result that fits. A stale Next must not fetch another page or script.
+        app.editor.load_text("SELECT id FROM records WHERE id=1")
+        await pilot.click("#run-query")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert grid.raw_rows == ((1,),) and app.query_one("#result-pager").display
+        assert app.query_one("#result-prev", Button).disabled and app.query_one("#result-next", Button).disabled
+
+        # The existing read-only shortcut stays read-only, even for a write.
+        app.editor.load_text("DELETE FROM records")
+        await pilot.press("shift+f5")
+        await app.workers.wait_for_complete()
+        assert app._main_outcome.error and not app.query_one("#result-pager").display
         assert d1_harness.connection.execute("SELECT count(*) FROM records").fetchone() == (3,)
 
 

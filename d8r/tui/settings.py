@@ -416,8 +416,8 @@ class DefaultRowsScreen(ModalScreen[None]):
             yield Static("Default rows returned")
             yield Static(
                 "Page size for the results grid. Run preserves authored LIMIT and OFFSET; writes are not capped. "
-                "PostgreSQL uses a server cursor for eligible reads. Use Paged read for large D1 queries; "
-                "ordinary D1 Run can receive the full response. AI samples keep their own limits.", markup=False,
+                "Run pages reads by default on every source. Use Previous and Next below the grid. "
+                "Deep offsets and sorts may still be expensive. AI samples keep their own limits.", markup=False,
             )
             yield Static("Whole number from 0 to 1,000,000; zero or values above 10,000 use the 10,000-row cap.")
             yield Input(str(self.ide.session.default_rows), type="integer", id="default-rows")

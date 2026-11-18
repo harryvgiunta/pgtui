@@ -1135,12 +1135,15 @@ class Session:
         """Execute the document and return its first outcome; use run_all for all."""
         return self.run_all(doc, record=record)[0]
 
-    def run_all(self, doc: str, record: bool = True, *, paged_read: bool = False) -> list[RunOutcome]:
+    def run_all(self, doc: str, record: bool = True, *, paged_read: bool | None = None) -> list[RunOutcome]:
         """Execute native statements in order, stopping at the first server error.
 
         Lexical/expansion errors prevent all execution. Native SQL transaction
         boundaries are exactly those authored; successful earlier statements are
         not silently rolled back when a later statement fails.
+
+        By default each read is paged and writes run once. True requires a
+        single guarded read; False explicitly requests driver-native execution.
         """
         document = self.parse(doc)
         if document.errors:
@@ -1159,7 +1162,8 @@ class Session:
         authored = split_statements(doc, dialect=self.source.dialect)
         outcomes = []
         for sql, text in zip(document.statements, authored):
-            outcome = self._run_statement(sql, text, record=record, readonly=paged_read)
+            outcome = self._run_statement(sql, text, record=record, readonly=paged_read is True,
+                                          page_reads=paged_read is None)
             outcomes.append(outcome)
             if outcome.error:
                 break
@@ -1176,12 +1180,12 @@ class Session:
                                    readonly=True, size=page.size, offset=page.offset + direction * page.size)
 
     def _run_statement(self, sql: str, doc: str, *, record: bool,
-                       source: DataSource | None = None, readonly=False, size=None, offset=0) -> RunOutcome:
+                       source: DataSource | None = None, readonly=False, page_reads=True, size=None, offset=0) -> RunOutcome:
         source = self.source if source is None else source
         if size is None:
             size = min(self.default_rows or PREVIEW_ROW_CAP, PREVIEW_ROW_CAP)
         try:
-            result = execute_sql(source, sql, max_rows=size, readonly=readonly, offset=offset)
+            result = execute_sql(source, sql, max_rows=size, readonly=readonly, offset=offset, page_reads=page_reads)
         except Exception as exc:
             message = self.execution_error(exc)
             if not self.source_connected(source.id) and source is self.source:
@@ -1209,10 +1213,8 @@ class Session:
             columns=result["columns"], dtypes=result["dtypes"], rows=result["rows"],
             total=result["total"], ms=result["ms"], sql=result["sql"],
             schema_changed=result["schema_changed"], doc=doc,
-            page=ResultPage(source, size, offset) if result["pageable"] else None,
+            page=ResultPage(source, size, offset) if result["pageable"] and (readonly or page_reads) else None,
         )
-        if not offset and not outcome.capped:
-            outcome.page = None
         outcome.status = " · ".join(part for part in (
             result["status"], self._status_for(outcome), schema_warning,
         ) if part)
@@ -1227,7 +1229,7 @@ class Session:
     @staticmethod
     def _status_for(outcome: RunOutcome) -> str:
         extent = f"{len(outcome.rows)} rows"
-        if outcome.page is not None:
+        if outcome.page is not None and (outcome.page.offset or outcome.capped):
             start = outcome.page.offset
             extent = f"rows {start + 1:,}–{start + len(outcome.rows):,}" if outcome.rows else f"no rows at offset {start:,}"
         status = f"{extent} · {outcome.ms:.1f} ms · {outcome.source} · {outcome.dialect}"

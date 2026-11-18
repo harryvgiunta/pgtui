@@ -206,7 +206,8 @@ class D8RApp(App):
         Binding("ctrl+j", "conversations", "Conversations", priority=True),
         Binding("ctrl+enter", "run_or_chat", "Run", priority=True),
         Binding("f5", "run", "Run", priority=True, show=False),
-        Binding("shift+f5", "run(True)", "Paged read", priority=True),
+        Binding("shift+f5", "run(True)", "Read-only page", priority=True),
+        Binding("ctrl+shift+f5", "run(False)", "Run native SQL", priority=True),
         Binding("ctrl+k", "compile", "SQL preview", priority=True),
         Binding("f6", "compile", "SQL preview", priority=True, show=False),
         Binding("ctrl+r", "preview_function", "Preview function", show=False),
@@ -300,8 +301,8 @@ class D8RApp(App):
                             )
                             yield Static("", id="source-version", markup=False)
                         with Horizontal(id="document-actions"):
-                            yield Button("Paged read", id="paged-read", compact=True,
-                                         tooltip=binding_tooltip(self.BINDINGS, "run(True)") + " · One bounded, read-only result page")
+                            yield Button("Run SQL", id="run-query", compact=True,
+                                         tooltip=binding_tooltip(self.BINDINGS, "run") + " · Page reads; execute writes once")
                             yield Button("New Query", id="query-new", compact=True,
                                          tooltip=binding_tooltip(self.BINDINGS, "new_query") + " · Keep the current draft")
                             yield Button("Ask AI", id="open-ai", compact=True)
@@ -341,6 +342,7 @@ class D8RApp(App):
                     with Horizontal(id="result-pager"):
                         yield Button("← Previous", compact=True, id="result-prev",
                                      tooltip=binding_tooltip(ResultsTable.BINDINGS, "app.result_page(-1)", context="Result focused"))
+                        yield Static("", id="result-page-number", markup=False)
                         yield Button("Next →", compact=True, id="result-next",
                                      tooltip=binding_tooltip(ResultsTable.BINDINGS, "app.result_page(1)", context="Result focused"))
                     with Vertical(id="function-output"):
@@ -1150,16 +1152,16 @@ class D8RApp(App):
                     return
         self.action_run()
 
-    @on(Button.Pressed, "#paged-read")
-    def _paged_read_clicked(self) -> None:
-        self.action_run(paged_read=True)
+    @on(Button.Pressed, "#run-query")
+    def _run_query_clicked(self) -> None:
+        self.action_run()
 
-    def action_run(self, paged_read: bool = False) -> None:
+    def action_run(self, paged_read: bool | None = None) -> None:
         """Capture this submission and reserve the session before dispatching it."""
         if self._modal_open() or self.ai_panel.has_focus_within:
             return
         if self.function_mode:
-            if not paged_read:
+            if paged_read is None:
                 self.function_editor.action_preview()
             return
         if self.refuse_busy("Run"):
@@ -1174,7 +1176,7 @@ class D8RApp(App):
             return
         self._start_run(document, paged_read)
 
-    def _run_after_connect(self, source: DataSource | None, document: str, target: str, paged_read: bool) -> None:
+    def _run_after_connect(self, source: DataSource | None, document: str, target: str, paged_read: bool | None) -> None:
         if source is None:
             return
         self._source_added(source)
@@ -1183,7 +1185,7 @@ class D8RApp(App):
             return
         self._start_run(document, paged_read)
 
-    def _start_run(self, document: str, paged_read: bool) -> None:
+    def _start_run(self, document: str, paged_read: bool | None) -> None:
         if self.refuse_busy("Run"):
             return
         source = self.session.source
@@ -1662,6 +1664,7 @@ class D8RApp(App):
         pager = self.query_one("#result-pager")
         pager.display = bool(tabs.display and page and page.source is self.session.source)
         if pager.display:
+            self.query_one("#result-page-number", Static).update(f"Page {page.offset // page.size + 1:,}")
             self.query_one("#result-prev", Button).disabled = not page.offset
             self.query_one("#result-next", Button).disabled = not outcome.capped
 
