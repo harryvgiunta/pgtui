@@ -12,6 +12,7 @@ from textual.widgets import Button, Checkbox, Input, Select, Static, TextArea
 
 from d8r.dbt import DbtError, DbtProject
 from d8r.sql import SqlError
+from .editing import DraftTextArea
 
 if TYPE_CHECKING:
     from .app import D8RApp
@@ -70,9 +71,9 @@ class DBTScreen(ModalScreen[None]):
                 yield Select([(name, name) for name in ("view", "table", "incremental", "ephemeral")],
                              value="view", allow_blank=False, id="dbt-materialized")
                 yield Static("Description")
-                yield TextArea("", id="dbt-description")
+                yield DraftTextArea("", id="dbt-description")
                 yield Static("Native SQL · review/edit before Apply or Export")
-                yield TextArea(self.target.document, id="dbt-sql", show_line_numbers=True)
+                yield DraftTextArea(self.target.document, id="dbt-sql", show_line_numbers=True)
                 yield Button("Use expanded editor SQL", id="dbt-editor")
                 yield Checkbox("I consent to replacing existing model SQL and updating its YAML metadata", id="dbt-overwrite")
                 yield Static("Export preserves unrelated YAML values, but YAML formatting/comments may change. "

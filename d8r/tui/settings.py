@@ -28,6 +28,7 @@ from d8r.themes import THEMES, theme_label
 
 from .add_source import AddSourceModal
 from .dbt import DBTScreen
+from .editing import DraftTextArea
 from .palette import prompt
 
 if TYPE_CHECKING:
@@ -568,7 +569,7 @@ class AIProviderScreen(ModalScreen[None]):
             yield Static("API key (token only; leave blank for header-only or unauthenticated providers)")
             yield Input(config.api_key, password=True, id="ai-api-key")
             yield Static("Request headers · one Name: value per line")
-            yield TextArea(config.headers, soft_wrap=True, tab_behavior="focus", id="ai-headers")
+            yield DraftTextArea(config.headers, soft_wrap=True, tab_behavior="focus", id="ai-headers")
             yield Checkbox("Remember API key and headers in system keyring", value=self.ide.session.ai_remember_key,
                            id="ai-remember-credentials")
             yield Static(self.ide.session.credential_warning, markup=False)

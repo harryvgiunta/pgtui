@@ -186,6 +186,7 @@ def test_unsupported_session_semantics_before_http(d1_source, d1_harness, sql):
     ("SELECT id FROM records UNION SELECT id FROM records ORDER BY id", [[1], [2]]),
     ("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<5) SELECT x FROM n", [[1], [2]]),
     ("WITH a AS MATERIALIZED (SELECT id FROM records) SELECT * FROM a ORDER BY id", [[1], [2]]),
+    ("WITH base AS (SELECT id FROM records), [http_requests](n) AS (SELECT id FROM base) SELECT n FROM http_requests ORDER BY n", [[1], [2]]),
     ("VALUES (1), (2), (3)", [[1], [2]]),
     ("SELECT id FROM records ORDER BY id; -- trailing comment", [[1], [2]]),
 ])
@@ -215,6 +216,7 @@ def test_paged_read_limits_the_remote_engine_not_just_the_grid(d1_source):
 
 @pytest.mark.parametrize("sql", ["DELETE FROM records", "PRAGMA user_version=7", "VACUUM",
     "SELECT load_extension('secret')", 'SELECT "writefile"(\'secret\', label) FROM records',
+    "WITH load_extension(x) AS (VALUES (1)) SELECT load_extension('secret') FROM load_extension",
     "SELECT * FROM pragma_writable_schema(1)", "SELECT 1; DROP TABLE records"])
 def test_readonly_unsafe_statements_never_execute(d1_source, d1_harness, sql):
     d1_harness.requests.clear()

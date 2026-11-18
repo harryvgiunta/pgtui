@@ -29,6 +29,7 @@ from d8r.ai.context import AIContext, AIProposal, AIQuestion
 from d8r.ai.diagnostics import AIDiagnostics
 from d8r.credentials import CredentialError
 from d8r.sql import FnDef
+from .editing import DraftTextArea
 
 
 MAX_QUERY_REPAIRS = 2  # Additional SQL drafts, independent of transport retries.
@@ -96,7 +97,7 @@ class ChatStatus(Static):
         return Content(str(self.content), spans)
 
 
-class ComposerArea(TextArea):
+class ComposerArea(DraftTextArea):
     """Enter sends; Shift+Enter inserts a newline without stealing button keys."""
 
     class Submitted(Message):
@@ -1471,7 +1472,6 @@ class AIPanel(Vertical):
         if chat is None:
             self.query_one("#ai-title", Static).update("AI assistant · New chat")
             self.query_one("#ai-transcript", Static).update("")
-            self.query_one("#ai-conversation").display = False
             status_view.set_status("Send a message or choose New chat to start a conversation.")
             self.query_one("#ai-send", Button).disabled = self.manager.closing
             self.query_one("#ai-cancel", Button).disabled = True
@@ -1498,7 +1498,6 @@ class AIPanel(Vertical):
         if chat.worker is not None and chat.partial:
             text += f"Assistant: {chat.partial}"
         transcript = self.query_one("#ai-transcript", Static)
-        self.query_one("#ai-conversation").display = bool(text)
         if str(transcript.content) != text:
             transcript.update(text)
             self.query_one("#ai-conversation", VerticalScroll).scroll_end(animate=False)

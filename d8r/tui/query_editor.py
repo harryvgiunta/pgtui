@@ -12,11 +12,11 @@ from rich.style import Style
 from rich.text import Text
 from textual import events
 from textual.reactive import reactive
-from textual.widgets import TextArea
 
 from d8r.sql import SqlError, lex_sql
 
 from d8r.completion.catalog import KEYWORDS
+from .editing import DraftTextArea
 
 _TOKENS = re.compile(
     r"(?P<comment>--[^\n]*|/\*[\s\S]*?(?:\*/|\Z))"
@@ -43,7 +43,7 @@ _KEYWORDS = frozenset(word.lower() for word in KEYWORDS)
 _CALL_TAIL = re.compile(r"\s*\(")
 
 
-class QueryTextArea(TextArea):
+class QueryTextArea(DraftTextArea):
     """SQL editor; caret, selection, wrapping and undo remain TextArea's."""
 
     dialect = reactive("postgres")

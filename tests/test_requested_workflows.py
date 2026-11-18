@@ -25,6 +25,22 @@ async def load_sql(app, pilot, text, offset=None):
     await pilot.pause()
 
 
+@async_test
+async def test_alt_arrows_move_query_cursor_without_editing(parquet_source):
+    app = D8RApp(Session({parquet_source.id: parquet_source}))
+    document = "\n".join(["SELECT label FROM data"] * 100)
+    async with app.run_test(size=(130, 42)) as pilot:
+        await load_sql(app, pilot, document, 12)
+        await pilot.press("ctrl+space", "alt+left")
+        assert app.editor.cursor_location == (0, 7)
+        await pilot.press("alt+right")
+        assert app.editor.cursor_location == (0, 12)
+        await pilot.press("escape", "alt+down")
+        assert app.editor.cursor_location[0] == app.editor.content_size.height
+        await pilot.press("alt+up", "ctrl+a")
+        assert app.editor.selected_text == document and app.editor.has_focus
+
+
 @pytest.mark.parametrize("tab,control", [
     ("tab-schema", "#schema-tree"), ("tab-schema", "#explorer-close"),
     ("tab-pages", "#page-search"), ("tab-pages", "#pages-list"),
@@ -253,19 +269,18 @@ async def test_distinct_read_uses_current_literal_but_respects_escape(parquet_so
             assert session.busy
             if dismiss:
                 await pilot.press("escape")
-            else:
-                await pilot.press("'", "b")
+            await pilot.press("'", "b")
         finally:
             release.set()
         await app.workers.wait_for_complete()
         await pilot.pause()
         assert not session.busy
+        assert app.editor.text.endswith("= 'b")
         if dismiss:
-            assert not app.palette.is_open
+            assert app.palette.view is None and not app.palette.details.display
         else:
             values = [entry.insert for entry in app.palette.view.entries if entry.kind == "value"]
             assert values == ["'beta'"]
-            assert app.editor.text.endswith("= 'b")
 
 
 @async_test

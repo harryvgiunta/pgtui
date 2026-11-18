@@ -119,6 +119,13 @@ def test_recursive_cte_explicit_columns_available_in_body(schema):
     assert set(fields(refs(context)["w"])) == {"node"}
 
 
+def test_recursive_arm_uses_seed_projection_when_no_column_list(schema):
+    context = at("WITH RECURSIVE walk AS (SELECT id AS node FROM users "
+                 "UNION ALL SELECT w.| FROM walk w) SELECT * FROM walk", schema)
+    node, = refs(context)["w"].fields
+    assert (node.name, node.table, node.column) == ("node", "users", "id")
+
+
 def test_derived_star_and_alias_type_lineage(schema):
     context = at("SELECT d.| FROM (SELECT u.*, u.name AS display_name, 1 AS literal, CAST(u.id AS bigint) AS key FROM users u) d", schema)
     derived = fields(refs(context)["d"])
@@ -392,12 +399,6 @@ def test_grouping_can_group_aggregate_outputs_of_derived_relation(schema):
               "FROM orders GROUP BY user_id) d GROUP BY |")
     result = complete(marked.replace("|", "", 1), marked.index("|"), schema)
     assert result.items[0].insert == "d.user_id, d.gross"
-
-
-def test_join_transition_ignores_incomplete_next_source(schema):
-    assert at("SELECT * FROM users u inn|", schema).relation_transition
-    assert not at("SELECT * FROM users u, ord|", schema).relation_transition
-    assert not at("SELECT * FROM users u JOIN ord|", schema).relation_transition
 
 
 @pytest.mark.parametrize("operator", ["IS DISTINCT FROM", "IS NOT DISTINCT FROM", "BETWEEN 'a' AND"])

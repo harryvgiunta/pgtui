@@ -273,16 +273,18 @@ tables/macros. Cache-save errors preserve live metadata and never relabel a succ
 connection or SQL statement as failed. A first successful connection is required:
 older builds did not write a durable snapshot that could be recovered retroactively.
 
-- Prefix, word-boundary and abbreviation matches lead; typo/subsequence matches
-  are fallbacks. Legal clause continuations outrank unrelated routines: `inn` after
-  a relation proposes `INNER JOIN`. A changed prefix selects the new best match.
+- After a table or alias, `WHERE`, `JOIN` and `LEFT JOIN` lead the list. After a
+  joined table, expect `ON`/`USING` instead (except for cross and natural joins).
+  Table and column slots still prioritize matching names; typo/subsequence matches
+  are fallbacks. `WITH` declarations offer `AS (` after the name and `SELECT` at
+  the start of the body or main query.
 - Starting a fresh PostgreSQL statement, including after a semicolon, with a table
   or schema prefix automatically offers matching tables: `etl`, `etl.` and
   `etl.dataset_sy` all work without Ctrl+Space. Acceptance inserts
   `SELECT  FROM "schema"."table" AS alias` with the caret between SELECT and FROM.
-  Escape dismisses the current popup; the next real edit resumes local suggestions,
-  while dismissed automatic AI requests stay revoked until explicitly requested again
-  or a different document is loaded. New query pages never inherit a suppressed popup.
+- **Esc** in the query editor pauses SQL suggestions across typing, newlines and
+  page changes. Backslash commands still work. Press **Esc** again to resume if
+  IntelliSense is enabled in Settings. Neither keypress requests AI completion.
 - Column suggestions use their visible relation alias/qualifier, not just ambiguous
   columns. SQL-required bare target/USING columns and projection aliases remain bare.
   FROM/JOIN table acceptance inserts a short collision-free alias, preserving an
@@ -384,9 +386,11 @@ draft; connection forms retain field focus and selection across edits and connec
 | Ctrl+R in function mode | Save and run function preview |
 | Ctrl+Space | Open local SQL completion |
 | F4 / Ctrl+Shift+Space | Request AI completion |
-| Alt+Up / Alt+Down | Scroll completion documentation/preview |
+| Ctrl+A in a text editor or chat composer | Select the entire draft |
+| Alt/Option+Left / Right in a text editor or chat composer | Jump by word |
+| Alt/Option+Up / Down | Jump by page; scroll completion details instead when they overflow |
 | Tab / Enter with completion open | Accept completion |
-| Escape in the query editor | Dismiss/cancel completion; press again to reopen local offers |
+| Escape in the query editor | Pause SQL suggestions until Escape is pressed again |
 | Escape in Explorer (Schema, Pages or Functions) | Hide Explorer and return to the query editor at the same cursor position |
 | Escape in the function editor | Return to the query and previous Explorer tab without discarding the function draft |
 | Escape in chat | Hide Conversations and return to the query editor without discarding the chat draft |

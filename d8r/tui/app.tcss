@@ -890,8 +890,7 @@ AIPanel #ai-review {
 }
 
 AIPanel #ai-conversation {
-    height: auto;
-    max-height: 50%;
+    height: 1fr;
     min-height: 3;
     margin-top: 1;
 }

@@ -17,7 +17,7 @@ import re
 
 from d8r.sql import FnDef, RoutineDef, SchemaContext, SqlError, format_parameters, lex_sql, parameter_types, relation_parts
 
-from .catalog import dialect_name, expressions_for, functions_for, keywords_for, types_for
+from .catalog import continuations_for, dialect_name, expressions_for, functions_for, keywords_for, types_for
 from .context import analyze
 from .models import Completion, Context, Field, Relation, Signature, Suggestion
 
@@ -448,7 +448,6 @@ def function_insertion(document: str, offset: int, fn: FnDef, schema: SchemaCont
     context = analyze(document, offset, schema, dialect=dialect)
     fresh = context.statement_relation_start is not None
     if (context.blocked or context.qualifier or context.call is not None
-            or context.relation_transition
             or not (fresh or context.clause in {"from", "join"})):
         return None
     following = _following(document[:context.statement_end], context.end)
@@ -495,7 +494,7 @@ def _fk_conditions(source: Relation, target: Relation, dialect: str) -> Iterable
 
 
 def _joins(document: str, context: Context, offers: _Offers, dialect: str) -> None:
-    if context.join_target is None or context.clause not in {"on", "join_condition", "join"}:
+    if context.join_target is None or context.clause not in {"on", "after_join"}:
         return
     if context.qualifier and not any(_same_name(relation.reference, context.qualifier, dialect)
                                      for relation in (*context.join_left, context.join_target)):
@@ -503,7 +502,7 @@ def _joins(document: str, context: Context, offers: _Offers, dialect: str) -> No
     for left in context.join_left:
         for source, target in ((left, context.join_target), (context.join_target, left)):
             for condition in _fk_conditions(source, target, dialect):
-                insert = ("ON " if context.clause == "join" else "") + condition
+                insert = ("ON " if context.clause == "after_join" else "") + condition
                 # The whole condition replaces the typed component; qualified
                 # prefixes must be replaced too or they would be duplicated.
                 start = context.start
@@ -511,10 +510,11 @@ def _joins(document: str, context: Context, offers: _Offers, dialect: str) -> No
                     prefix = document[context.statement_start:context.start]
                     match = re.search(re.escape(context.qualifier) + r"\s*\.\s*$", prefix)
                     start = context.statement_start + match.start() if match else start - len(context.qualifier) - 1
-                offers.add(Suggestion(insert, insert, "foreign-key join", "join",
+                prefix = _clause_separator(document, start) if context.clause == "after_join" else ""
+                offers.add(Suggestion(insert, prefix + insert, "foreign-key join", "join",
                                       start=max(context.statement_start, start), end=context.end),
-                           name=insert, relevance=-1,
-                           force=not context.token or (context.clause == "join" and "on".startswith(context.token.casefold())))
+                           name=insert, relevance=-1, force=not context.token or (
+                               context.clause == "after_join" and "on".startswith(context.token.casefold())))
 
 
 def _star(document: str, context: Context, offers: _Offers, dialect: str) -> None:
@@ -618,16 +618,14 @@ def _values(context: Context, offers: _Offers, dialect: str, values: Values | No
 
 _CLAUSE_KEYWORDS = {
     "statement": "SELECT WITH INSERT UPDATE DELETE CREATE ALTER DROP EXPLAIN BEGIN COMMIT ROLLBACK CALL",
-    "select": "DISTINCT CASE NULL TRUE FALSE FROM AS OVER FILTER",
-    "from": "LATERAL WHERE JOIN LEFT RIGHT INNER FULL CROSS GROUP ORDER LIMIT OFFSET",
-    "join": "LATERAL ON USING",
-    "on": "AND OR NOT IS NULL IN EXISTS TRUE FALSE",
-    "where": "AND OR NOT IS NULL IN EXISTS BETWEEN LIKE ILIKE TRUE FALSE",
-    "having": "AND OR NOT IS NULL IN EXISTS BETWEEN TRUE FALSE",
-    "group": "BY HAVING ORDER",
-    "group_by": "HAVING ORDER",
-    "order": "BY ASC DESC NULLS LIMIT OFFSET",
-    "order_by": "ASC DESC NULLS LIMIT OFFSET",
+    "select": "DISTINCT CASE NULL TRUE FALSE",
+    "from": "LATERAL",
+    "join": "LATERAL",
+    "on": "NOT NULL EXISTS TRUE FALSE",
+    "where": "NOT NULL EXISTS TRUE FALSE",
+    "having": "NOT NULL EXISTS TRUE FALSE",
+    "group": "",
+    "order": "",
     "returning": "AS NULL CASE",
     "values": "NULL DEFAULT TRUE FALSE",
     "update_set": "NULL DEFAULT CASE WHERE RETURNING",
@@ -645,30 +643,57 @@ _CLAUSE_KEYWORDS = {
 }
 
 
+def _clause_separator(document: str, start: int) -> str:
+    return " " if start and start <= len(document) and not (
+        document[start - 1].isspace() or document[start - 1] in "(,;") else ""
+
+
+def _group_edit(context: Context, offers: _Offers) -> None:
+    if context.group_expressions:
+        prefix = context.group_prefix if context.group_slot else "GROUP BY "
+        offers.add(Suggestion("GROUP BY all nonaggregate SELECT expressions",
+                              prefix + ", ".join(context.group_expressions),
+                              "complete nonaggregate projection; known stars expanded", "snippet"),
+                   force=True, relevance=-2)
+
+
+def _continuations(document: str, context: Context, phrases: tuple[str, ...], offers: _Offers) -> None:
+    if context.qualifier or context.quote:
+        return
+    token = context.token.upper()
+    lead = _clause_separator(document, context.start)
+    following = document[context.end:context.end + 1]
+    suffix = _following(document, context.end)
+    next_word = re.match(r"[\w$]+", suffix)
+    for rank, phrase in enumerate(phrases):
+        if not phrase.startswith(token):
+            continue
+        if next_word and phrase.split()[0] == next_word.group().upper():
+            continue  # Don't insert AS before an existing AS, or WHERE before WHERE.
+        if phrase == "AS (" and not token and suffix.startswith("("):
+            continue  # The existing parentheses can be the CTE's output column list.
+        insert = "USING (" if phrase == "USING" else phrase
+        if insert.endswith("("):
+            if suffix.startswith("("):
+                insert = insert[:-1].rstrip()
+                if not insert:
+                    continue
+        if not insert.endswith("(") and not following.isspace():
+            insert += " "
+        offers.add(Suggestion(phrase, lead + insert, "native SQL continuation", "keyword"), relevance=rank)
+
+
 def _syntax(document: str, context: Context, offers: _Offers, dialect: str) -> None:
     native = keywords_for(dialect)
-    words = _CLAUSE_KEYWORDS.get(context.clause, "AND OR NOT NULL CASE").split()
-    if context.clause == "from" and not context.relation_transition:
-        words = ["LATERAL"]
-    for word in words:
-        if word in native and word not in {"LEFT", "RIGHT", "INNER", "FULL", "CROSS"}:
-            offers.add(Suggestion(word, word, "native SQL keyword", "keyword"), relevance=4)
-    if context.relation_transition and context.clause in {"from", "on"}:
-        for word in ("INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL"):
-            if word in native:
-                label = word + " JOIN"
-                offers.add(Suggestion(label, label + " ", "native join clause", "snippet"), relevance=-2)
-        for label in ("WHERE", "GROUP BY", "ORDER BY", "LIMIT"):
-            offers.add(Suggestion(label, label + " ", "native query clause", "keyword"), relevance=3)
-    if context.group_expressions:
-        in_group = context.clause in {"group", "group_by"}
-        prefix = context.group_prefix if in_group else "GROUP BY "
-        eligible = (context.group_slot if in_group else not context.token or "group by".startswith(context.token.casefold()))
-        if eligible:
-            offers.add(Suggestion("GROUP BY all nonaggregate SELECT expressions",
-                                  prefix + ", ".join(context.group_expressions),
-                                  "complete nonaggregate projection; known stars expanded", "snippet"),
-                       force=True, relevance=-2)
+    words = _CLAUSE_KEYWORDS.get(context.clause, "NOT NULL CASE").split()
+    for rank, word in enumerate(words):
+        if word in native:
+            statement = context.clause == "statement"
+            insert = word + " " if word == "WITH" and not document[context.end:context.end + 1].isspace() else word
+            offers.add(Suggestion(word, insert, "native SQL keyword", "keyword"),
+                       relevance=rank if statement else 4)
+    if context.group_slot:
+        _group_edit(context, offers)
     snippets: list[tuple[str, str, int, str]] = []
     if context.clause in {"select", "where", "having", "on", "update_set", "set", "returning"}:
         snippets.extend((("CASE WHEN", "CASE WHEN  THEN  ELSE  END", 16, "conditional expression"),
@@ -678,17 +703,9 @@ def _syntax(document: str, context: Context, offers: _Offers, dialect: str) -> N
     if context.clause == "select":
         snippets.append(("COUNT(*)", "COUNT(*)", 0, "count rows"))
     if context.clause in {"where", "having", "on"}:
-        snippets.extend((("EXISTS", "EXISTS (SELECT 1 FROM )", 1, "existence predicate"),
-                         ("IS NULL", "IS NULL", 0, "NULL predicate"),
-                         ("IS NOT NULL", "IS NOT NULL", 0, "non-NULL predicate"),
-                         ("BETWEEN", "BETWEEN  AND ", 5, "inclusive range predicate"),
-                         ("IN", "IN ()", 1, "membership predicate")))
+        snippets.append(("EXISTS", "EXISTS (SELECT 1 FROM )", 1, "existence predicate"))
     if context.clause in {"select", "window"}:
         snippets.append(("OVER", "OVER (PARTITION BY  ORDER BY )", 11, "window specification"))
-    if context.clause in {"from", "where", "on", "having"}:
-        snippets.append(("GROUP BY", "GROUP BY ", 0, "group rows"))
-    if context.clause in {"from", "where", "on", "group", "group_by", "having"}:
-        snippets.append(("ORDER BY", "ORDER BY ", 0, "sort rows"))
     if context.clause == "select" and not context.token:
         for relation in context.relations:
             if relation.outer or not relation.fields:
@@ -699,7 +716,7 @@ def _syntax(document: str, context: Context, offers: _Offers, dialect: str) -> N
                                   "explicit projection list", "expansion"), relevance=2)
     if context.clause == "statement":
         snippets.extend((("SELECT FROM", "SELECT  FROM ", 6, "projection and source"),
-                         ("WITH", "WITH  AS (SELECT ) SELECT ", 21, "common table expression")))
+                         ("WITH … AS (…)", "WITH  AS (SELECT ) SELECT ", 21, "common table expression")))
     for label, insert, back, detail in snippets:
         if _following(document, context.end).startswith("(") and "(" in insert:
             continue
@@ -719,11 +736,21 @@ def complete(document: str, offset: int, schema: SchemaContext, *, dialect: str 
     """Propose native SQL edits from immutable scope and cached metadata only."""
     parameters = tuple(parameters)
     context = analyze(document, offset, schema, dialect=dialect, parameters=parameters)
-    call_routines = _call_routines(context, schema, dialect)
-    signature, expected = _signature(context, call_routines)
     offers = _Offers(context.token, usage or {})
     if context.blocked and not context.literal:
         return Completion(context)
+    phrases = continuations_for(context.clause, dialect)
+    if context.clause == "cte_first_name" and not context.token and not manual:
+        return Completion(context)  # The user is naming the CTE, not choosing a catalog item.
+    if phrases is not None:
+        _continuations(document, context, phrases, offers)
+        if context.clause == "after_join":
+            _joins(document, context, offers, dialect)
+        if not context.quote and not context.qualifier:
+            _group_edit(context, offers)
+        return Completion(context, offers.result())
+    call_routines = _call_routines(context, schema, dialect)
+    signature, expected = _signature(context, call_routines)
     if context.literal:
         _values(context, offers, dialect, values)
         return Completion(context, offers.result(), signature)
@@ -734,7 +761,8 @@ def complete(document: str, offset: int, schema: SchemaContext, *, dialect: str 
     if context.clause == "statement" and context.call is None:
         if not context.qualifier and not context.quote:
             _syntax(document, context, offers, dialect)
-        if context.statement_relation_start is not None and dialect_name(dialect) == "postgres":
+        if (context.statement_relation_start is not None and (context.token or context.qualifier or context.quote)
+                and dialect_name(dialect) == "postgres"):
             _tables(document, context, schema, offers, dialect)
         return Completion(context, offers.result(), signature)
     if context.call and expected == "relation":
@@ -758,10 +786,8 @@ def complete(document: str, offset: int, schema: SchemaContext, *, dialect: str 
     if context.token == "*":
         return Completion(context, offers.result(), signature)
     relation_only = context.clause in _RELATION_CLAUSES and context.call is None
-    transition = context.relation_transition and context.call is None
     if relation_only:
-        if not transition:
-            _tables(document, context, schema, offers, dialect)
+        _tables(document, context, schema, offers, dialect)
     elif context.clause != "call" or context.call is not None:
         _columns(context, offers, dialect, expected, _following(document, context.end).startswith("."))
         if not context.relations and not context.qualifier and context.clause in {"select", "statement"}:
@@ -777,7 +803,7 @@ def complete(document: str, offset: int, schema: SchemaContext, *, dialect: str 
                                       field.type + " · " + ", ".join(field.tables), "column", field.doc),
                            name=field.name, relevance=3, category="column",
                            table=table)
-    if context.clause not in _COLUMN_CLAUSES and not transition:
+    if context.clause not in _COLUMN_CLAUSES:
         # A qualifier belonging to a relation resolves columns only, not global
         # functions. Unknown qualifiers can resolve a real native routine schema.
         relation_qualifier = context.qualifier and any(

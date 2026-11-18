@@ -377,7 +377,7 @@ def test_quoted_identifier_has_no_bare_keywords(monkeypatch, schema):
 
 def test_fk_join_on_after_target_and_projection_list(monkeypatch, schema):
     users, orders = relation(schema, "users", "u"), relation(schema, "orders", "o")
-    context = Context(40, 40, clause="join", relations=(users, orders), join_target=orders, join_left=(users,))
+    context = Context(40, 40, clause="after_join", relations=(users, orders), join_target=orders, join_left=(users,))
     result = candidates(monkeypatch, context, schema)
     assert by_label(result, "ON o.user_id = u.id").insert == "ON o.user_id = u.id"
     context = Context(7, 7, clause="select", relations=(users,))
@@ -703,3 +703,70 @@ def test_schema_prefix_preserves_existing_dot():
 def test_incomplete_grouping_keeps_oversized_ordinal_bounded(schema):
     result, _ = complete_marked("SELECT id, count(*) FROM users GROUP BY " + "9" * 5000 + ", |", schema)
     assert result.items[0].insert == "id"
+
+
+@pytest.mark.parametrize("marked", [
+    "SELECT * FROM users|", "SELECT * FROM users u |", 'SELECT * FROM users AS "u"|',
+    "SELECT * FROM users AS u -- next clause\n|", "SELECT * FROM users, orders o |",
+    "SELECT * FROM (SELECT id FROM users) d |", "SELECT * FROM generate_series(1, 3) |",
+    "WITH q AS (SELECT id FROM users) SELECT * FROM q |",
+    "SELECT * FROM users u CROSS JOIN orders o |", "SELECT * FROM users NATURAL LEFT JOIN orders |",
+    "SELECT * FROM users u JOIN orders o USING (id) |",
+])
+def test_after_source_offers_clauses_without_replacing_source(schema, marked):
+    result, document = complete_marked(marked, schema)
+    assert [item.label for item in result.items[:3]] == ["WHERE", "JOIN", "LEFT JOIN"]
+    assert apply_completion(result, document, result.items[0]) == document + ("" if document[-1].isspace() else " ") + "WHERE "
+    assert len({item.label for item in result.items}) == len(result.items)
+    assert not any(item.kind in {"function", "table", "column", "join"} for item in result.items)
+
+
+@pytest.mark.parametrize("marked,expected", [
+    ("SELECT * FROM users le|", "SELECT * FROM users LEFT JOIN "),
+    ("SELECT * FROM users u wh|ere u.active", "SELECT * FROM users u WHERE u.active"),
+    ("SELECT * FROM users u LEFT OUTER j|", "SELECT * FROM users u LEFT OUTER JOIN "),
+    ("SELECT * FROM users u JOIN orders AS o|", "SELECT * FROM users u JOIN orders AS o ON o.user_id = u.id"),
+    ("SELECT * FROM users u JOIN orders o ON o.user_id = u.id wh|", "SELECT * FROM users u JOIN orders o ON o.user_id = u.id WHERE "),
+    ("SELECT id f|", "SELECT id FROM "),
+    ("SELECT * FROM users WHERE active |", "SELECT * FROM users WHERE active AND "),
+    ("SELECT * FROM users WHERE id BETWEEN 1 |", "SELECT * FROM users WHERE id BETWEEN 1 AND "),
+    ("SELECT * FROM users ORDER |", "SELECT * FROM users ORDER BY "),
+    ("SELECT * FROM users ORDER BY email |", "SELECT * FROM users ORDER BY email ASC "),
+])
+def test_keyword_acceptance_at_clause_boundaries(schema, marked, expected):
+    result, document = complete_marked(marked, schema)
+    assert apply_completion(result, document, result.items[0]) == expected
+
+
+@pytest.mark.parametrize("marked,kind", [
+    ("SELECT * FROM |", "table"), ("SELECT * FROM users, ord|ers", "table"),
+    ("SELECT * FROM ONLY us|", "table"),
+    ("SELECT * FROM users u LEFT JOIN |", "table"), ("SELECT * FROM users WHERE |", "column"),
+    ("SELECT * FROM users ORDER BY |", "column"),
+    ("SELECT * FROM users u JOIN orders o ON o.user_id = |", "column"),
+])
+def test_incomplete_operands_do_not_jump_to_the_next_clause(schema, marked, kind):
+    result, _ = complete_marked(marked, schema)
+    assert any(item.kind == kind for item in result.items)
+    assert not any(item.label in {"WHERE", "LEFT JOIN", "ORDER BY", "GROUP BY", "DESC", "AND"}
+                   or (item.kind == "join" and not item.table) for item in result.items)
+
+
+@pytest.mark.parametrize("marked,expected", [
+    ("WITH q|", "WITH q AS ("), ("WITH q AS |", "WITH q AS ("),
+    ("WITH q AS (|", "WITH q AS (SELECT "),
+    ('WITH RECURSIVE "Nodes"(n) a| (VALUES (1))', 'WITH RECURSIVE "Nodes"(n) AS (VALUES (1))'),
+    ("WITH q AS (SELECT 1), r AS NOT MATERIALIZED (|)", "WITH q AS (SELECT 1), r AS NOT MATERIALIZED (SELECT )"),
+    ("WITH q AS (SELECT 1)\n|", "WITH q AS (SELECT 1)\nSELECT "),
+])
+def test_with_completion_preserves_declarations(schema, marked, expected):
+    result, document = complete_marked(marked, schema)
+    assert apply_completion(result, document, result.items[0]) == expected
+    assert all(item.kind == "keyword" for item in result.items)
+
+
+@pytest.mark.parametrize("marked", ["WITH |", "WITH q(col, |)", "WITH a AS (SELECT 1), |",
+                                    "WITH q| AS (SELECT 1)", "WITH q| (id) AS (SELECT 1)", "SELECT * FROM users AS |"])
+def test_naming_slots_leave_input_to_the_user(schema, marked):
+    result, _ = complete_marked(marked, schema)
+    assert not result.items

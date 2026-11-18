@@ -19,7 +19,7 @@ from uuid import UUID
 
 import httpx
 
-from d8r.sql import ColumnDef, ForeignKey, lex_sql, relation_name
+from d8r.sql import ColumnDef, ForeignKey, cte_declarations, lex_sql, relation_name
 from .datasources import DataSource, EngineError, _sql_error_message
 
 _API = "https://api.cloudflare.com/client/v4"
@@ -371,8 +371,10 @@ def _unsafe_function(name):
 
 
 def _guard_readonly(con, sql, tokens, operation):
+    declarations = {name for name, _ in cte_declarations(tokens)}
     for index, token in enumerate(tokens[:-1]):
-        if token.kind in {"word", "quoted_identifier"} and tokens[index + 1].text == "(" and _unsafe_function(_function_name(token)):
+        if (token.kind in {"word", "quoted_identifier"} and tokens[index + 1].text == "("
+                and index not in declarations and _unsafe_function(_function_name(token))):
             raise EngineError("Read-only D1 tools cannot call file, network, extension or mutation functions")
     names, rows, _ = con.raw("EXPLAIN " + sql, operation)
     required = {"addr", "opcode", "p1", "p2", "p3", "p4", "p5"}

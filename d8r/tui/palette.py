@@ -94,7 +94,7 @@ def _location(document: str, offset: int) -> tuple[int, int]:
 
 def view_for(session: Session, doc: str, line: str, column: int, *,
              parameters: Iterable[str] = (), row: int = 0,
-             query_history: bool = True, manual: bool = False) -> View | None:
+             query_history: bool = True, manual: bool = False, commands_only: bool = False) -> View | None:
     offset = _offset(doc, (row, column))
     source = session.source
     action = command_span(doc, offset, dialect=source.dialect)
@@ -104,6 +104,8 @@ def view_for(session: Session, doc: str, line: str, column: int, *,
                    for label, detail, name in ACTIONS
                    if token.casefold() in label.casefold() or token.casefold() in name.casefold()]
         return View(start, token, entries, "command", end) if entries else None
+    if commands_only:
+        return None
     result = complete(doc, offset, session.schema, dialect=source.dialect,
                       parameters=tuple(parameters), usage=session.completion_usage(),
                       values=lambda table, column: session.cached_values(source, table, column),
@@ -187,10 +189,8 @@ class CommandPalette(OptionList):
         self.details: CompletionDetails | None = None
         self._view: View | None = None
         self._preferred_width = 40
-        self._dismissed = False
-        self._ai_dismissed = False
-        self._load_serial = 0
-        self._history_dismissed = False
+        # Editor-local, not document-local: only Escape changes this flag.
+        self._sql_muted = False
         self._preview_document: str | None = None
         self._sync_pending = False
         self._sync_scheduled = False
@@ -219,7 +219,6 @@ class CommandPalette(OptionList):
         self.editor = editor
         self._last_document = editor.text
         self._edit_serial = getattr(editor, "user_edit_serial", 0)
-        self._load_serial = getattr(editor, "document_load_serial", 0)
         with self.session.target_source(self.source_id):
             editor.dialect = self.session.source.dialect
         self.set_interval(0.1, self._guard_ai)
@@ -250,14 +249,14 @@ class CommandPalette(OptionList):
                     getattr(editor, "user_edit_serial", 0), getattr(editor, "document_load_serial", 0),
                     getattr(editor, "selection_revision", 0), self._close_generation, self.session.ai_provider_revision)
 
-    def _eligible(self, *, ai: bool = False) -> bool:
+    def _eligible(self, *, ai: bool = False, allow_commands: bool = False) -> bool:
         editor = self.editor
         return bool(editor is not None and editor.is_mounted and editor.is_on_screen
                     and self.app.focused is editor and not editor.read_only
                     and editor.selection.start == editor.selection.end
                     and self.session.intellisense
-                    and (not ai or not self.session.busy and not self._ai_dismissed)
-                    and not self._dismissed and not getattr(self.app, "_closing", False))
+                    and (not self._sql_muted or allow_commands)
+                    and (not ai or not self.session.busy) and not getattr(self.app, "_closing", False))
 
     def cancel_ai(self) -> None:
         self._generation += 1
@@ -279,12 +278,6 @@ class CommandPalette(OptionList):
         editor = self.editor
         if editor is None:
             return
-        load_serial = getattr(editor, "document_load_serial", 0)
-        if load_serial != self._load_serial:
-            self._load_serial = load_serial
-            self._dismissed = False
-            self._ai_dismissed = False
-            self._history_dismissed = False
         if editor.text == self._last_document:
             return
         self._last_document = editor.text
@@ -292,13 +285,6 @@ class CommandPalette(OptionList):
         typed = (serial != self._edit_serial
                  and serial > getattr(editor, "programmatic_edit_serial", 0))
         self._edit_serial = serial
-        if typed:
-            # Escape dismisses an offer, not local completion for future edits.
-            self._dismissed = False
-        row, column = editor.cursor_location
-        if typed and column and editor.document[row][column - 1] in {"\\", "@"}:
-            self._dismissed = False
-            self._history_dismissed = False
         self.cancel_ai()
         self._values_snapshot = self._snapshot() if typed and not self._accepting and self._eligible() else None
         self.queue_sync()
@@ -332,20 +318,18 @@ class CommandPalette(OptionList):
         editor = self.editor
         if editor is None:
             return
-        if not self._eligible():
+        if not self._eligible(allow_commands=True):
             self.close()
             return
         if self._view is not None and self._view.phase == "ai":
             return
         row, column = editor.cursor_location
         line = editor.document[row]
-        if not editor.text.strip():
-            self._history_dismissed = False
         with self.session.target_source(self.source_id):
             editor.dialect = self.session.source.dialect
             view = view_for(self.session, editor.text, line, column, parameters=self._parameters(),
-                            row=row, query_history=self.workspace_actions and not self._history_dismissed,
-                            manual=manual)
+                            row=row, query_history=self.workspace_actions, manual=manual,
+                            commands_only=self._sql_muted)
             if (view is not None and view.phase == "argument" and view.value_field is not None
                     and not self.session.busy and self.session.value_cache_enabled
                     and (manual or values_snapshot is not None and values_snapshot == self._snapshot())):
@@ -367,7 +351,7 @@ class CommandPalette(OptionList):
     def accept_table(self, table: str) -> bool:
         """Accept a registered explorer table by identity, never display spelling."""
         editor = self.editor
-        if (editor is None or editor.read_only or self._dismissed or not self.session.intellisense
+        if (editor is None or editor.read_only or self._sql_muted or not self.session.intellisense
                 or editor.selection.start != editor.selection.end):
             return False
         row, column = editor.cursor_location
@@ -412,14 +396,9 @@ class CommandPalette(OptionList):
 
     def manual_local(self) -> None:
         self.cancel_ai()
-        self._dismissed = False
-        self._history_dismissed = False
         self.sync(manual=True)
 
     def request_ai(self, *, automatic: bool = False) -> None:
-        if not automatic:
-            self._dismissed = False
-            self._ai_dismissed = False
         self.cancel_ai()
         if not self._eligible(ai=True) or (automatic and not self.session.ai_completion):
             return
@@ -458,12 +437,12 @@ class CommandPalette(OptionList):
                     allow_schema=self.session.ai_allow_schema_refreshes,
                     metadata_cache_info=self.session.schema_cache_info())
                 config = self.session.ai_config
-            self._ai_status = "AI · requesting suggestions… · Esc cancels"
+            self._ai_status = "AI · requesting suggestions… · Esc mutes completion"
             self._render_details()
             suggestions = await sql_completion.complete_sql(config, request)
             if not self._ai_current(generation, snapshot):
                 return
-            self._ai_status = "AI · review only · Tab/Enter accepts · Esc dismisses" if suggestions else "AI · no suggestions"
+            self._ai_status = "AI · review only · Tab/Enter accepts · Esc mutes completion" if suggestions else "AI · no suggestions"
             if suggestions:
                 entries = [Entry(f"AI suggestion {index + 1}", item.insert, item.detail,
                                  cursor_back=item.cursor_back, kind="AI",
@@ -626,20 +605,11 @@ class CommandPalette(OptionList):
         self.post_message(self.HistoryPreviewChanged(self, document).set_sender(self))
 
     def escape(self) -> None:
-        if self._ai_snapshot is not None:
+        self._sql_muted = not self._sql_muted
+        if self._sql_muted or (self._view is not None and self._view.phase == "command"):
             self.close()
-            self._dismissed = True
-            self._ai_dismissed = True
-        elif self._view is not None and any(entry.replace_document for entry in self._view.entries):
-            self._history_dismissed = True
-            self.sync()
-        elif self.is_open or (self.details is not None and self.details.display):
-            self.close()
-            self._dismissed = True
-            self._ai_dismissed = True
         else:
-            self._dismissed = False
-            self.sync(manual=True)
+            self.sync()  # Restore current local offers; Escape is not an AI or value request.
 
     def move(self, delta: int) -> None:
         if self.option_count:
@@ -660,7 +630,8 @@ class CommandPalette(OptionList):
 
     def _accept(self, index: int) -> bool:
         view, editor = self._view, self.editor
-        if view is None or not self._eligible() or not 0 <= index < len(view.entries):
+        if (view is None or not self._eligible(allow_commands=view.phase == "command")
+                or not 0 <= index < len(view.entries)):
             return False
         if view.phase == "ai" and (self.styles.visibility != "visible" or self.details is None or not self.details.display):
             return False
@@ -711,13 +682,12 @@ class EditorPane(Vertical):
         Binding("up", "palette_up", "Cursor up", show=False, priority=True),
         Binding("down", "palette_down", "Cursor down", show=False, priority=True),
         Binding("enter", "palette_enter", "Newline", show=False, priority=True),
-        Binding("escape", "palette_escape", "Close the palette", show=False, priority=True),
-        Binding("ctrl+a", "select_all", "Select all", show=False, priority=True),
+        Binding("escape", "palette_escape", "Toggle SQL completion", show=False, priority=True),
         Binding("tab", "palette_tab", "Accept suggestion", show=False, priority=True),
         Binding("ctrl+space", "complete_local", "SQL completion", show=False, priority=True),
         Binding("ctrl+shift+space,f4", "complete_ai", "AI completion", show=False, priority=True),
-        Binding("alt+up", "completion_details_up", "Scroll completion details up", show=False, priority=True),
-        Binding("alt+down", "completion_details_down", "Scroll completion details down", show=False, priority=True),
+        Binding("alt+up", "scroll_details(-3)", "Scroll completion details up", show=False, priority=True),
+        Binding("alt+down", "scroll_details(3)", "Scroll completion details down", show=False, priority=True),
     ]
 
     @property
@@ -794,9 +764,6 @@ class EditorPane(Vertical):
     def action_palette_escape(self) -> None:
         self.palette.escape()
 
-    def action_select_all(self) -> None:
-        self.editor.select_all()
-
     def action_palette_tab(self) -> bool:
         return self.palette.accept_highlighted()
 
@@ -806,10 +773,11 @@ class EditorPane(Vertical):
     def action_complete_ai(self) -> None:
         self.palette.request_ai()
 
-    def action_completion_details_up(self) -> None:
-        if self.palette.details is not None and self.palette.details.display:
-            self.palette.details.scroll_relative(y=-3, animate=False)
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action == "scroll_details":
+            details = self.palette.details
+            return bool(details and details.display and details.max_scroll_y > 0)
+        return super().check_action(action, parameters)
 
-    def action_completion_details_down(self) -> None:
-        if self.palette.details is not None and self.palette.details.display:
-            self.palette.details.scroll_relative(y=3, animate=False)
+    def action_scroll_details(self, lines: int) -> None:
+        self.palette.details.scroll_relative(y=lines, animate=False)

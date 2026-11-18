@@ -260,6 +260,33 @@ def test_postgres_run_does_not_evaluate_the_unfetched_tail(postgres_source):
     assert session.run("SELECT 42").rows == [[42]]
 
 
+def test_postgres_cte_declaration_is_not_an_unsafe_call(postgres_source):
+    from d8r.tui.session import Session
+
+    session = Session({postgres_source.id: postgres_source})
+    session.update_settings(default_rows=2)
+    sql = ("WITH seed AS (SELECT generate_series(1, 5) AS n), "
+           '"http_requests"(n) AS (SELECT n FROM seed) '
+           'SELECT n, 1 / (4 - n) FROM "http_requests"')
+    # Treating http_requests(n) as a call disables the cursor: ordinary Run
+    # would evaluate the fourth row, outside the preview, and fail altogether.
+    first = session.run(sql)
+    assert first.ok, first.error
+    assert first.rows == [[1, 0], [2, 0]] and first.capped
+    assert first.sql == sql and first.page is not None
+    assert session.run_all(sql, paged_read=True)[0].rows == first.rows
+
+
+@pytest.mark.parametrize("clause", ["SEARCH DEPTH FIRST BY n SET visit_order", "CYCLE n SET is_cycle USING path"])
+def test_postgres_recursive_cte_set_names_a_column(postgres_source, clause):
+    sql = ("WITH RECURSIVE walk(n) AS (VALUES (1) UNION ALL SELECT n+1 FROM walk WHERE n<4) "
+           + clause + " SELECT n FROM walk ORDER BY n")
+    for readonly in (False, True):
+        result = execute_sql(postgres_source, sql, max_rows=2, readonly=readonly)
+        assert result["rows"] == [[1], [2]] and result["pageable"]
+    assert not transaction_open(postgres_source)
+
+
 def test_postgres_pages_respect_authored_window(postgres_source):
     from d8r.tui.session import Session
 
@@ -326,6 +353,9 @@ def test_postgres_catalog_metadata_and_composite_fk(postgres_source):
 @pytest.mark.parametrize("query", [
     "INSERT INTO native_guard VALUES (2)",
     "WITH changed AS (DELETE FROM native_guard RETURNING *) SELECT * FROM changed",
+    "WITH ids AS (SELECT 1) UPDATE native_guard SET id=2 RETURNING id",
+    "WITH pg_read_file(n) AS (VALUES (1)) SELECT pg_read_file('not-a-file') FROM pg_read_file",
+    "SET application_name = 'not allowed'",
     "SELECT * INTO TEMP native_stolen FROM native_guard",
     "SELECT pg_catalog.lo_export(1, '/tmp/forbidden')",
     'SELECT pg_catalog."lo_export"(1, \'/tmp/forbidden\')',

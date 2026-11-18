@@ -64,6 +64,21 @@ def test_function_expansion_and_preview_preserve_authored_history(parquet_source
     assert session.fn_preview("not_saved").error
 
 
+def test_run_cte_script_with_from_first_saved_relation(parquet_source):
+    session = session_for(parquet_source)
+    session.save_fn("after_id", "n", "SELECT id FROM data WHERE id > @n", "")
+    first = ("-- native DuckDB; keep both CTEs in this statement\n"
+             "WITH picked AS MATERIALIZED (FROM after_id(1) SELECT after_id.id),\n"
+             "     labelled AS (SELECT id, 'a;b' AS tag FROM picked)\n"
+             "SELECT * FROM labelled ORDER BY id")
+    second = "WITH picked AS (VALUES (7)) SELECT * FROM picked"
+    results = session.run_all(f"{first};\n{second};")
+    assert [r.error for r in results] == ["", ""]
+    assert [r.rows for r in results] == [[[2, "a;b"], [3, "a;b"]], [[7]]]
+    assert results[1].sql == second
+    assert [entry.doc for entry in session.history] == [second, first]
+
+
 def test_function_validation_persists_only_valid_definitions(parquet_source):
     session = session_for(parquet_source)
     with pytest.raises(ValueError):

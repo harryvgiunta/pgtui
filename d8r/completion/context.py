@@ -11,7 +11,7 @@ import re
 
 from d8r.sql import RoutineDef, SchemaContext, SqlError, Token, lex_sql, parameter_types
 from .models import Call, Context, Field, Relation
-from .catalog import functions_for, keywords_for
+from .catalog import continuations_for, functions_for, keywords_for
 
 _MAX_CHARS = 200_000
 _MAX_TOKENS = 24_000
@@ -140,6 +140,15 @@ def _merge(local: tuple[Relation, ...], outer: tuple[Relation, ...], dialect: st
     return local + tuple(replace(r, outer=True) for r in outer if _key(r.reference, dialect) not in names)
 
 
+@dataclass(frozen=True)
+class _Source:
+    start: int
+    body_end: int  # Exclusive token indices, before and after an optional alias.
+    end: int
+    alias: int | None
+    relation: Relation
+
+
 @dataclass
 class _Scope:
     lo: int
@@ -151,7 +160,9 @@ class _Scope:
     outputs: tuple[Field, ...] = ()
     children: list[_Scope] = field(default_factory=list)
     # Relation source positions make JOIN ON/USING visibility left-to-right.
-    sources: list[tuple[int, Relation]] = field(default_factory=list)
+    sources: list[_Source] = field(default_factory=list)
+    # Cursor offsets at which the next legal part of a WITH declaration changes.
+    cte_steps: list[tuple[int, str]] = field(default_factory=list)
     insert_open: int | None = None
     projection_span: tuple[int, int] | None = None
 
@@ -471,7 +482,7 @@ class _Model:
         return replace(relation, fields=fields), min(close + 1, hi)
 
     def query(self, lo: int, hi: int, ctes: tuple[Relation, ...] = (),
-              outer: tuple[Relation, ...] = (), depth: int = 0) -> _Scope:
+              outer: tuple[Relation, ...] = (), depth: int = 0, *, recursive_self: Relation | None = None) -> _Scope:
         start = self.tokens[lo].start if lo < hi else (self.tokens[lo - 1].end if lo else 0)
         end = self.tokens[hi].start if hi < len(self.tokens) else len(self.text)
         scope = _Scope(lo, hi, start, end, ctes=ctes)
@@ -480,23 +491,36 @@ class _Model:
             return scope
         consumed: set[int] = set()
         main = lo
-        if self.upper(main) == "WITH":
+        if main < hi and self.upper(main) == "WITH":
+            def after(index: int, clause: str) -> None:
+                scope.cte_steps.append((self.tokens[index].end, clause))
+
+            after(main, "cte_first_name")
             main += 1
             recursive = self.upper(main) == "RECURSIVE"
+            if recursive:
+                after(main, "cte_name")
             main += int(recursive)
             while main < hi:
                 name, pos = self.identifier(main, hi)
                 if not name:
                     break
+                after(pos - 1, "cte_as")
                 explicit = pos if pos < hi and self.tokens[pos].text == "(" else None
                 if explicit is not None:
+                    after(explicit, "cte_name")
+                    if self.pairs[explicit] < hi:
+                        after(self.pairs[explicit], "cte_as")
                     pos = min(self.pairs.get(pos, hi) + 1, hi)
                 if self.upper(pos) != "AS":
                     break
+                after(pos, "cte_open")
                 pos += 1
                 if self.upper(pos) == "NOT":
+                    after(pos, "cte_materialized")
                     pos += 1
                 if self.upper(pos) == "MATERIALIZED":
+                    after(pos, "cte_paren")
                     pos += 1
                 if pos >= hi or self.tokens[pos].text != "(":
                     break
@@ -506,16 +530,21 @@ class _Model:
                     relation, _ = self.renamed(relation, explicit, hi)
                 visible = tuple(r for r in ctes if _key(r.reference, self.dialect) != _key(name, self.dialect))
                 body_ctes = visible + (relation,) if recursive else ctes
-                child = self.query(pos + 1, close, body_ctes, outer, depth + 1)
+                child = self.query(pos + 1, close, body_ctes, outer, depth + 1,
+                                   recursive_self=relation if recursive and explicit is None else None)
                 child.start = self.tokens[pos].end
+                child.cte_steps.insert(0, (child.start, "cte_body"))
                 scope.children.append(child)
                 consumed.add(pos)
                 relation = replace(relation, fields=child.outputs)
                 if explicit is not None:
                     relation, _ = self.renamed(relation, explicit, hi)
                 ctes = visible + (relation,)
+                if close < hi:
+                    after(close, "cte_main")
                 main = close + 1
                 if main < hi and self.tokens[main].text == ",":
+                    after(main, "cte_name")
                     main += 1
                 else:
                     break
@@ -527,8 +556,12 @@ class _Model:
             for stop in sets + [hi]:
                 child = self.query(begin, stop, ctes, outer, depth + 1)
                 scope.children.append(child)
-                if not scope.outputs:
+                if begin == main:
                     scope.outputs = child.outputs
+                    # Without an explicit column list, the seed SELECT names
+                    # the fields visible to the recursive arm of UNION [ALL].
+                    if recursive_self is not None:
+                        ctes = tuple(replace(r, fields=child.outputs) if r is recursive_self else r for r in ctes)
                 begin = stop + 1
                 if self.upper(begin) in {"ALL", "DISTINCT"}:
                     begin += 1
@@ -551,7 +584,7 @@ class _Model:
                 i = self.pairs.get(i, i) + 1
                 continue
             lateral = word == "LATERAL" and self.dialect != "sqlite"
-            if lateral:
+            if lateral or (word == "ONLY" and self.dialect == "postgres"):
                 i += 1
                 if i >= hi:
                     break
@@ -584,9 +617,11 @@ class _Model:
             if relation is None:
                 expect = False
                 continue
+            body_end, alias = i, None
             if self.upper(i) == "AS":
                 i += 1
             if i < hi and self.tokens[i].kind in _IDS and self.upper(i) not in _STOP:
+                alias = i
                 reference = self.tokens[i].text
                 relation = replace(relation, name=relation.name or reference, reference=reference)
                 i += 1
@@ -597,7 +632,7 @@ class _Model:
                 i = min(self.pairs.get(i, hi) + 1, hi)
             if relation.reference or relation.fields:
                 local.append(relation)
-                scope.sources.append((source, relation))
+            scope.sources.append(_Source(source, body_end, i, alias, relation))
             expect = False
         scope.relations = _merge(tuple(local), outer, self.dialect)
         top = list(self.top(main, hi))
@@ -631,7 +666,7 @@ class _Model:
                 close = min(self.pairs.get(opening, b), b)
                 if self.upper(opening + 1) in {"SELECT", "WITH", "VALUES"}:
                     available = scope.relations
-                    preceding = [r for at, r in scope.sources if at < opening]
+                    preceding = [s.relation for s in scope.sources if s.start < opening]
                     # ON subqueries cannot see relations introduced by later joins.
                     last_clause = self.clause(scope, self.tokens[opening].start)[0]
                     if last_clause in {"on", "using"}:
@@ -662,8 +697,83 @@ class _Model:
             return Relation(name, name, tuple(Field(c.name, c.type, doc=c.doc, values=c.values) for c in native.columns), doc=native.doc)
         return Relation(name, name)
 
+    def conditioned_join(self, scope: _Scope, anchor: int) -> bool:
+        modifier = anchor - 1
+        while modifier >= scope.lo and self.upper(modifier) in {"LEFT", "RIGHT", "FULL", "INNER", "OUTER"}:
+            modifier -= 1
+        return modifier < scope.lo or self.upper(modifier) not in {"CROSS", "NATURAL"}
+
+    def source_slot(self, scope: _Scope, clause: str, tail: str, source: _Source,
+                    last: int, current: Token | None, offset: int) -> tuple[str, bool]:
+        """Distinguish replacing a relation/keyword prefix from appending after a source."""
+        if current and current.end == offset and current.kind in _IDS and (
+                current.kind != "quoted_identifier" or _closed_identifier(current.text)):
+            # An accepted table edit lands immediately after its AS alias, with
+            # no trailing space. Never replace that alias with the next keyword.
+            if source.alias is not None and self.tokens[source.alias] == current:
+                if (self.upper(source.alias - 1) == "AS" or not any(
+                        phrase.startswith(current.text.upper()) for phrase in continuations_for(tail, self.dialect) or ())):
+                    return tail, True
+            elif (source.alias is None and self.tokens[source.body_end - 1] == current
+                  and (source.relation.table or any(r.name == source.relation.name for r in scope.ctes))
+                  and (source.body_end == scope.hi or self.tokens[source.body_end].text != ".")):
+                return tail, True
+        if last >= source.body_end:
+            word = self.upper(last)
+            if word == "AS":
+                return "alias_name", False
+            if word in {"LEFT", "RIGHT", "FULL"}:
+                return "outer_join_modifier", False
+            if word in {"INNER", "OUTER", "CROSS", "NATURAL"}:
+                return "join_modifier", False
+        return (tail if last in {source.body_end - 1, source.end - 1} else clause), False
+
+    def expression_slot(self, clause: str, anchor: int, last: int) -> str:
+        """Only a committed operand can introduce a following clause (not '=' or 'AND')."""
+        if clause in {"order", "group"} and last == anchor:
+            return "by_keyword"
+        if clause == "using" and self.pairs.get(anchor + 1) == last:
+            return "after_from"
+        if clause not in {"select", "on", "where", "having", "group", "order"} or last <= anchor:
+            return clause
+        word = self.upper(last)
+        if clause == "select" and word == "AS":
+            return "alias_name"
+        if clause == "order":
+            if word in {"ASC", "DESC"}:
+                return "after_direction"
+            if word == "NULLS":
+                return "nulls_order"
+        if clause == "on" and word in {"LEFT", "RIGHT", "FULL", "INNER", "OUTER", "CROSS", "NATURAL"}:
+            return "outer_join_modifier" if word in {"LEFT", "RIGHT", "FULL"} else "join_modifier"
+        previous = self.tokens[last]
+        star = clause == "select" and previous.text == "*" and (
+            last == anchor + 1 or self.tokens[last - 1].text in {",", "."} or self.upper(last - 1) in {"ALL", "DISTINCT"})
+        operand = (previous.kind in {"number", "string", "dollar_string", "quoted_identifier", "parameter"}
+                   or previous.text == ")" or word in {"END", "NULL", "TRUE", "FALSE"}
+                   or word and word not in keywords_for(self.dialect))
+        if star or operand:
+            case_depth = 0
+            between = False
+            for i in self.top(anchor + 1, last + 1):
+                part = self.upper(i)
+                if part == "CASE":
+                    case_depth += 1
+                elif part == "END" and case_depth:
+                    case_depth -= 1
+                elif not case_depth and part in {"BETWEEN", "AND", "OR"}:
+                    between = part == "BETWEEN"
+            if case_depth:
+                return clause
+            if between and clause in {"on", "where", "having"}:
+                return "between_bounds"
+            return "after_" + clause
+        return clause
+
     def clause(self, scope: _Scope, offset: int) -> tuple[str, int]:
-        clause, anchor = "statement", scope.lo
+        boundary, clause = next((step for step in reversed(scope.cte_steps) if step[0] <= offset),
+                                (scope.start, "statement"))
+        anchor = scope.lo
         names = {"SELECT": "select", "FROM": "from", "JOIN": "join", "ON": "on", "USING": "using",
                  "WHERE": "where", "GROUP": "group", "ORDER": "order", "HAVING": "having", "SET": "update_set",
                  "INSERT": "insert", "UPDATE": "update", "DELETE": "delete", "INTO": "insert",
@@ -673,6 +783,8 @@ class _Model:
         for i in self.top(scope.lo, scope.hi):
             if self.tokens[i].end > offset:
                 break
+            if self.tokens[i].start < boundary:
+                continue
             word = self.upper(i)
             if word in names and not (word in {"ON", "FROM"} and self.upper(i - 1) == "DISTINCT"):
                 clause, anchor = ("table" if word == "FROM" and clause == "delete" else names[word]), i
@@ -797,6 +909,12 @@ def analyze(document: str, offset: int, schema: SchemaContext, *, dialect: str =
     root.start, root.end = statement_start, statement_end
     scope = _active(root, offset)
     clause, anchor = model.clause(scope, start)
+    if (clause in {"cte_first_name", "cte_name"} and current and current.end == offset
+            and current.kind in {"word", "quoted_identifier"} and (not quote or _closed_identifier(current.text))
+            and not (clause == "cte_first_name" and "RECURSIVE".startswith(token.upper()))
+            and model.clause(scope, offset)[0] == "cte_as"):
+        # AS ( is an insertion after the chosen name, not a replacement for it.
+        clause, start, end, token, quote = "cte_as", offset, offset, "", ""
     before = [i for i in range(scope.lo, scope.hi) if tokens[i].end <= start]
     if clause == "update_set":
         assignment = anchor + 1
@@ -823,41 +941,17 @@ def analyze(document: str, offset: int, schema: SchemaContext, *, dialect: str =
     if clause in {"insert_columns", "update_set"}:
         relations = tuple(r for r in relations if not r.outer)[:1]
     join_target, join_left = None, ()
-    visible_sources = [(at, r) for at, r in scope.sources if tokens[at].start < offset]
+    source_tail = "after_from"
+    visible_sources = [s for s in scope.sources if tokens[s.start].start < offset]
     if clause in {"on", "using"} and visible_sources:
-        join_target = visible_sources[-1][1]
-        join_left = tuple(r for _, r in visible_sources[:-1])
+        join_target = visible_sources[-1].relation
+        join_left = tuple(s.relation for s in visible_sources[:-1])
         relations = _merge(join_left + (join_target,), tuple(r for r in relations if r.outer), dialect)
-    elif clause == "join" and visible_sources:
-        join_left = tuple(r for at, r in visible_sources if at < anchor)
-        joined = [(at, r) for at, r in visible_sources if at > anchor]
-        if joined:
-            at, candidate = joined[-1]
-            _, after = model.identifier(at, scope.hi)
-            if after < scope.hi and tokens[after].text == "(":
-                after = min(model.pairs.get(after, scope.hi) + 1, scope.hi)
-            explicit_alias = model.upper(after) == "AS"
-            if explicit_alias:
-                after += 1
-            if after < scope.hi and tokens[after].kind in _IDS and model.upper(after) not in _STOP:
-                if tokens[after].end <= start:
-                    after += 1
-                elif not explicit_alias:
-                    candidate = replace(candidate, reference=candidate.name)
-            if after > at and tokens[after - 1].end <= start and not explicit_alias:
-                join_target = candidate
-            elif explicit_alias and after > at and tokens[after - 1].end <= start and model.upper(after - 1) != "AS":
-                join_target = candidate
-    relation_transition = False
-    if clause in {"from", "join"}:
-        sources = [(at, relation) for at, relation in visible_sources if at > anchor]
-        if sources and (not before or tokens[before[-1]].text not in {",", "."}) and (not before or model.upper(before[-1]) != "AS"):
-            at, relation = sources[-1]
-            _, after = model.identifier(at, scope.hi)
-            relation_transition = after > at and tokens[after - 1].end <= start
-    elif clause == "on" and before and before[-1] > anchor:
-        previous = tokens[before[-1]]
-        relation_transition = previous.kind in _IDS | {"number", "string"} or previous.text == ")"
+        if clause == "on" and anchor + 1 < scope.hi and tokens[anchor + 1].start < qualifier_start:
+            join_target = None  # Don't propose a whole FK predicate as an operand of another.
+    elif clause == "join" and model.conditioned_join(scope, anchor):
+        source_tail = "after_join"
+        join_left = tuple(s.relation for s in visible_sources if s.start < anchor)
     # The innermost open call supplies the active argument, not commas in children.
     call = None
     containing = [i for i in range(scope.lo, scope.hi) if tokens[i].text == "(" and tokens[i].end <= offset
@@ -907,6 +1001,20 @@ def analyze(document: str, offset: int, schema: SchemaContext, *, dialect: str =
     if before and (tokens[before[-1]].text == "::" or (
         len(before) > 1 and tokens[before[-1]].text == tokens[before[-2]].text == ":")):
         clause = "type"
+    if not containing and not blocked:
+        last = before[-1] if before else scope.lo - 1
+        if clause in {"from", "join"} and visible_sources and visible_sources[-1].start > anchor:
+            source = visible_sources[-1]
+            clause, append = model.source_slot(scope, clause, source_tail, source, last, current, offset)
+            if append:
+                start = end = offset
+                token = qualifier = quote = ""
+            if clause == "after_join":
+                join_target = source.relation
+                if source.alias is not None and tokens[source.alias].end > start:
+                    join_target = replace(join_target, reference=join_target.name)
+        elif not qualifier and not quote and token != "*":
+            clause = model.expression_slot(clause, anchor, last)
     value_field = None
     rhs = before[-1] if before else -1
     # IN lists retain their field across commas; nested calls retain their own context.
@@ -956,9 +1064,10 @@ def analyze(document: str, offset: int, schema: SchemaContext, *, dialect: str =
                 used.append(_name(tokens[a]))
     identifiers = tuple(dict.fromkeys([r.reference for r in relations] + [r.reference for r in scope.ctes] + list(parameters)))
     group_expressions, group_outputs, group_prefix, group_slot = (), None, "", False
-    if clause == "group" or (clause in {"from", "on", "where", "having"}
-                              and (not token or "group by".startswith(token.lower()))):
-        group_expressions, group_outputs, group_prefix, group_slot = model.grouping(scope, start, end, clause, anchor)
+    if (clause in {"group", "by_keyword"} and model.upper(anchor) == "GROUP"
+            or clause in {"after_from", "after_on", "after_where"} and token and "group by".startswith(token.lower())):
+        group_expressions, group_outputs, group_prefix, group_slot = model.grouping(
+            scope, start, end, "group" if clause == "by_keyword" else clause, anchor)
     statement_relation_start = None
     if clause == "statement" and scope is root:
         relation_start = qualifier_start
@@ -967,5 +1076,4 @@ def analyze(document: str, offset: int, schema: SchemaContext, *, dialect: str =
     return Context(start, end, token, qualifier, quote, clause, blocked, relations, scope.ctes, scope.outputs,
                    join_target, join_left, call, value_field, token if value_field else "", literal,
                    tuple(used), statement_start, statement_end, identifiers,
-                   group_outputs, group_expressions, group_prefix, group_slot, relation_transition,
-                   statement_relation_start)
+                   group_outputs, group_expressions, group_prefix, group_slot, statement_relation_start)

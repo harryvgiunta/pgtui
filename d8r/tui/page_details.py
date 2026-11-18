@@ -12,6 +12,7 @@ from textual.worker import Worker, get_current_worker
 
 from d8r.ai.client import AIError
 from d8r.ai.page_details import generate_details
+from .editing import DraftTextArea
 
 if TYPE_CHECKING:
     from .app import D8RApp
@@ -32,7 +33,7 @@ class PageDetails(Vertical):
                          tooltip="Send this query to the configured AI provider to name and describe it; never runs it")
             yield Button("Cancel", id="page-details-cancel", compact=True)
         yield Input(placeholder="Page name", id="page-name")
-        yield TextArea("", id="page-description", soft_wrap=True)
+        yield DraftTextArea("", id="page-description", soft_wrap=True)
         yield Static("Name and description autosave. AI receives only the query text.",
                      id="page-details-status", markup=False)
 

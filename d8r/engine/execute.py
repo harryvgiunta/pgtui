@@ -8,13 +8,16 @@ from contextlib import nullcontext
 from time import perf_counter
 from uuid import uuid4
 
-from d8r.sql import SqlError, lex_sql, quote_identifier, relation_name, relation_parts, split_statements
+from d8r.sql import SqlError, cte_declarations, lex_sql, quote_identifier, relation_name, relation_parts, split_statements
 
 from .datasources import DataSource, EngineError, _safe_error, cancel_source, transaction_open
 
 _DEFAULT_ROWS = 10000
 _PLAN_CHARS = 64000
-_WRITE_WORDS = frozenset("INSERT UPDATE DELETE MERGE INTO CREATE ALTER DROP TRUNCATE COPY CALL DO EXECUTE PREPARE GRANT REVOKE VACUUM ANALYZE REFRESH LOCK SET RESET".split())
+# Standalone SET is already excluded by _QUERY_WORDS. Within a query SET
+# also names the generated column of a recursive CTE's SEARCH/CYCLE clause;
+# UPDATE/MERGE and other writes remain prohibited independently.
+_WRITE_WORDS = frozenset("INSERT UPDATE DELETE MERGE INTO CREATE ALTER DROP TRUNCATE COPY CALL DO EXECUTE PREPARE GRANT REVOKE VACUUM ANALYZE REFRESH LOCK RESET".split())
 _QUERY_WORDS = frozenset(("SELECT", "WITH", "VALUES", "TABLE"))
 _DUCK_EXTERNAL = frozenset(("COPY", "EXPORT", "IMPORT", "ATTACH", "DETACH", "LOAD", "INSTALL", "EXTENSION", "PREPARE", "EXECUTE", "CALL"))
 _UNSAFE_FUNCTIONS = frozenset(("set_config", "nextval", "setval", "pg_notify", "pg_stat_file", "pg_file_rename", "pg_file_unlink", "pg_file_write", "pg_promote", "http", "system", "shell", "exec"))
@@ -30,6 +33,7 @@ def _row_limit(value) -> int:
 def _read_functions(tokens):
     """Check explicit calls and collect their names for the native volatility check."""
     names = set()
+    declarations = {name for name, _ in cte_declarations(tokens)}
     for index, token in enumerate(tokens):
         if token.kind not in {"word", "quoted_identifier"}:
             continue
@@ -37,7 +41,7 @@ def _read_functions(tokens):
         following = tokens[index + 1].text if index + 1 < len(tokens) else ""
         if name.lower() == "u" and following == "&":
             raise EngineError("Escaped Unicode identifiers are not accepted by read-only tools")
-        if following == "(":
+        if following == "(" and index not in declarations:
             if name.lower() in _UNSAFE_FUNCTIONS or name.lower().startswith(_UNSAFE_PREFIXES):
                 raise EngineError("Read-only tools cannot call file, network, session-control or mutation functions")
             names.add(name)

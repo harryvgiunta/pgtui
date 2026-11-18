@@ -61,6 +61,15 @@ COMMIT; -- trailing comment
     assert "$body$ SELECT x;" in document.statements[3]
 
 
+def test_cte_script_splits_after_postgres_cr_line_comment():
+    first = "-- report\rWITH q(v) AS (VALUES (';')) SELECT v FROM q"
+    second = "WITH q AS (SELECT $$a;b$$ AS v) SELECT v FROM q"
+    script = f"{first};\r{second};"
+    assert parse_sql(script).sql == script
+    assert split_statements(script) == (first, second)
+    assert split_statements(script, dialect="sqlite") == ()  # SQLite comments end only at LF.
+
+
 def test_comment_only_statements_are_not_executed():
     assert split_statements(" ; -- only a comment\n; /* also /* nested */ */ ; ") == ()
     assert split_statements("-- first\nSELECT 1; /* second */ SELECT 2;") == (
@@ -207,6 +216,7 @@ def test_function_body_semicolon_in_literal_is_not_a_statement_separator():
 @pytest.mark.parametrize("body", [
     "", "-- comment", "SELECT 1; SELECT 2", "DELETE FROM data", "CREATE TABLE t(id int)",
     "BEGIN", "WITH q AS (SELECT 1) DELETE FROM data",
+    "WITH q AS (SELECT 1), gone(id) AS (DELETE FROM data RETURNING id) SELECT * FROM gone",
 ])
 def test_function_bodies_must_be_one_query(body):
     with pytest.raises(SqlError):

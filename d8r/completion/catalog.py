@@ -41,6 +41,47 @@ def keywords_for(dialect: str) -> tuple[str, ...]:
 
 KEYWORDS = tuple(sorted(set((_COMMON + " " + _POSTGRES + " " + _SQLITE + " " + _DUCKDB).split())))
 
+
+# Pure syntax positions: order here is the order offered for an empty prefix.
+# These are common continuations, not a complete SQL grammar.
+_AFTER_SOURCE = ("WHERE", "JOIN", "LEFT JOIN", "INNER JOIN", "GROUP BY", "ORDER BY", "LIMIT",
+                 "RIGHT JOIN", "FULL JOIN", "CROSS JOIN", "NATURAL JOIN", "OFFSET")
+_TESTS = ("IS NULL", "IS NOT NULL", "IN", "NOT IN", "BETWEEN", "LIKE", "ILIKE")
+_CONTINUATIONS = {
+    "after_from": _AFTER_SOURCE,
+    "after_join": ("ON", "USING"),
+    "join_modifier": ("JOIN",),
+    "outer_join_modifier": ("JOIN", "OUTER JOIN"),
+    "after_on": ("AND", *_AFTER_SOURCE, "OR", *_TESTS),
+    "after_where": ("AND", "OR", "GROUP BY", "ORDER BY", "LIMIT", *_TESTS),
+    "after_having": ("AND", "OR", "ORDER BY", "LIMIT", *_TESTS),
+    "between_bounds": ("AND",),
+    "after_select": ("FROM", "AS", "ORDER BY", "LIMIT"),
+    "by_keyword": ("BY",),
+    "after_group": ("HAVING", "ORDER BY", "LIMIT"),
+    "after_order": ("ASC", "DESC", "NULLS FIRST", "NULLS LAST", "LIMIT", "OFFSET"),
+    "after_direction": ("NULLS FIRST", "NULLS LAST", "LIMIT", "OFFSET"),
+    "nulls_order": ("FIRST", "LAST"),
+    "alias_name": (),
+    "cte_first_name": ("RECURSIVE",),
+    "cte_name": (),
+    "cte_as": ("AS (",),
+    "cte_open": ("(", "MATERIALIZED (", "NOT MATERIALIZED ("),
+    "cte_materialized": ("MATERIALIZED (",),
+    "cte_paren": ("(",),
+    "cte_body": ("SELECT", "VALUES", "WITH"),
+    "cte_main": ("SELECT", "INSERT", "UPDATE", "DELETE", "VALUES"),
+}
+
+
+@lru_cache(maxsize=256)
+def continuations_for(clause: str, dialect: str) -> tuple[str, ...] | None:
+    """None is an expression/relation position; () is a user-defined name."""
+    phrases = _CONTINUATIONS.get(clause)
+    if phrases is None:
+        return None
+    return tuple(phrase for phrase in phrases if phrase == "(" or phrase.split()[0] in keywords_for(dialect))
+
 _TYPES = {
     "postgres": ("smallint", "integer", "bigint", "numeric", "decimal", "real", "double precision",
                  "text", "varchar", "char", "boolean", "date", "time", "timestamp", "timestamptz",

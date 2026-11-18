@@ -93,6 +93,47 @@ async def send(app, pilot, prompt="Show one value"):
     return app.panel.chat
 
 
+@async_test
+async def test_composer_select_all_and_accelerated_navigation(session):
+    app = ConversationHost(session)
+    async with app.run_test(size=(90, 40)) as pilot:
+        await pilot.click("#conversation-new")
+        composer = app.panel.query_one("#ai-input", TextArea)
+        draft = "\n".join(["alpha bravo"] * 30)
+        composer.load_text(draft)
+        composer.move_cursor((0, 11))
+        composer.focus()
+        await pilot.press("alt+left")
+        assert composer.cursor_location == (0, 6)
+        await pilot.press("alt+right")
+        assert composer.cursor_location == (0, 11)
+        await pilot.press("alt+down")
+        assert composer.cursor_location[0] == composer.content_size.height
+        await pilot.press("alt+up", "ctrl+a")
+        assert composer.selected_text == draft
+        await pilot.press("x")
+        assert composer.text == "x" and not app.panel.chat.messages
+
+
+@async_test
+async def test_transcript_uses_space_above_composer_after_resize(session):
+    app = ConversationHost(session)
+    async with app.run_test(size=(90, 35)) as pilot:
+        await pilot.click("#conversation-new")
+        conversation = app.panel.query_one("#ai-conversation")
+        composer = app.panel.query_one("#ai-input")
+        status = app.panel.query_one("#ai-status")
+        for height, transcript in [(35, "You: hello"), (55, "Assistant: response\n" * 100)]:
+            app.panel.chat.transcript = transcript
+            app.ai_chats.changed(app.panel.chat)
+            await pilot.resize_terminal(90, height)
+            await pilot.pause()
+            assert conversation.region.bottom == status.region.y
+            assert 0 <= composer.region.y - status.region.bottom <= 1
+            assert composer.region.bottom <= app.screen.region.bottom
+        assert conversation.max_scroll_y > 0  # The transcript scrolls, not the message box.
+
+
 @pytest.mark.parametrize("mode", ["default", "execute", "off"])
 @async_test
 async def test_final_pages_checked_before_apply_without_provider_tools(session, monkeypatch, mode):

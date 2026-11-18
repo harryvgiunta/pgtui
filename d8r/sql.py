@@ -7,7 +7,7 @@ and comment. Only saved relation calls and their declared parameter kinds expand
 """
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 import re
 from types import MappingProxyType
@@ -173,6 +173,7 @@ class Token:
     end: int
 
 
+_PG_LINE_END = re.compile(r"[\r\n]")
 _WORD = re.compile(r"(?:[^\W\d]|_)[\w$]*", re.UNICODE)
 _DOLLAR = re.compile(r"\$(?:[^\W\d][\w]*|_[\w]*)?\$", re.UNICODE)
 _NUMBER = re.compile(r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
@@ -247,8 +248,13 @@ def lex_sql(text: str, *, dialect: str = "postgres") -> tuple[Token, ...]:
                 i += 1
             kind = "whitespace"
         elif text.startswith("--", i):
-            end = text.find("\n", i + 2)
-            i = size if end < 0 else end
+            # PostgreSQL ends a line comment at CR or LF; SQLite requires LF.
+            if dialect == "postgres":
+                end = _PG_LINE_END.search(text, i + 2)
+                i = end.start() if end else size
+            else:
+                end = text.find("\n", i + 2)
+                i = size if end < 0 else end
             kind = "comment"
         elif text.startswith("/*", i):
             i += 2
@@ -427,6 +433,51 @@ def split_statements(text: str, *, dialect: str = "postgres") -> tuple[str, ...]
     return tuple(statements)
 
 
+def cte_declarations(tokens: Sequence[Token]) -> Iterable[tuple[int, int]]:
+    """Yield (name, body opening) indices in significant tokens, not references.
+
+    In particular, ``WITH name(col) AS (...)`` does not call name(). Track
+    body parentheses so commas in a SELECT list cannot introduce declarations.
+    Unrecognized native syntax stays the database's concern.
+    """
+    candidate = -1
+    body = -1
+    stack: list[bool] = []
+    for i, token in enumerate(tokens):
+        if i == candidate and token.kind in _IDENTIFIERS:
+            j = i + 1
+            if j < len(tokens) and tokens[j].text == "(":
+                # Column aliases, not arbitrary parenthesized expressions.
+                j += 1
+                while (j + 1 < len(tokens) and tokens[j].kind in _IDENTIFIERS
+                       and tokens[j + 1].text == ","):
+                    j += 2
+                if (j + 1 >= len(tokens) or tokens[j].kind not in _IDENTIFIERS
+                        or tokens[j + 1].text != ")"):
+                    continue
+                j += 2
+            if j < len(tokens) and tokens[j].text.upper() == "AS":
+                j += 1
+                if j < len(tokens) and tokens[j].text.upper() == "NOT":
+                    j += 1
+                    if j >= len(tokens) or tokens[j].text.upper() != "MATERIALIZED":
+                        continue
+                if j < len(tokens) and tokens[j].text.upper() == "MATERIALIZED":
+                    j += 1
+                if j < len(tokens) and tokens[j].text == "(":
+                    body = j
+                    yield i, j
+        if token.kind == "word" and token.text.upper() == "WITH":
+            candidate = i + 1
+            if candidate < len(tokens) and tokens[candidate].text.upper() == "RECURSIVE":
+                candidate += 1
+        elif token.text == "(":
+            stack.append(i == body)
+        elif token.text == ")" and stack and stack.pop():
+            if i + 1 < len(tokens) and tokens[i + 1].text == ",":
+                candidate = i + 2
+
+
 # These are lexical relation boundaries, not a grammar/keyword whitelist. A
 # database may accept other syntax; only known saved calls at these sites expand.
 _FROM_END = frozenset({
@@ -435,7 +486,7 @@ _FROM_END = frozenset({
 })
 _ALIAS_BOUNDARY = _FROM_END | frozenset({
     "JOIN", "LEFT", "RIGHT", "FULL", "INNER", "OUTER", "CROSS", "NATURAL",
-    "ON", "USING", "WITH", "TABLESAMPLE", "AS", "PIVOT", "UNPIVOT",
+    "ON", "USING", "WITH", "TABLESAMPLE", "AS", "PIVOT", "UNPIVOT", "SELECT",
 })
 
 
@@ -452,6 +503,9 @@ def _relation_sites(tokens: tuple[Token, ...]) -> Iterable[int]:
     Each expression parenthesis gets a fresh frame, so FROM in extract/trim and
     commas in arrays, calls, windows or subqueries never act on an outer FROM.
     """
+    # A CTE body is a query even when it starts with DuckDB's FROM-first
+    # syntax. Ordinary expression parentheses must not inherit this state.
+    query_openings = {opening for _, opening in cte_declarations(tokens)}
     frames = [_RelationFrame()]
     for index, token in enumerate(tokens):
         frame = frames[-1]
@@ -460,7 +514,7 @@ def _relation_sites(tokens: tuple[Token, ...]) -> Iterable[int]:
         if text in {"(", "[", "{"} and token.kind == "symbol":
             relation_group = frame.expect and text == "("
             frame.expect = False
-            frames.append(_RelationFrame(in_from=relation_group, expect=relation_group))
+            frames.append(_RelationFrame(query=index in query_openings, in_from=relation_group, expect=relation_group))
         elif text in {")", "]", "}"} and token.kind == "symbol":
             if len(frames) > 1:
                 frames.pop()
@@ -570,6 +624,9 @@ def _function_body(fn: FnDef, *, dialect: str = "postgres") -> str:
     tokens = _significant(body, dialect=dialect)
     if tokens[0].kind != "word" or tokens[0].text.upper() not in {"SELECT", "WITH", "VALUES", "TABLE"}:
         raise SqlError(f"{fn.name}() body must be a SELECT, WITH, VALUES or TABLE query.")
+    for _, opening in cte_declarations(tokens):
+        if opening + 1 < len(tokens) and tokens[opening + 1].text.upper() in {"INSERT", "UPDATE", "DELETE", "MERGE"}:
+            raise SqlError(f"{fn.name}() cannot contain a data-modifying CTE.")
     if tokens[0].text.upper() == "WITH":
         depth = 0
         for token in tokens[1:]:

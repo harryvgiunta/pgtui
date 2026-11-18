@@ -67,6 +67,24 @@ async def test_absolute_spans_suffixes_and_single_undo(parquet_source, document,
 
 
 @async_test
+async def test_accept_cte_and_clause_after_generated_alias_then_run(parquet_source):
+    app = D8RApp(configured(parquet_source))
+    async with app.run_test(size=(140, 45)) as pilot:
+        await load_editor(app, pilot, "WITH picked ", (0, 12))
+        await pilot.press("ctrl+space", "tab", "s", "e", "l", "tab")
+        app.editor.insert("id FROM data) SELECT * FROM pic")
+        await pilot.press("ctrl+space", "tab")
+        assert app.editor.text.endswith("FROM picked AS p")
+        await pilot.press("ctrl+space")
+        assert app.palette.view.labels[:3] == ["WHERE", "JOIN", "LEFT JOIN"]
+        await pilot.press("tab")
+        app.editor.insert("p.id = 2")
+        await pilot.press("ctrl+enter")
+        await app.workers.wait_for_complete()
+        assert app._main_outcome.ok and app._main_outcome.rows == [[2]]
+
+
+@async_test
 async def test_local_only_signature_and_stable_highlight(parquet_source, monkeypatch):
     requests = []
 
@@ -96,8 +114,56 @@ async def test_local_only_signature_and_stable_highlight(parquet_source, monkeyp
         assert not app.palette.is_open
         assert not requests
         app.update_settings(intellisense=False)
-        await pilot.press("ctrl+space", "ctrl+shift+space")
-        assert not app.palette.is_open and not requests
+        await pilot.press("escape", "ctrl+space", "ctrl+shift+space")
+        assert not app.palette.is_open and not requests and not app.session.intellisense
+
+
+@async_test
+async def test_escape_from_closed_palette_keeps_commands_but_not_sql_completion(parquet_source):
+    from d8r.tui.settings import SettingsScreen
+
+    app = D8RApp(configured(parquet_source))
+    async with app.run_test(size=(140, 45)) as pilot:
+        await load_editor(app, pilot, "SEL", (0, 3))
+        app.palette.close()  # A hidden popup doesn't mean completion was muted.
+        await pilot.press("escape", "enter", "s", "e", "l", "ctrl+space", "tab")
+        await pilot.pause()
+        assert app.editor.text == "SEL\nsel"
+        assert app.palette.view is None and not app.palette.details.display
+        assert app.session.intellisense
+
+        await pilot.press("backslash", *"settings")
+        await pilot.pause()
+        assert app.palette.view.phase == "command"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, SettingsScreen)
+        await pilot.press("escape")  # Close Settings; don't toggle the editor.
+        assert app.editor.text == "SEL\nsel"
+        await load_editor(app, pilot, "SELECT l FROM data", (0, 8))
+        await pilot.press("a")
+        await pilot.pause()
+        assert app.palette.view is None
+        await pilot.press("escape")
+        assert app.palette.is_open and any("label" in entry.insert for entry in app.palette.view.entries)
+
+
+@async_test
+async def test_escape_mutes_history_and_queued_sync_together(parquet_source):
+    session = configured(parquet_source)
+    assert session.run("SELECT 42").ok
+    app = D8RApp(session)
+    async with app.run_test(size=(140, 45)) as pilot:
+        await load_editor(app, pilot, "SEL", (0, 3))
+        await pilot.press("ctrl+space")
+        assert any(entry.replace_document for entry in app.palette.view.entries)
+        # Toggle before the already-queued timer gets an event-loop turn.
+        app.palette.queue_sync()
+        app.palette.escape()
+        await pilot.pause()
+        assert app.palette.view is None and not app.palette.is_open
+        await pilot.press("escape")
+        assert any(entry.replace_document for entry in app.palette.view.entries)
 
 
 @pytest.mark.parametrize("source_fixture,table", [("parquet_source", "data"), ("d1_source", "records")])
@@ -208,14 +274,22 @@ async def test_automatic_ai_only_after_real_typing_idle(parquet_source, monkeypa
         assert app.editor.text == "SELECT la FROM data"
         assert app.palette.view.phase == "ai"
         await pilot.press("escape")
-        await pilot.press("b")
+        await pilot.press("b", "ctrl+space", "f4")
         await pilot.pause(0.85)
-        assert len(requests) == 1  # Escape still revokes automatic AI, not local completion.
+        assert app.palette.view is None and not app.palette.details.display
+        assert len(requests) == 1 and session.ai_completion
+        await pilot.press("escape")
+        await pilot.pause(0.85)
+        assert len(requests) == 1  # Resuming local offers isn't an AI request.
         assert app.palette.is_open and app.palette.view.phase == "argument"
         assert any(entry.kind == "column" and "label" in entry.insert for entry in app.palette.view.entries)
+        ready.clear()
+        await pilot.press("e")
+        await asyncio.wait_for(ready.wait(), 3)
+        assert len(requests) == 2
 
 
-@pytest.mark.parametrize("change", ["escape", "text", "caret", "source", "schema", "functions",
+@pytest.mark.parametrize("change", ["escape", "escape-roundtrip", "text", "caret", "source", "schema", "functions",
                                     "provider", "provider-roundtrip", "headers", "page", "mode", "off", "automatic-off", "blur"])
 @async_test
 async def test_late_ai_response_is_never_published(parquet_source, monkeypatch, change):
@@ -238,8 +312,10 @@ async def test_late_ai_response_is_never_published(parquet_source, monkeypatch, 
         await load_editor(app, pilot, "SELECT la FROM data", (0, 9))
         await pilot.press("ctrl+shift+space")
         await asyncio.wait_for(started.wait(), 2)
-        if change == "escape":
+        if change in {"escape", "escape-roundtrip"}:
             await pilot.press("escape")
+            if change == "escape-roundtrip":
+                await pilot.press("escape")
         elif change == "text":
             await pilot.press("x", "ctrl+z")
         elif change == "caret":
@@ -614,6 +690,9 @@ async def test_postgres_table_first_typing_needs_no_manual_completion(postgres_s
                     await pilot.press("ctrl+n", "e", "t")
             await pilot.press("l")
             await pilot.pause()
+            if scenario in {"dismissed", "new_page"}:
+                assert app.palette.view is None
+                await pilot.press("escape")
             assert app.palette.is_open
             assert any(entry.table == relation and entry.kind == "table" for entry in app.palette.view.entries)
             typed = "etl"
