@@ -10,12 +10,12 @@ from .datasources import (
     refresh_source_schema,
     transaction_open,
 )
-from .execute import column_values, execute_sql, sample_rows
+from .execute import column_values, execute_sql, explain_sql, prepare_sql, sample_rows
 from .parquet import add_parquet_source
 from .d1api import add_d1_source
 
 __all__ = [
     "POSTGRES_VERSION", "DataSource", "EngineError", "add_postgres_source",
     "add_parquet_source", "add_d1_source", "cancel_source", "close_source", "column_values",
-    "execute_sql", "load", "refresh_source_schema", "sample_rows", "transaction_open",
+    "execute_sql", "explain_sql", "load", "prepare_sql", "refresh_source_schema", "sample_rows", "transaction_open",
 ]

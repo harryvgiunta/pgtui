@@ -1,6 +1,7 @@
 """Bounded native execution; ordinary Run never translates or adds SQL LIMIT."""
 from __future__ import annotations
 
+import json
 import math
 import threading
 from time import perf_counter
@@ -11,6 +12,7 @@ from d8r.sql import SqlError, lex_sql, quote_identifier, relation_name, relation
 from .datasources import DataSource, EngineError, _safe_error, cancel_source, transaction_open
 
 _DEFAULT_ROWS = 10000
+_PLAN_CHARS = 64000
 _WRITE_WORDS = frozenset("INSERT UPDATE DELETE MERGE INTO CREATE ALTER DROP TRUNCATE COPY CALL DO EXECUTE PREPARE GRANT REVOKE VACUUM ANALYZE REFRESH LOCK SET RESET".split())
 _QUERY_WORDS = frozenset(("SELECT", "WITH", "VALUES", "TABLE"))
 _DUCK_EXTERNAL = frozenset(("COPY", "EXPORT", "IMPORT", "ATTACH", "DETACH", "LOAD", "INSTALL", "EXTENSION", "PREPARE", "EXECUTE", "CALL"))
@@ -67,6 +69,20 @@ def _pg_result(con, sql, cap, readonly):
         return columns, dtypes, rows, total, cursor.statusmessage or "OK"
 
 
+def _pg_explain(con, sql):
+    from psycopg.types.string import TextLoader
+
+    # EXPLAIN is not valid in DECLARE CURSOR. libpq buffers this single JSON
+    # cell; bound it before JSON decoding and never publish a partial plan tree.
+    with con.cursor() as cursor:
+        cursor.adapters.register_loader("json", TextLoader)
+        cursor.execute("EXPLAIN (FORMAT JSON, ANALYZE FALSE) " + sql, prepare=False)
+        text = cursor.fetchone()[0]
+    truncated = len(text) > _PLAN_CHARS
+    return {"plan": None if truncated else json.loads(text),
+            "truncated": truncated, "plan_limit": _PLAN_CHARS}
+
+
 def _duck_result(con, sql, cap, statement_type):
     cursor = con.execute(sql)
     description = cursor.description
@@ -94,11 +110,35 @@ def execute_sql(source: DataSource, sql: str, *, max_rows=10000, readonly=False,
     then use an outer LIMIT, not a connection-local read-only transaction. This
     does not bound scan cost. Cancellation/deadlines cannot roll back remote work.
     """
+    return _execute_statement(source, sql, max_rows=max_rows, readonly=readonly, timeout=timeout)
+
+
+def prepare_sql(source: DataSource, sql: str, *, timeout=30.0) -> None:
+    """Plan one read-only query on its native engine without running the query."""
+    _execute_statement(source, sql, max_rows=1, readonly=True, timeout=timeout, prepare_only=True)
+
+
+def explain_sql(source: DataSource, sql: str, *, timeout=30.0) -> dict:
+    """Return a bounded PostgreSQL JSON estimate, never EXPLAIN ANALYZE.
+
+    Planning can evaluate immutable functions; the ordinary read-only guards
+    still apply. This is not an execution check or a privileged-function sandbox.
+    """
+    if source.kind != "postgres-live":
+        raise EngineError("Query plans are available only for connected PostgreSQL sources")
+    return _execute_statement(source, sql, max_rows=1, readonly=True, timeout=timeout, explain=True)
+
+
+def _execute_statement(source, sql, *, max_rows, readonly, timeout, explain=False, prepare_only=False):
     cap = _row_limit(max_rows)
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
         raise EngineError("Query timeout must be a positive finite number")
     if not isinstance(sql, str):
         raise EngineError("SQL must be text")
+    if explain:
+        if len(sql) > 64000:
+            raise EngineError("Supply a query of at most 64,000 characters")
+        timeout = min(timeout, 30.0)
     try:
         statements = split_statements(sql, dialect=source.dialect)
         words = _words(sql, dialect=source.dialect)
@@ -108,7 +148,7 @@ def execute_sql(source: DataSource, sql: str, *, max_rows=10000, readonly=False,
         raise EngineError("Execute exactly one SQL statement at a time")
     if source.kind == "d1-live":
         from .d1api import execute_d1
-        return execute_d1(source, sql, statements[0], cap=cap, readonly=readonly, timeout=timeout)
+        return execute_d1(source, sql, statements[0], cap=cap, readonly=readonly, timeout=timeout, prepare_only=prepare_only)
     first = words[0] if words else ""
     with source._lock:
         if source.con is None or source.kind not in {"postgres-live", "parquet"}:
@@ -152,6 +192,20 @@ def execute_sql(source: DataSource, sql: str, *, max_rows=10000, readonly=False,
                     source.con.execute("BEGIN TRANSACTION READ ONLY")
                     own_transaction = True
                     source._transaction = True
+            if prepare_only or explain:
+                if explain:
+                    result = _pg_explain(source.con, sql)
+                else:
+                    # Fixed EXPLAIN, never caller-supplied options or ANALYZE.
+                    if source.kind == "postgres-live":
+                        with source.con.cursor() as cursor:
+                            cursor.execute("EXPLAIN (ANALYZE FALSE) " + sql, prepare=False)
+                    else:
+                        source.con.execute("EXPLAIN " + sql)
+                    result = {}
+                if expired.is_set():
+                    raise EngineError("Query deadline exceeded")
+                return {**result, "ms": (perf_counter() - started) * 1000}
             if source.kind == "postgres-live":
                 columns, dtypes, rows, total, status = _pg_result(source.con, sql, cap, readonly)
             else:

@@ -76,7 +76,7 @@ def binding_rows() -> list[Row]:
     """
     from textual.app import App as TextualApp
 
-    from .app import D8RApp
+    from .app import D8RApp, ExplorerSlot
     from .results import ResultsTable
     from .palette import EditorPane
     from .ai import AIDiagnosticsScreen, AIPanel, DeleteOptionList
@@ -84,6 +84,7 @@ def binding_rows() -> list[Row]:
 
     groups = (
         ("app", D8RApp.BINDINGS),
+        ("explorer", ExplorerSlot.BINDINGS),
         ("document", EditorPane.BINDINGS),
         ("results", ResultsTable.BINDINGS),
         ("settings", SettingsScreen.BINDINGS),
@@ -185,9 +186,10 @@ class SettingsScreen(ModalScreen[None]):
             "dbt": "Exchange native SQL and local dbt models. Project home belongs to this source workspace. "
                    "No dbt installation, execution, network or credential profiles; imports require manual Apply.",
             "ai": "Provider forms require Save & use to activate changes. Permission toggles save immediately. Schema refreshes control AI metadata lookups, not IDE indexing. "
-                  "Test AI Queries permits bounded read-only execution and PostgreSQL estimated plans with ANALYZE disabled; reads can still be expensive. "
-                  "Plans may expose schema details and literals even when Allow Sample Data is off. Query-check failures and bounded row counts are also shared; result samples require Allow Sample Data. "
-                  "Sample records per read governs query checks, not plans. Request timeout also caps checks and plans at 30 seconds. "
+                  "Test AI Queries checks final drafts and tries up to two SQL repairs. By default the database plans without running. Failed drafts require manual Apply anyway. "
+                  "Run read-only test queries opts into bounded execution instead; reads can still be expensive. "
+                  "PostgreSQL plans may expose schema details and literals. Result samples require Allow Sample Data. "
+                  "Sample records per read limits fetched rows. Request timeout caps checks and plans at 30 seconds. "
                   "Automatically applied edits update validated, unchanged drafts only; they never run queries or save functions. "
                   "AI completion while typing sends the current SQL window and permitted cached schema after an idle pause; "
                   "it never samples rows or auto-applies; SQL literals may contain sensitive data. F4 or Ctrl+Shift+Space requests it manually. "
@@ -280,8 +282,10 @@ class SettingsScreen(ModalScreen[None]):
                 Row("Request timeout", f"{config.timeout:g} seconds · requests, checks and plans", "ai", "ai-timeout"),
                 Row("Allow Sample Data", "on" if self.session.ai_allow_sample_data else "off", "ai-sample-data"),
                 Row("Allow Schema Refreshes", "on" if self.session.ai_allow_schema_refreshes else "off", "ai-schema-refreshes"),
-                Row("Test AI Queries", "on · read-only checks + PostgreSQL plans" if self.session.ai_test_queries else
-                    "off · no query checks or plans", "ai-test-queries"),
+                Row("Test AI Queries", "on · automatically check final drafts" if self.session.ai_test_queries else
+                    "off · offline validation only", "ai-test-queries"),
+                Row("Run read-only test queries", "on · execute when testing" if self.session.ai_allow_query_execution else
+                    "off · plan only", "ai-query-execution"),
                 Row("Automatically Apply AI Edits", "on · validated drafts only" if self.session.ai_auto_accept else
                     "off · review and Apply manually", "ai-auto-accept"),
                 Row("AI completion while typing", "on · sends SQL/cached schema after pauses" if self.session.ai_completion else
@@ -340,6 +344,8 @@ class SettingsScreen(ModalScreen[None]):
             self.ide.update_settings(ai_allow_schema_refreshes=not self.session.ai_allow_schema_refreshes)
         elif row.action == "ai-test-queries":
             self.ide.update_settings(ai_test_queries=not self.session.ai_test_queries)
+        elif row.action == "ai-query-execution":
+            self.ide.update_settings(ai_allow_query_execution=not self.session.ai_allow_query_execution)
         elif row.action == "value-cache":
             self.ide.update_settings(value_cache_enabled=not self.session.value_cache_enabled)
         elif row.action == "clear-values":

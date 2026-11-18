@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from textual import on
 from textual.app import App, ComposeResult
-from textual.widgets import Button, Static, TextArea
+from textual.widgets import Button, Static, TextArea, Tooltip
 from textual.worker import WorkerCancelled
 
 from d8r.ai import client
@@ -91,6 +91,120 @@ async def send(app, pilot, prompt="Show one value"):
     composer.focus()
     await pilot.press("enter")
     return app.panel.chat
+
+
+@pytest.mark.parametrize("mode", ["default", "execute", "off"])
+@async_test
+async def test_final_pages_checked_before_apply_without_provider_tools(session, monkeypatch, mode):
+    session.update_settings(ai_auto_accept=True)
+    if mode == "off":
+        session.update_settings(ai_test_queries=False)
+    elif mode == "execute":
+        session.update_settings(ai_allow_query_execution=True)
+    session.install_quality_functions()
+    # The default plan check must not evaluate this failing row-level cast.
+    first = ("SELECT CAST(label AS INTEGER) FROM data" if mode == "default" else
+             "SELECT value FROM dq_row_count(data)")
+    second = "SELECT unknown_column FROM data"
+    drafts, feedback = [], []
+
+    async def provider(config, messages, tools, callback):
+        if drafts:
+            feedback.append(messages[-1]["content"])
+        detail = (second if not drafts else "SELECT id FROM data" if mode == "default" else
+                  f"SELECT unknown_column_{len(drafts)} FROM data")
+        drafts.append(detail)
+        answer = (f"```sql\n{first}\n```\n```sql\n{detail}\n```\n"
+                  '```json\n{"kind":"queries","titles":["Quality","Detail"]}\n```')
+        messages.append({"role": "assistant", "content": answer})
+        yield AIEvent("text", answer)
+
+    monkeypatch.setattr(client, "run_turn", provider)
+    app = ConversationHost(session)
+    async with app.run_test(size=(100, 42)) as pilot:
+        chat = await send(app, pilot, "QC the table; one summary and one detail page")
+        await app.workers.wait_for_complete()
+        evidence = chat.context.query_checks
+        assert not session.history
+        if mode == "off":
+            assert evidence == {} and len(app.applied) == 1
+            assert drafts == [second]
+            return
+        assert evidence[second]["error"] and not evidence[second]["executed"]
+        assert all(evidence[sql]["error"] in message and "Detail" in message
+                   for sql, message in zip(drafts, feedback))
+        if mode == "default":
+            assert evidence[first] == {"prepared": True, "executed": False}
+            # First repair passes; accept the complete batch without another request.
+            assert drafts == [second, "SELECT id FROM data"]
+            assert chat.status == "idle" and evidence[drafts[-1]]["prepared"]
+            assert [q.body for q in app.applied[0].queries] == [first, drafts[-1]]
+        else:
+            assert evidence[first]["executed"] and evidence[first]["row_count"] == 1
+            # Two different failed repairs; never automatically accept any of them.
+            assert len(drafts) == 3 and len(feedback) == 2 and not app.applied
+            assert chat.status == "error" and "Detail" in chat.query_warning
+            assert not app.ai_chats.apply(chat, app.panel, automatic=True)
+            assert app.query_one("#editor", TextArea).text == "SELECT 1"
+            apply = app.panel.query_one("#ai-apply", Button)
+            assert not apply.disabled
+            apply.focus()
+            await pilot.press("enter")
+            assert [q.body for q in app.applied[0].queries] == [first, drafts[-1]]
+            assert not session.history
+
+
+@async_test
+async def test_unusable_repair_preserves_last_query_for_manual_edit(session, monkeypatch):
+    session.update_settings(ai_auto_accept=True)
+    draft = "SELECT 'unterminated"
+    answers = iter([f"```sql\n{draft}\n```", "No replacement."])
+
+    async def provider(config, messages, tools, callback):
+        answer = next(answers, None)
+        if answer is None:
+            # Even a provider ignoring the empty tool list cannot save a function.
+            await callback("save_function", {"name": "unrequested", "original_name": None,
+                           "parameters": [], "description": "", "body": "SELECT 1"})
+            pytest.fail("Repair was allowed to invoke a tool")
+        messages.append({"role": "assistant", "content": answer})
+        yield AIEvent("text", answer)
+
+    monkeypatch.setattr(client, "run_turn", provider)
+    app = ConversationHost(session)
+    async with app.run_test(size=(100, 42)) as pilot:
+        chat = await send(app, pilot)
+        await app.workers.wait_for_complete()
+        assert chat.status == "error" and chat.query_warning and not app.applied
+        assert "unrequested" not in session.functions_for() and not chat.context.query_checks
+        app.panel.query_one("#ai-apply", Button).focus()
+        await pilot.press("enter")
+        assert app.query_one("#editor", TextArea).text == draft
+        assert not session.history and not chat.save_error
+
+
+@async_test
+async def test_hover_conversation_tab_paints_literal_details(session):
+    app = ConversationHost(session)
+    app.TOOLTIP_DELAY = 0.01
+    async with app.run_test(size=(90, 36), tooltips=True) as pilot:
+        app.panel.action_clear()
+        chat = app.panel.chat
+        chat.title = "[dim]Q4 orders[/]"
+        app.ai_chats.changed(chat)
+        await pilot.pause()
+        tab = app.query_one(ConversationTab)
+        for widget, offset in ((tab, (1, tab.region.height - 1)),
+                               (tab.query_one(".conversation-select"), (1, 0))):
+            await pilot.hover(widget, offset=offset)
+            await pilot.pause(0.1)
+            tip = app.screen.query_one(Tooltip)
+            assert tip.display
+            x, y = tip.content_region.offset
+            assert app.screen.get_widget_at(x, y)[0] is tip
+            assert f"{chat.title} · {chat.label}" in tip.render_line(0).text
+            style = app.screen.get_style_at(x, y)
+            assert style.color != style.bgcolor
 
 
 @async_test

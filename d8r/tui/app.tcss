@@ -5,6 +5,13 @@ Screen {
     layers: base;
 }
 
+Tooltip {
+    background: $panel;
+    color: $foreground;
+    border: round $primary 65%;
+    padding: 0 1;
+}
+
 /* Flat controls preserve the one-row toolbars without simulated bevels. */
 Button {
     color: $foreground;
@@ -185,7 +192,7 @@ CommandPalette > .option-list--separator {
     color: $foreground 18%;
 }
 
-/* Active tabs retain a complete outline and a subtle theme-relative highlight. */
+/* Accent the resting button's outline and label, not its rectangular backing. */
 Tabs {
     height: 3;
     background: $background;
@@ -209,16 +216,14 @@ Tabs Tab:hover {
     color: $text;
 }
 
-Tabs Tab.-active {
+Tabs Tab.-active, Tabs:focus Tab.-active {
     border: round $primary;
-    background: $primary 16%;
-    color: $text;
+    background: $panel;
+    color: $foreground;
     text-style: bold;
 }
 
 Tabs:focus Tab.-active {
-    color: $foreground;
-    background: $primary 16%;
     text-style: bold underline;
 }
 
@@ -326,11 +331,6 @@ Tabs Tab:disabled {
     padding: 0;
 }
 
-#schema-hint {
-    height: 2;
-    color: $text-muted;
-}
-
 #page-actions {
     height: 1;
 }
@@ -410,7 +410,7 @@ Tabs Tab:disabled {
     width: 1fr;
 }
 
-#document-actions Button, #results-actions Button, #fn-actions Button {
+#document-actions Button, #fn-actions Button {
     height: 1;
     min-width: 8;
     margin: 0 1 0 0;
@@ -524,10 +524,14 @@ CommandPalette.open {
     height: 1fr;
 }
 
+/* Keep the drag highlight visible behind the titled rule and between buttons. */
+#output-controls, #output-controls .pane-title {
+    background: transparent;
+}
+
 #results-actions {
     height: 1;
-    padding: 0 1;
-    background: $panel;
+    width: auto;
 }
 
 #results-table {
@@ -553,16 +557,21 @@ CommandPalette.open {
     color: $text-muted;
 }
 
-.data-actions {
-    height: 1;
-    padding: 0 1;
-    background: $panel;
+#output-controls Button {
+    max-width: 5;
+    min-width: 0;
+    line-pad: initial;
+    padding: 0;
+    margin: 0 1 0 0;
 }
 
-.data-actions Button {
-    height: 1;
-    min-width: 6;
-    margin: 0 1 0 0;
+#output-controls #results-export {
+    max-width: 6;
+}
+
+#output-controls .pane-close {
+    width: 3;
+    margin: 0;
 }
 
 .data-table {
@@ -837,7 +846,6 @@ SettingsScreen {
     width: 44;
     min-width: 0;
     height: 1fr;
-    border-left: solid $accent;
     padding: 0 1;
     background: $surface;
 }

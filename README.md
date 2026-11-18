@@ -342,6 +342,16 @@ workspace's resizable layout. Metadata IntelliSense remains offline; predicate
 value reads and optional inline AI follow the controls above. Pages,
 functions, history and chats are isolated by connection identity. Pane resizing,
 result selection, clipboard copying and CSV export remain available.
+In Pages, Up from the first row or an empty list focuses search; Down returns to the list.
+Query batches open **Results 1**, **Results 2**, and so on, one tab per statement.
+The next run replaces unpinned results. Pin on Results 1 keeps a separate snapshot;
+Pin on another result keeps that tab. Pinned tabs are marked ◆.
+Drag the vertical dividers to resize Explorer or Conversations. Drag the horizontal
+line beside **Query results**, or the title itself, to resize the editor and results.
+The toolbar copies or exports the selected result; **Close** removes an extra tab,
+while **[x]** hides the whole results pane.
+After a successful run, each result tab shows its statement’s row count and timing.
+The footer shows `Ready` for a single result or the number of results for a batch.
 Hover a button to see its bound keyboard shortcut. New Query preserves the current
 draft; connection forms retain field focus and selection across edits and connection work.
 
@@ -359,7 +369,9 @@ draft; connection forms retain field focus and selection across edits and connec
 | Alt+Up / Alt+Down | Scroll completion documentation/preview |
 | Tab / Enter with completion open | Accept completion |
 | Escape in the query editor | Dismiss/cancel completion; press again to reopen local offers |
-| Escape in Functions or chat | Return to the query editor, preserving unsaved drafts |
+| Escape in Explorer (Schema, Pages or Functions) | Hide Explorer and return to the query editor at the same cursor position |
+| Escape in the function editor | Return to the query and previous Explorer tab without discarding the function draft |
+| Escape in chat | Hide Conversations and return to the query editor without discarding the chat draft |
 | Ctrl+Q | Return from function mode; otherwise quit |
 
 Backslash entries are **editor actions**, available mid-query as well as at the start:
@@ -459,26 +471,69 @@ fences. Manual Apply is required unless Auto accept AI updates is enabled; neith
 path executes SQL. Explicitly requested workspace function saves can persist through
 the guarded save tool without opening the function form.
 
-Sample Data, Test AI Queries and Auto accept are off by default. PostgreSQL/DuckDB
-checks use a bounded read-only transaction; D1 checks inspect server EXPLAIN bytecode
-for persistent writes and unsafe operations before executing a bounded outer SELECT.
-Malformed or incomplete plans are refused. Checks do not alter drafts/results/history
-and refuse an existing user transaction. They are not a sandbox for privileged
-installed PostgreSQL functions or extensions; use a least-privileged role. Read
-limits are not query-cost guarantees, and D1 checks do not create a remote session.
+For data questions, chat gets a short list of saved function names for the current
+source and is instructed to check their definitions before writing equivalent SQL.
+It can search beyond that list by name or description. For example, with the quality
+templates installed, “how many extra email entries are duplicates?” calls for
+`dq_duplicate_count`; “which emails repeat?” needs a function or query that returns
+the addresses instead. If no saved function fits, or you ask for standalone SQL,
+chat is instructed to write the query directly. No template installation is needed
+for the fallback.
+
+**Test AI Queries is on by default.** Before a chat query draft can be applied,
+PGTUI checks the exact final SQL on its source, expanding saved functions first.
+It checks every page of a multi-page proposal, even if the model calls no tools.
+By default it uses native `EXPLAIN` without `ANALYZE`: a pass means the database
+could plan the query, not that it ran successfully. If SQL fails a lexical or
+database syntax/type check, PGTUI sends the model the check error and gives it
+up to **two repair attempts**. Each corrected draft is checked again. Repairs
+cannot call tools or change pages that already passed. Connection and permission
+failures are not reasons to rewrite SQL.
+
+If no repair passes, **Apply anyway** copies the last complete query draft into
+the editor for manual editing. It never runs it. Failed checks never auto-apply;
+invalid proposal formats, stale targets and function-save guards still block Apply.
+Turning Test AI Queries off keeps validation offline and disables repairs. Saved
+off settings are preserved. Function drafts and inline completions are not run.
+
+**Run read-only test queries** opts into bounded execution instead of planning.
+Earlier settings that explicitly enabled execution retain that permission.
+Sample Data and auto-accept remain off by default. PostgreSQL/DuckDB checks
+use read-only transactions and refuse an existing user transaction. D1 checks
+inspect server EXPLAIN bytecode and reject incomplete or unsafe programs; only
+execution tests go on to run a bounded outer SELECT. Checks do not update the
+editor's results or Run history. Timeouts and row caps do not guarantee cheap
+queries or sandbox privileged functions; use a least-privileged database role.
+
+For PostgreSQL, Test AI Queries also enables `explain_query`. It expands saved local
+functions and inspects one read-only query using fixed
+`EXPLAIN (FORMAT JSON, ANALYZE FALSE)` options. Caller-supplied EXPLAIN/options,
+multiple statements, mutations and known unsafe functions are refused. The tool
+shares read-only transaction, cancellation and source/permission guards with query
+checks, with a deadline of the configured timeout or 30 seconds, whichever is lower.
+Plans exceeding 64,000 characters are withheld in full rather than returned as a
+partial tree. The driver can buffer the full JSON cell before this output limit;
+it is not a peak-memory or database-work guarantee.
+
+Plan scans, joins, row estimates and costs are not measured execution results or
+proof that a query will run successfully. ANALYZE stays disabled, but PostgreSQL
+planning can evaluate immutable functions. Plans can expose schema details and
+SQL literals even when Allow Sample Data is off; no result rows are sampled.
+Plan inspection never changes drafts, results, history or query-execution receipts.
+
 Streaming, questions, steering, cancellation, source/definition guards and saved
 chat history remain available. No app HTTP server or browser is involved.
 
-Recent conversations appear as horizontal closable tabs with names and status-colored
-dots. Ctrl+J focuses the strip; arrows navigate, Enter selects, and Delete/Ctrl+W closes
-a tab. Closing or switching tabs retains its draft, history and background request;
+Recent conversations appear as closable tabs with status-colored dots. Hover over a
+tab to read its full title, target, and status. Ctrl+J focuses the strip; arrows
+navigate, Enter selects, and Delete/Ctrl+W closes a tab. Closing or switching tabs retains its draft, history and background request;
 History reopens closed chats. Only explicit permanent deletion removes history and
 cancels the request. Conversations remain source-scoped.
 
-AI status sayings follow real connection, generation, schema, history, functions and
-validation stages rather than a rotating timer. Validation statuses explicitly mean
-offline lexical/template checks, not server validation. Retry, cancellation and errors
-retain accurate status messages.
+While the assistant is working, a wave of the theme’s accent color moves across its
+status saying. The words follow the actual stage (connection, generation, schema,
+history, functions, or validation), not a timer. Validation means offline lexical/template
+checks, not server validation. Retry, cancellation, and error messages stay still.
 
 ### Future AI — roadmap only
 

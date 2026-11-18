@@ -154,7 +154,8 @@ def _settings(value: object) -> dict:
         "ai_auto_accept": False,
         "ai_allow_sample_data": False,
         "ai_allow_schema_refreshes": True,
-        "ai_test_queries": False,
+        "ai_test_queries": True,
+        "ai_allow_query_execution": False,
         "ai_completion": False,
         "ai_providers": [],
         "ai_active_provider": "",
@@ -172,7 +173,7 @@ def _settings(value: object) -> dict:
         raise ValueError("Choose a supported theme from Settings → Theme.")
     if type(document["ai_auto_accept"]) is not bool:
         raise ValueError("ai_auto_accept must be a boolean")
-    for field in ("ai_allow_sample_data", "ai_allow_schema_refreshes", "ai_test_queries", "ai_completion"):
+    for field in ("ai_allow_sample_data", "ai_allow_schema_refreshes", "ai_test_queries", "ai_allow_query_execution", "ai_completion"):
         if type(document[field]) is not bool:
             raise ValueError(f"{field} must be a boolean")
     if type(document["value_cache_enabled"]) is not bool:
@@ -285,6 +286,8 @@ def _settings_document(value: object) -> dict:
     if not isinstance(profiles, list):
         raise ValueError("invalid saved AI provider profiles")
     runtime = deepcopy(value)
+    # In older files an explicitly enabled Test AI Queries authorized execution.
+    runtime.setdefault("ai_allow_query_execution", runtime.get("ai_test_queries", False))
     for profile in runtime["ai_providers"]:
         if not isinstance(profile, dict) or not isinstance(profile.get("config"), dict):
             raise ValueError("invalid AI provider metadata")

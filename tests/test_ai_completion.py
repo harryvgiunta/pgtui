@@ -180,9 +180,11 @@ async def test_bad_target_is_rejected_before_network(request_context, monkeypatc
 def test_ai_completion_opt_in_persists_without_enabling_execution_or_autoapply():
     session = Session()
     assert not session.ai_completion
+    session.update_settings(ai_test_queries=False)
     session.update_settings(ai_completion=True)
     restored = Session()
     assert restored.ai_completion
+    assert not restored.ai_allow_query_execution
     assert not restored.ai_auto_accept and not restored.ai_test_queries and not restored.ai_allow_sample_data
     before = session.settings_path.read_bytes()
     with pytest.raises(ValueError):

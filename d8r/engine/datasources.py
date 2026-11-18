@@ -13,6 +13,10 @@ POSTGRES_VERSION = "18.7"
 class EngineError(ValueError):
     """A safe, public execution or connection error."""
 
+    def __init__(self, message: str, *, sqlstate: str = "") -> None:
+        super().__init__(message)
+        self.sqlstate = sqlstate
+
 
 @dataclass
 class DataSource:
@@ -93,8 +97,8 @@ def _safe_error(exc: Exception, operation: str = "SQL execution") -> EngineError
         if isinstance(position, str) and re.fullmatch(r"[0-9]{1,10}", position) and 0 < int(position) <= 2147483647:
             suffix += f" at character {int(position)}"
         if valid_state and state in _SQL_ERRORS:
-            return EngineError(_sql_error_message(state, suffix))
-        return EngineError(f"{operation} failed" + suffix)
+            return EngineError(_sql_error_message(state, suffix), sqlstate=state)
+        return EngineError(f"{operation} failed" + suffix, sqlstate=state if valid_state else "")
     if isinstance(exc, duckdb.Error):
         state = None
         if isinstance(exc, duckdb.ParserException):
@@ -109,7 +113,7 @@ def _safe_error(exc: Exception, operation: str = "SQL execution") -> EngineError
             message = str(exc)[:2048].split("\n", 1)[0]
             state = next((code for pattern, code in _DUCK_ERROR_PATTERNS if pattern.match(message)), None)
         if state is not None:
-            return EngineError(_sql_error_message(state))
+            return EngineError(_sql_error_message(state), sqlstate=state)
     return EngineError(f"{operation} failed")
 
 

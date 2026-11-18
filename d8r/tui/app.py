@@ -12,6 +12,7 @@ from collections.abc import Callable
 from copy import deepcopy
 from uuid import uuid4
 
+from rich.rule import Rule
 from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -19,7 +20,6 @@ from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
 from textual.content import Content, Text
 from textual.screen import ModalScreen, Screen
-from textual.widget import Widget
 from textual.widgets import (
     Button,
     DataTable,
@@ -29,6 +29,7 @@ from textual.widgets import (
     Static,
     TabbedContent,
     TabPane,
+    Tabs,
     TextArea,
     Tree,
 )
@@ -89,6 +90,44 @@ class IdeScreen(Screen):
             self.focus_previous()
 
 
+
+
+class ExplorerSlot(Vertical):
+    BINDINGS = [Binding("escape", "app.dismiss_explorer", "Hide explorer", show=False, priority=True)]
+
+
+class ExplorerTabs(TabbedContent):
+    BINDINGS = [
+        Binding("up", "page_search", "Search pages", show=False, priority=True),
+        Binding("down", "page_list", "Select page", show=False, priority=True),
+    ]
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action in {"page_search", "page_list"}:
+            if self.active != "tab-pages":
+                return False
+            focused = self.screen.focused
+            if isinstance(focused, Tabs):
+                return True  # The user just clicked the Pages tab itself.
+            if action == "page_search":
+                listing = self.query_one("#pages-list", OptionList)
+                return focused is listing and listing.highlighted in (0, None)
+            return focused is self.query_one("#page-search", Input)
+        return super().check_action(action, parameters)
+
+    def action_page_search(self) -> None:
+        self.query_one("#page-search", Input).focus()
+
+    def action_page_list(self) -> None:
+        self.query_one("#pages-list", OptionList).focus()
+
+
+class AssistantSlot(Vertical):
+    # The conversation strip and window controls sit outside the chat composer.
+    BINDINGS = [Binding("escape", "close", "Hide conversations", show=False)]
+
+    def action_close(self) -> None:
+        self.query_one(AIPanel).action_close()
 
 
 def column_label(column: ColumnDef) -> Text:
@@ -200,6 +239,7 @@ class D8RApp(App):
         self.function_mode = False
         self._function_started = bool(self.session.workspace.get("function_draft"))
         self._page_rows: tuple = ()
+        self._last_explorer_tab = "tab-schema"
         self._value_reads: dict[tuple[int, str, str, int], asyncio.Task] = {}
         self._function_pick: tuple | None = None
         self._connection_progress: ConnectionProgress | None = None
@@ -219,18 +259,19 @@ class D8RApp(App):
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="body"):
-            with Vertical(id="explorer-slot"):
+            with ExplorerSlot(id="explorer-slot"):
                 with Horizontal(classes="pane-controls"):
                     yield Static("Explorer", classes="pane-title")
                     yield Button(Content("[x]"), id="explorer-close", classes="pane-close",
-                                 compact=True, tooltip="Hide explorer · reopen with \\schema or \\pages")
+                                 compact=True, tooltip=binding_tooltip(ExplorerSlot.BINDINGS, "app.dismiss_explorer",
+                                                                       context="Explorer focused")
+                                 + " · reopen with \\schema or \\pages")
                 initial_tab = self.session.workspace["explorer_tab"]
                 if initial_tab == "agents":
                     initial_tab = "schema"
-                with TabbedContent(initial="tab-" + initial_tab, id="explorer-tabs"):
+                with ExplorerTabs(initial="tab-" + initial_tab, id="explorer-tabs"):
                     with TabPane("Schema", id="tab-schema"):
                         with Vertical(id="schema-pane"):
-                            yield Static("Expand column: values · Enter: insert", id="schema-hint", markup=False)
                             yield Tree(Text("datasets"), id="schema-tree")
                     with TabPane("Pages", id="tab-pages"):
                         with Horizontal(id="page-actions"):
@@ -268,21 +309,25 @@ class D8RApp(App):
                                             show_line_numbers=True, id="editor")
                         yield CommandPalette(self.session, id="palette", markup=False)
                     yield FnEditor(self, id="function-editor")
-                yield PaneSplitter("#editor-slot", "height", "editor", min_size=8,
-                                   min_remaining=5, id="editor-splitter")
-                with Vertical(id="output-slot"):
+                with PaneSplitter("#editor-slot", "height", "editor", min_size=8,
+                                  min_remaining=5, id="editor-splitter"):
                     with Horizontal(id="output-controls", classes="pane-controls"):
-                        yield Static("Query results", classes="pane-title")
+                        yield Static(Rule("Query results", align="left", style=""), classes="pane-title")
+                        with Horizontal(id="results-actions"):
+                            yield Button("Copy", id="results-copy", compact=True,
+                                         tooltip=binding_tooltip(ResultsTable.BINDINGS, "copy_selection", context="Results table focused"))
+                            yield Button("Pin", id="results-pin", compact=True,
+                                         tooltip="Keep this result across runs")
+                            yield Button("Export", id="results-export", compact=True,
+                                         tooltip="Export this result to CSV")
+                            yield Button("Close", id="results-close", compact=True,
+                                         tooltip="Close this result tab")
                         yield Button(Content("[x]"), id="output-close", classes="pane-close",
                                      compact=True, tooltip="Hide results window · reopen with \\results, \\sql or \\history")
+                with Vertical(id="output-slot"):
                     with TabbedContent(id="result-tabs"):
-                        with TabPane("Results", id="tab-results"):
+                        with TabPane("Results 1", id="tab-results"):
                             yield Static("", id="results-error", markup=False)
-                            with Horizontal(id="results-actions"):
-                                yield Button("Copy selection", id="results-copy", compact=True,
-                                             tooltip=binding_tooltip(ResultsTable.BINDINGS, "copy_selection", context="Results table focused"))
-                                yield Button("Export CSV…", id="results-export", compact=True)
-                                yield Button("Pin result", id="results-pin", compact=True)
                             yield ResultsTable(id="results-table", zebra_stripes=True, cursor_type="cell")
                             yield Static("", id="results-status", markup=False)
                         with TabPane("SQL", id="tab-sql"):
@@ -295,7 +340,7 @@ class D8RApp(App):
                 yield HistoryPreview(id="history-preview")
             yield PaneSplitter("#assistant-slot", "width", "ai", reverse=True,
                                min_size=28, min_remaining=30, id="ai-splitter")
-            with Vertical(id="assistant-slot"):
+            with AssistantSlot(id="assistant-slot"):
                 with Horizontal(id="assistant-controls", classes="pane-controls"):
                     yield Static("Conversations", classes="pane-title")
                     yield Button(Content("[x]"), id="assistant-close", classes="pane-close",
@@ -679,6 +724,8 @@ class D8RApp(App):
 
     @on(TabbedContent.TabActivated, "#explorer-tabs")
     def _explorer_tab_changed(self, event: TabbedContent.TabActivated) -> None:
+        if event.pane.id != "tab-functions":
+            self._last_explorer_tab = event.pane.id
         if self._workspace_ready:
             self.save_workspace(explorer_tab=event.pane.id.removeprefix("tab-"))
             if event.pane.id == "tab-pages":
@@ -698,6 +745,8 @@ class D8RApp(App):
             return
         self.set_pane("schema", visible)
         tabs.active = "tab-pages"
+        if visible:
+            self.call_after_refresh(self.query_one("#pages-list", OptionList).focus)
         self.save_workspace(explorer_tab="pages")
 
     # -- widgets ------------------------------------------------------------
@@ -906,11 +955,20 @@ class D8RApp(App):
 
     # -- panes --------------------------------------------------------------
 
+    def _hide_explorer(self) -> bool:
+        if not self.update_settings(panes={"schema": False}):
+            return False
+        self.set_pane("schema", False)
+        return True
+
     @on(Button.Pressed, "#explorer-close")
     def _close_explorer(self) -> None:
-        if self.update_settings(panes={"schema": False}):
-            self.set_pane("schema", False)
+        if self._hide_explorer():
             self._focus_editor()
+
+    def action_dismiss_explorer(self) -> None:
+        self._hide_explorer()
+        self.return_to_query()
 
     @on(Button.Pressed, "#output-close")
     def _close_output(self) -> None:
@@ -1027,7 +1085,7 @@ class D8RApp(App):
 
     def action_back_or_quit(self) -> None:
         if self.function_mode and not self._modal_open():
-            self.action_workspace()
+            self.return_to_query()
         else:
             self.exit()
 
@@ -1154,17 +1212,18 @@ class D8RApp(App):
         self._refresh_history()
         # Rollback or a partially successful document may also change tables.
         self._schema_updated(source)
-        status = outcome.status
-        if len(outcomes) > 1:
-            # A multi-query document answers on its own tabs; name the extras.
-            status += f" · {len(outcomes)} results"
-        if outcomes[-1].error and len(outcomes) > 1:
+        if outcomes[-1].error:
             status = outcomes[-1].status
+        else:
+            # Each result tab already shows its statement's execution summary.
+            status = f"{len(outcomes)} results" if len(outcomes) > 1 else "Ready"
+            if not self.pane_visible("results"):
+                status += r" · \results to show details"
         self._set_status(status)
         if self.session.workspace_error:
             self.notify(self.session.workspace_error, title="History could not be saved", severity="error", timeout=15)
         self._show_tab("tab-results")
-        self.call_next(self._open_data_tabs, outcomes[1:])
+        self._open_data_tabs(outcomes[1:])
 
     def action_compile(self) -> None:
         """Expand local functions only; native SQL grammar is checked on Run."""
@@ -1325,7 +1384,7 @@ class D8RApp(App):
 
     @on(Button.Pressed, "#results-copy")
     def _copy_results_clicked(self) -> None:
-        self.query_one("#results-table", ResultsTable).action_copy_selection()
+        self._active_results_table().action_copy_selection()
 
     @on(Button.Pressed, "#results-export")
     def _export_results_clicked(self) -> None:
@@ -1437,11 +1496,15 @@ class D8RApp(App):
         return (editor, editor.text, editor.cursor_location, getattr(editor, "document_load_serial", 0),
                 self.session.source_key(source_id), identity, self.function_mode)
 
-    @on(FnExplorer.BackRequested)
-    def _leave_function_picker(self, event: FnExplorer.BackRequested) -> None:
-        event.stop()
+    def return_to_query(self) -> None:
         self._function_pick = None
-        self.action_workspace()
+        tabs = self.query_one("#explorer-tabs", TabbedContent)
+        if tabs.active == "tab-functions":
+            tabs.active = self._last_explorer_tab
+        if self.function_mode:
+            self.action_workspace()
+        else:
+            self.editor.focus()
 
     @on(FnExplorer.InsertRequested)
     def _insert_function(self, event: FnExplorer.InsertRequested) -> None:
@@ -1501,102 +1564,97 @@ class D8RApp(App):
     # -- data tabs ------------------------------------------------------------
 
     def _open_data_tabs(self, outcomes: list[RunOutcome]) -> None:
-        """One extra tab per result beyond the first, expanding out from History.
-
-        A run replaces the previous run's unpinned tabs; a pinned tab keeps
-        its rows across every later run until the user closes it.
-        """
+        """Replace this source's unpinned extras, keeping a tab for every statement."""
         for tab_id in [key for key, tab in self._data_tabs.items()
                        if tab["source"] == self._workspace_key and not tab["pinned"]]:
             self._remove_data_tab(tab_id)
-        first_new = ""
         for outcome in outcomes:
-            first_new = first_new or self._append_data_tab(outcome)
-        if first_new:
-            # The newest result comes forward; older and pinned tabs stay put.
-            self.query_one("#result-tabs", TabbedContent).active = first_new
+            self._append_data_tab(outcome)
+        self._sync_data_tabs()
+        self._fit_result_tabs()
 
     def _append_data_tab(self, outcome: RunOutcome, *, pinned: bool = False) -> str:
-        """Build one result tab at the far end, past History and its siblings."""
+        """Use a stable widget ID independent of the source's visible numbering."""
         self._data_tab_seq += 1
         tab_id = f"tab-data-{self._data_tab_seq}"
-        label = self._data_tab_label(tab_id, pinned=pinned)
         table = ResultsTable(id=f"data-{tab_id}", classes="data-table", zebra_stripes=True, cursor_type="cell")
         pane = TabPane(
-            label,
-            Horizontal(
-                Button("Unpin" if pinned else "Pin", classes="data-pin", compact=True),
-                Button("Export CSV…", classes="data-export", compact=True),
-                Button("Close", classes="data-close", compact=True),
-                classes="data-actions",
-            ),
+            "Results",
             table,
             Static(outcome.status, classes="data-status", markup=False),
             id=tab_id,
         )
         tabs = self.query_one("#result-tabs", TabbedContent)
-        last = next(reversed(self._data_tabs), "")
-        self._data_tabs[tab_id] = {"pinned": pinned, "label": label, "source": self._workspace_key}
-        tabs.add_pane(pane, after=last or "tab-history")
+        self._data_tabs[tab_id] = {"pinned": pinned, "source": self._workspace_key}
+        tabs.add_pane(pane, before="tab-sql")
         self.call_after_refresh(table.show_result, outcome)
-        self.call_after_refresh(self._sync_data_tabs)
         return tab_id
 
     def _sync_data_tabs(self) -> None:
         tabs = self.query_one("#result-tabs", TabbedContent)
+        number = 1  # The live result is always Results 1.
         for tab_id, tab in self._data_tabs.items():
-            if tab["source"] == self._workspace_key:
+            button = tabs.get_tab(tab_id)
+            if tab["source"] != self._workspace_key:
+                if button.display:
+                    tabs.hide_tab(tab_id)
+                continue
+            number += 1
+            label = f"Results {number}" + (" ◆" if tab["pinned"] else "")
+            if button.label_text != label:
+                button.label = label
+            if not button.display:
                 tabs.show_tab(tab_id)
-            else:
-                tabs.hide_tab(tab_id)
+            if not tabs.active:
+                tabs.active = tab_id
+
+    @on(TabbedContent.TabActivated, "#result-tabs")
+    @on(TabbedContent.Cleared, "#result-tabs")
+    def _sync_result_controls(self) -> None:
+        active = self.query_one("#result-tabs", TabbedContent).active
+        tab = self._data_tabs.get(active)
+        self.query_one("#results-actions").display = active == "tab-results" or tab is not None
+        self.query_one("#results-close").display = tab is not None
+        pin = self.query_one("#results-pin", Button)
+        pinned = tab is not None and tab["pinned"]
+        pin.label = "Unpin" if pinned else "Pin"
+        pin.tooltip = "Replace this result on the next run" if pinned else "Keep this result across runs"
 
     @on(Button.Pressed, "#results-pin")
-    def _pin_main_result(self) -> None:
-        """Keep the current Results content through every later run."""
+    def _toggle_result_pin(self) -> None:
+        tabs = self.query_one("#result-tabs", TabbedContent)
+        if (tab := self._data_tabs.get(tabs.active)) is not None:
+            tab["pinned"] = not tab["pinned"]
+            self._sync_data_tabs()
+            self._sync_result_controls()
+            return
+        if tabs.active != "tab-results":
+            return
         outcome = self._main_outcome
         if outcome is None or not outcome.columns:
             self.notify("Nothing to pin yet", severity="warning")
             return
         tab_id = self._append_data_tab(outcome, pinned=True)
-        self.query_one("#result-tabs", TabbedContent).active = tab_id
+        self._sync_data_tabs()
+        tabs.active = tab_id
         self._set_status("Result pinned · it survives the next run")
-
-    @staticmethod
-    def _data_tab_label(tab_id: str, *, pinned: bool) -> str:
-        number = tab_id.rsplit("-", 1)[-1]
-        return f"◆ Data {number}" if pinned else f"Data {number}"
 
     def _remove_data_tab(self, tab_id: str) -> None:
         self._data_tabs.pop(tab_id, None)
         tabs = self.query_one("#result-tabs", TabbedContent)
-        was_active = tabs.active == tab_id
+        if tabs.active == tab_id:
+            # Move off the tab before unmounting; a batch can remove several neighbours.
+            tabs.active = next((key for key in (*self.TAB_PANES.values(), *self._data_tabs)
+                                if tabs.get_tab(key).display), "")
         tabs.remove_pane(tab_id)
-        if was_active:
-            # remove_pane auto-activates a neighbour; a closed result always
-            # hands the view back to the run's main pane, once the removal lands.
-            self.call_after_refresh(setattr, tabs, "active", "tab-results")
 
-    @on(Button.Pressed, ".data-pin")
-    def _data_pin_clicked(self, event: Button.Pressed) -> None:
-        tab_id = self._tab_id_for(event.button)
-        tab = self._data_tabs[tab_id]
-        tab["pinned"] = not tab["pinned"]
-        event.button.label = "Unpin" if tab["pinned"] else "Pin"
-        tabs = self.query_one("#result-tabs", TabbedContent)
-        tabs.get_tab(tab_id).label = self._data_tab_label(tab_id, pinned=tab["pinned"])
-
-    @on(Button.Pressed, ".data-close")
-    def _data_close_clicked(self, event: Button.Pressed) -> None:
-        self._remove_data_tab(self._tab_id_for(event.button))
-
-    @on(Button.Pressed, ".data-export")
-    def _data_export_clicked(self, event: Button.Pressed) -> None:
-        tab_id = self._tab_id_for(event.button)
-        self.query_one(f"#data-{tab_id}", ResultsTable).action_export()
-
-    @staticmethod
-    def _tab_id_for(widget: Widget) -> str:
-        return next(pane.id for pane in widget.ancestors if isinstance(pane, TabPane) and pane.id)
+    @on(Button.Pressed, "#results-close")
+    def _close_result_tab(self) -> None:
+        active = self.query_one("#result-tabs", TabbedContent).active
+        if active in self._data_tabs:
+            self._remove_data_tab(active)
+            self._sync_data_tabs()
+            self._fit_result_tabs()
 
     def _active_results_table(self) -> ResultsTable:
         """The grid the active tab shows: the run's own, or a pinned data tab."""

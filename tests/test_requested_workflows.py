@@ -5,7 +5,7 @@ import asyncio
 from functools import wraps
 
 import pytest
-from textual.widgets import Input, TabbedContent
+from textual.widgets import Input, OptionList, TabbedContent
 
 from d8r.tui.app import D8RApp
 from d8r.tui.session import Session
@@ -23,6 +23,69 @@ async def load_sql(app, pilot, text, offset=None):
     app.editor.move_cursor(app.editor.document.get_location_from_index(len(text) if offset is None else offset))
     app.editor.focus()
     await pilot.pause()
+
+
+@pytest.mark.parametrize("tab,control", [
+    ("tab-schema", "#schema-tree"), ("tab-schema", "#explorer-close"),
+    ("tab-pages", "#page-search"), ("tab-pages", "#pages-list"),
+])
+@async_test
+async def test_explorer_escape_hides_pane_and_restores_query_caret(parquet_source, tab, control):
+    app = D8RApp(Session({parquet_source.id: parquet_source}))
+    async with app.run_test(size=(130, 42)) as pilot:
+        await load_sql(app, pilot, "SELECT 42", len("SELECT "))
+        caret = app.editor.cursor_location
+        app.query_one("#explorer-tabs", TabbedContent).active = tab
+        await pilot.pause()
+        target = app.query_one(control)
+        target.focus()
+        await pilot.pause()
+        assert target.has_focus
+
+        await pilot.press("escape")
+        assert not app.query_one("#explorer-slot").display
+        assert not app.query_one("#explorer-splitter").display
+        assert app.editor.has_focus and app.editor.cursor_location == caret
+        assert app.editor.text == "SELECT 42"
+
+        app.action_toggle_schema()
+        await pilot.press("escape")  # Escape in the editor doesn't close the reopened explorer.
+        assert app.query_one("#explorer-slot").display and app.editor.has_focus
+
+
+@async_test
+async def test_pages_tab_up_search_and_functions_escape():
+    app = D8RApp(Session())
+    async with app.run_test(size=(130, 42)) as pilot:
+        await pilot.press("ctrl+n")
+        tabs = app.query_one("#explorer-tabs", TabbedContent)
+        pages = tabs.get_tab("tab-pages")
+        search = app.query_one("#page-search", Input)
+        listing = app.query_one("#pages-list", OptionList)
+        # The padding and the gap after the button keep their resting background.
+        def backgrounds():
+            y = pages.region.y + 1
+            return [app.screen.get_style_at(x, y).bgcolor for x in (pages.region.x + 1, pages.region.right)]
+
+        resting = backgrounds()
+        await pilot.click(pages)
+        assert backgrounds() == resting
+        await pilot.press("up")
+        assert search.has_focus
+        await pilot.press("down", "home", "down")
+        assert listing.has_focus and listing.highlighted == 1
+        await pilot.press("up")
+        assert listing.has_focus and listing.highlighted == 0
+        await pilot.press("up", *"missing", "down")
+        assert listing.has_focus and listing.option_count == 0
+        await pilot.press("up")
+        assert search.has_focus and search.value == "missing"
+
+        await pilot.click(tabs.get_tab("tab-functions"))
+        await pilot.press("escape")
+        assert not app.query_one("#explorer-slot").display
+        assert tabs.active == "tab-pages" and app.editor.has_focus
+        assert search.value == "missing"
 
 
 @async_test
@@ -226,3 +289,7 @@ async def test_conversation_new_key_does_not_create_query_page(parquet_source):
         assert app.ai_panel.chat.id != original
         assert original in app.ai_chats.chats
         assert app.editor.text == "SELECT 17" and app._document_identity == identity
+        app.action_conversations()
+        await pilot.press("escape")
+        assert not app.query_one("#assistant-slot").display and app.editor.has_focus
+        assert original in app.ai_chats.chats

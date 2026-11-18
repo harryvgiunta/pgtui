@@ -95,7 +95,8 @@ async def test_offline_validation_is_honest_and_never_executes(session, monkeypa
 @run_async
 async def test_sample_and_execution_permissions_default_off(session):
     assert session.ai_allow_sample_data is False
-    assert session.ai_test_queries is False
+    assert session.ai_test_queries is True
+    assert session.ai_allow_query_execution is False
     context = context_for(session)
     tools = {item["function"]["name"] for item in context.tools}
     assert "sample_rows" not in tools
@@ -121,7 +122,7 @@ async def test_metadata_is_cached_native_columns(session, monkeypatch):
 
 @run_async
 async def test_readonly_checks_withhold_values_and_never_change_history(session):
-    session.update_settings(ai_test_queries=True, ai=replace(session.ai_config, sample_rows=2))
+    session.update_settings(ai_allow_query_execution=True, ai=replace(session.ai_config, sample_rows=2))
     context = context_for(session)
     before = list(session.history_for(context.source_key))
     result = await tool(context, "test_query", text="SELECT * FROM data ORDER BY id")
@@ -209,10 +210,10 @@ async def test_questions_validate_before_callback_and_resume(session):
 
 @run_async
 async def test_cancelled_turn_holds_shared_lane_until_read_finishes(session, monkeypatch):
-    session.update_settings(ai_test_queries=True)
+    session.update_settings(ai_allow_query_execution=True)
     context = context_for(session)
     manager = AIChats(SimpleNamespace(), session)
-    chat = AIChat("chat", "target")
+    chat = AIChat("chat", "target", provider_snapshot=(session.ai_provider_revision, session.ai_config))
     entered = asyncio.Event()
     release = threading.Event()
     loop = asyncio.get_running_loop()
@@ -323,7 +324,7 @@ def test_postgres_prompt_includes_actual_server_version(session):
 
 @run_async
 async def test_driver_error_text_is_never_sent_to_provider(session, monkeypatch):
-    session.update_settings(ai_test_queries=True)
+    session.update_settings(ai_allow_query_execution=True)
 
     def fail(*args, **kwargs):
         raise RuntimeError("password=private-password api-key=private-key")

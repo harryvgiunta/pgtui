@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import asyncio
 from functools import wraps
-from textual.widgets import DataTable, Input, Select, Static, TextArea
+from textual.widgets import Button, DataTable, Input, Select, Static, Tab, TabbedContent, TextArea
 
 from d8r.tui.add_source import AddSourceModal
 from d8r.tui.app import D8RApp
 from d8r.tui.palette import view_for
+from d8r.tui.results import ExportModal, ResultsTable
 from d8r.tui.session import Session
 from d8r.tui.settings import MENUS
 
@@ -74,7 +75,7 @@ async def test_sql_completion_run_results_and_multiple_tabs(parquet_source):
         await pilot.pause()
         await pilot.press("tab")
         assert app.editor.text == "SELECT"
-        sql = "SELECT id, label FROM data ORDER BY id; SELECT count(*) AS n FROM data;"
+        sql = "SELECT id, label FROM data ORDER BY id; SELECT count(*) AS n FROM data; SELECT 42 AS answer;"
         app.editor.load_text(sql)
         app.editor.focus()
         await pilot.press("f5")
@@ -83,10 +84,91 @@ async def test_sql_completion_run_results_and_multiple_tabs(parquet_source):
         assert app._main_outcome is not None and app._main_outcome.ok
         assert app._main_outcome.rows == [[1, "alpha"], [2, "beta"], [3, None]]
         assert app.query_one("#results-table", DataTable).row_count == 3
-        assert len(app._data_tabs) == 1
+        tabs = app.query_one("#result-tabs", TabbedContent)
+        buttons = list(tabs.query(Tab))
+        assert [tab.label_text for tab in buttons] == ["Results 1", "Results 2", "Results 3", "SQL", "History"]
+        assert tabs.active == "tab-results"
+        for tab, rows in zip(buttons[1:3], [((3,),), ((42,),)]):
+            await pilot.click(tab)
+            assert tabs.get_pane(tabs.active).query_one(ResultsTable).raw_rows == rows
         assert session.history
         assert app.editor.text == sql
         assert "DuckDB" in str(app.query_one("#source-version", Static).content)
+        footer = str(app.query_one("#status", Static).content)
+        assert "3 results" in footer and "3 rows" not in footer
+
+
+@async_test
+async def test_results_drag_bar_operates_on_current_tab_and_preserves_pins(parquet_source):
+    app = D8RApp(Session({parquet_source.id: parquet_source}))
+    async with app.run_test(size=(120, 45)) as pilot:
+        tabs = app.query_one("#result-tabs", TabbedContent)
+        app.editor.load_text("SELECT 11 AS n; SELECT 22 AS n")
+        await pilot.press("f5")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.click("#results-pin")  # Keep a snapshot of Results 1.
+        pinned = tabs.active
+        assert tabs.get_tab(pinned).label_text == "Results 3 ◆"
+        assert app.query_one("#results-pin", Button).label.plain == "Unpin"
+        # Even with both sidebars open, [x] and Close are separate hit targets.
+        await pilot.resize_terminal(80, 45)
+        app.action_ai()
+        await pilot.pause()
+        handle = app.query_one("#editor-splitter")
+        for control in app.query("#output-controls Button"):
+            assert handle.region.contains_region(control.region)
+            assert app.screen.get_widget_at(*control.region.offset)[0] is control
+        await pilot.press("escape")
+        await pilot.resize_terminal(120, 45)
+        second = next(tab for tab in tabs.query(Tab) if tab.label_text == "Results 2")
+        await pilot.click(second)
+        title = app.query_one("#output-controls .pane-title")
+        for control in [title, *app.query("#output-controls Button")]:
+            assert control.region.height == 1 and control.region.y == handle.region.y
+        initial = app.session.pane_sizes["editor"]
+        await pilot.click("#results-copy")
+        assert app.clipboard.splitlines() == ["n", "22"]
+        await pilot.click("#results-export")
+        assert isinstance(app.screen, ExportModal) and app.screen.snapshot.rows == ((22,),)
+        await pilot.press("escape")
+        assert app.session.pane_sizes["editor"] == initial
+        x, y = title.region.x + 1, title.region.y + 2
+        await pilot.mouse_down(title, offset=(1, 0))
+        await pilot.mouse_up(offset=(x, y))
+        assert app.session.pane_sizes["editor"] == initial + 2
+
+        app.editor.load_text("SELECT 33 AS n; SELECT 44 AS n")
+        await pilot.press("f5")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert tabs.active == "tab-results"
+        assert [tab.label_text for tab in tabs.query(Tab)][:3] == ["Results 1", "Results 2 ◆", "Results 3"]
+        await pilot.click(tabs.get_tab(pinned))
+        assert tabs.get_pane(pinned).query_one(ResultsTable).raw_rows == ((11,),)
+        await pilot.click("#results-pin")
+        assert tabs.get_tab(pinned).label_text == "Results 2"
+        await pilot.click("#results-close")
+        assert [tab.label_text for tab in tabs.query(Tab)] == ["Results 1", "Results 2", "SQL", "History"]
+        await pilot.click(tabs.get_tab("tab-sql"))
+        assert not app.query_one("#results-actions").display
+        await pilot.click("#output-close")
+        assert not handle.display and not app.query_one("#output-slot").display
+
+
+@async_test
+async def test_zero_row_summary_appears_only_in_results(parquet_source):
+    app = D8RApp(Session({parquet_source.id: parquet_source}))
+    async with app.run_test(size=(140, 45)) as pilot:
+        app.editor.load_text("SELECT id FROM data WHERE false")
+        await pilot.press("f5")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        summary = str(app.query_one("#results-status", Static).content)
+        assert "0 rows" in summary and " ms" in summary
+        footer = str(app.query_one("#status", Static).content)
+        assert "0 rows" not in footer and " ms" not in footer
+        assert "running" not in footer.lower()
 
 
 @async_test

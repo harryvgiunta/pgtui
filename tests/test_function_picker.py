@@ -540,7 +540,11 @@ async def test_escape_returns_to_query_without_losing_function_or_chat_drafts(pa
         assert session.workspace["function_draft"]["body"] == draft
         assert session.fns == functions
         assert not session.history
+        assert app.query_one("#explorer-slot").display == (focus not in {"#fn-search", "#fn-list"})
+        if focus.startswith("#fn-"):
+            assert app.query_one("#explorer-tabs").active != "tab-functions"
         if chat is not None:
+            assert not app.query_one("#assistant-slot").display
             assert chat.input == "Keep this unsent chat draft"
             assert session.load_chats()[chat.id]["input"] == chat.input
             assert not chat.messages

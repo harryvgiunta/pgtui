@@ -326,8 +326,13 @@ class Session:
 
     @property
     def ai_test_queries(self) -> bool:
-        """Whether AI tools may execute bounded, read-only query checks."""
+        """Whether to check final AI query drafts and attempt SQL repairs."""
         return self._settings.document["ai_test_queries"]
+
+    @property
+    def ai_allow_query_execution(self) -> bool:
+        """Whether checks may run a query rather than only prepare it."""
+        return self._settings.document["ai_allow_query_execution"]
 
     @property
     def ai_completion(self) -> bool:
@@ -423,6 +428,7 @@ class Session:
         ai_allow_sample_data: bool | None = None,
         ai_allow_schema_refreshes: bool | None = None,
         ai_test_queries: bool | None = None,
+        ai_allow_query_execution: bool | None = None,
         ai_completion: bool | None = None,
         pane_sizes: dict[str, int] | None = None,
         value_cache_enabled: bool | None = None,
@@ -475,6 +481,8 @@ class Session:
             document["ai_allow_schema_refreshes"] = ai_allow_schema_refreshes
         if ai_test_queries is not None:
             document["ai_test_queries"] = ai_test_queries
+        if ai_allow_query_execution is not None:
+            document["ai_allow_query_execution"] = ai_allow_query_execution
         if ai_completion is not None:
             document["ai_completion"] = ai_completion
         if value_cache_enabled is not None:

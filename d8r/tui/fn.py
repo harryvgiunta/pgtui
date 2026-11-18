@@ -86,7 +86,6 @@ class FnExplorer(Vertical):
     """Searchable source-local call picker; editing and installation are explicit."""
 
     BINDINGS = [
-        Binding("escape", "back", "Back to query", show=False, priority=True),
         Binding("down", "enter_list", "Function list", show=False, priority=True),
         Binding("up", "focus_search", "Search functions", show=False, priority=True),
     ]
@@ -109,9 +108,6 @@ class FnExplorer(Vertical):
 
     class InstallQualityRequested(Message):
         pass
-
-    class BackRequested(Message):
-        """Leave the picker without inserting or changing a definition."""
 
     def __init__(self, *, manage: bool = True, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -139,9 +135,6 @@ class FnExplorer(Vertical):
 
     def focus_search(self) -> None:
         self.query_one("#fn-search", Input).focus()
-
-    def action_back(self) -> None:
-        self.post_message(self.BackRequested())
 
     def show_functions(self, functions, selected: str = "") -> None:
         """Accept this workspace editor's library, never fetch schema or rows."""
@@ -224,6 +217,8 @@ class FnExplorer(Vertical):
 class FunctionPicker(ModalScreen[FnDef | None]):
     """Reuse the source-local library for a draft-only function reference."""
 
+    BINDINGS = [Binding("escape", "dismiss", "Back to query", show=False, priority=True)]
+
     DEFAULT_CSS = """
     FunctionPicker { align: center middle; }
     FunctionPicker > FnExplorer {
@@ -254,11 +249,6 @@ class FunctionPicker(ModalScreen[FnDef | None]):
     def _choose(self, event: FnExplorer.InsertRequested) -> None:
         event.stop()
         self.dismiss(self._functions.get(event.name))
-
-    @on(FnExplorer.BackRequested)
-    def _back(self, event: FnExplorer.BackRequested) -> None:
-        event.stop()
-        self.dismiss(None)
 
 
 class FnEditor(Vertical):
@@ -726,7 +716,7 @@ class FnEditor(Vertical):
 
     def action_back(self) -> None:
         """Return to the query without unmounting editors or cancelling chats."""
-        self.ide.action_workspace()
+        self.ide.return_to_query()
 
 
 def _cell(value: object) -> str:

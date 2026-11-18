@@ -68,7 +68,7 @@ def _d1_error(payload, fallback):
         message = message[:2048].removeprefix("D1_ERROR: ")
         for pattern, state in _D1_ERROR_PATTERNS:
             if pattern.match(message):
-                return EngineError("Cloudflare D1: " + _sql_error_message(state) + " " + _UNCERTAIN)
+                return EngineError("Cloudflare D1: " + _sql_error_message(state) + " " + _UNCERTAIN, sqlstate=state)
     return EngineError(fallback + " " + _UNCERTAIN)
 
 
@@ -409,7 +409,7 @@ def _guard_readonly(con, sql, tokens, operation):
                 raise EngineError("Read-only D1 EXPLAIN rejected an unsafe function")
 
 
-def execute_d1(source, sql, statement, *, cap, readonly, timeout):
+def execute_d1(source, sql, statement, *, cap, readonly, timeout, prepare_only=False):
     tokens = [token for token in lex_sql(statement, dialect="sqlite") if token.kind not in {"whitespace", "comment"}]
     words = [token.text.upper() for token in tokens if token.kind == "word"]
     first = words[0] if words else ""
@@ -430,6 +430,8 @@ def execute_d1(source, sql, statement, *, cap, readonly, timeout):
             native = sql
             if readonly:
                 _guard_readonly(con, statement, tokens, operation)
+                if prepare_only:
+                    return {}  # The guarded EXPLAIN already prepared the exact statement.
                 # The newline protects the closing wrapper from a trailing line comment.
                 native = f"SELECT * FROM (\n{statement}\n) AS _pgtui_read LIMIT {cap + 1}"
             columns, rows, changes = con.raw(native, operation)

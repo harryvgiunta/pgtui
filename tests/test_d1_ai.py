@@ -30,7 +30,11 @@ def test_d1_ai_checks_expand_templates_and_keep_samples_opt_in(d1_source, d1_har
         result = json.loads(await disabled.call_tool("test_query", {"text": "SELECT * FROM by_id(2)"}))
         assert not result["executed"]
         assert len(d1_harness.requests) == before
-        session.update_settings(ai_test_queries=True)
+        prepared = await disabled.check_query("SELECT * FROM by_id(2)", execute=False)
+        assert prepared == {"prepared": True, "executed": False}
+        requests = [json.loads(r.content)["sql"] for r in d1_harness.requests[before:]]
+        assert len(requests) == 1 and requests[0].startswith("EXPLAIN ")
+        session.update_settings(ai_allow_query_execution=True)
         context = AIContext(session, d1_source.id, "SELECT * FROM records")
         workspace = deepcopy(session.workspace)
         history = list(session.history)

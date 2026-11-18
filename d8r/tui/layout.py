@@ -29,10 +29,12 @@ class PaneSplitter(Widget, can_focus=True):
         width: 1;
         height: 1fr;
         background: $panel-lighten-2;
+        hatch: vertical $foreground 65%;
     }
     PaneSplitter.horizontal {
         width: 1fr;
         height: 1;
+        hatch: horizontal $foreground 65%;
     }
     PaneSplitter:hover, PaneSplitter:focus, PaneSplitter.dragging {
         background: $accent;
@@ -144,7 +146,8 @@ class PaneSplitter(Widget, can_focus=True):
         self.refresh_size()
 
     def on_mouse_down(self, event: events.MouseDown) -> None:
-        if event.button != 1:
+        # A toolbar button embedded in the handle owns its click, not a resize.
+        if event.button != 1 or self.screen.get_focusable_widget_at(*event.screen_offset) is not self:
             return
         event.stop()
         self.focus()
@@ -194,6 +197,8 @@ class PaneSplitter(Widget, can_focus=True):
         self._cancel_drag()
 
     def on_key(self, event: events.Key) -> None:
+        if not self.has_focus:
+            return
         if event.key == "escape" and self._drag is not None:
             self._cancel_drag()
         else:
