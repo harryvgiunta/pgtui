@@ -204,6 +204,12 @@ class ResultsTable(DataTable):
         self.selected_rows = set(range(len(self.raw_rows)))
         self._selection_changed()
 
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action == "clear_selection":
+            # Without a selection, let Escape dismiss the enclosing results window.
+            return self._cell_bounds is not None or bool(self.selected_rows)
+        return super().check_action(action, parameters)
+
     def action_clear_selection(self) -> None:
         self._range_anchor = None
         self._cell_bounds = None

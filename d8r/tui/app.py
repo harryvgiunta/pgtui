@@ -209,6 +209,8 @@ class D8RApp(App):
         Binding("shift+f5", "run(True)", "Read-only page", priority=True),
         Binding("ctrl+shift+f5", "run(False)", "Run native SQL", priority=True),
         Binding("ctrl+k", "compile", "SQL preview", priority=True),
+        Binding("ctrl+w", "close_result_tab", "Close result tab", show=False),
+        Binding("escape", "close_output", "Hide results window", show=False),
         Binding("f6", "compile", "SQL preview", priority=True, show=False),
         Binding("ctrl+r", "preview_function", "Preview function", show=False),
         Binding("ctrl+d", "delete_function", "Delete function", show=False),
@@ -250,9 +252,9 @@ class D8RApp(App):
         self._startup_connection_started = False
         self._data_tabs: dict[str, dict] = {}
         self._data_tab_seq = 0
-        self._results_closed = False
+        self._results_closed = not any(self.session.pane_visibility[name] for name in self.TAB_PANES)
         self._main_outcome: RunOutcome | None = None
-        self._workspace_outputs: dict[str, tuple[RunOutcome | None, str]] = {}
+        self._workspace_outputs: dict[str, tuple[RunOutcome | None, str, bool]] = {}
 
     def get_default_screen(self) -> Screen:
         """The IDE runs on `IdeScreen`, whose tab does not walk the panes."""
@@ -326,9 +328,10 @@ class D8RApp(App):
                             yield Button("Export", id="results-export", compact=True,
                                          tooltip="Export this result to CSV")
                             yield Button("Close", id="results-close", compact=True,
-                                         tooltip="Close this result tab")
+                                         tooltip=binding_tooltip(self.BINDINGS, "close_result_tab", context="Results focused"))
                         yield Button(Content("[x]"), id="output-close", classes="pane-close",
-                                     compact=True, tooltip="Hide results window · reopen with \\results, \\sql or \\history")
+                                     compact=True, tooltip=binding_tooltip(self.BINDINGS, "close_output", context="Results focused")
+                                     + " · reopen with \\results, \\sql or \\history")
                 with Vertical(id="output-slot"):
                     with TabbedContent(id="result-tabs"):
                         with TabPane("Results 1", id="tab-results"):
@@ -507,8 +510,9 @@ class D8RApp(App):
         """Capture outgoing widgets before their source or stable identities change."""
         for palette in self.query(CommandPalette):
             palette.close()
+        result_closed = self.session.pane_visibility["results"] and not self.pane_visible("results")
         self._workspace_outputs[self._workspace_key] = (
-            self._main_outcome, self.query_one("#sql-text", TextArea).text)
+            self._main_outcome, self.query_one("#sql-text", TextArea).text, result_closed)
         self.function_editor.flush_draft()
         self.ai_panel._flush_chat()
         self._flush_workspace()
@@ -539,9 +543,11 @@ class D8RApp(App):
         self._refresh_header()
         self._refresh_tree()
         self._refresh_history()
-        outcome, sql = self._workspace_outputs.get(self._workspace_key, (None, ""))
-        self._render_results(outcome or RunOutcome())
-        self._set_error(outcome.error if outcome else "")
+        outcome, sql, result_closed = self._workspace_outputs.pop(self._workspace_key, (None, "", False))
+        self._render_results(outcome)
+        visible = self.session.pane_visibility["results"] and not result_closed
+        if self.pane_visible("results") != visible:
+            self.set_pane("results", visible)
         self._set_sql(sql)
         self._sync_data_tabs()
         self._sync_layout()
@@ -982,7 +988,7 @@ class D8RApp(App):
         self.return_to_query()
 
     @on(Button.Pressed, "#output-close")
-    def _close_output(self) -> None:
+    def action_close_output(self) -> None:
         if not self.update_settings(panes={name: False for name in self.TAB_PANES}):
             return
         self._results_closed = True
@@ -1102,6 +1108,12 @@ class D8RApp(App):
             self.exit()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action in {"close_result_tab", "close_output"}:
+            if not self._workspace_ready or self._modal_open() or self.function_mode:
+                return False
+            in_output = (self.query_one("#output-slot").has_focus_within
+                         or self.query_one("#editor-splitter").has_focus_within)
+            return in_output and (action == "close_output" or self.query_one("#results-actions").display)
         if action == "new_query":
             focused = self.screen.focused
             in_conversations = focused is not None and any(
@@ -1234,8 +1246,10 @@ class D8RApp(App):
         if self.session.source is not source:
             return
         outcome = outcomes[0]
-        self._set_error(outcome.error)
         self._render_results(outcome)
+        # Closing a single result is not a preference to hide future runs.
+        if self.session.pane_visibility["results"]:
+            self.set_pane("results", True)
         self._refresh_history()
         # Rollback or a partially successful document may also change tables.
         self._schema_updated(source)
@@ -1249,7 +1263,6 @@ class D8RApp(App):
         self._set_status(status)
         if self.session.workspace_error:
             self.notify(self.session.workspace_error, title="History could not be saved", severity="error", timeout=15)
-        self._show_tab("tab-results")
         self._open_data_tabs(outcomes[1:])
 
     def action_compile(self) -> None:
@@ -1582,8 +1595,10 @@ class D8RApp(App):
         self.refresh_functions()
         self._set_status(f"Installed {count} data-quality functions · nothing executed")
 
-    def _render_results(self, outcome: RunOutcome) -> None:
+    def _render_results(self, outcome: RunOutcome | None) -> None:
         self._main_outcome = outcome
+        outcome = outcome or RunOutcome()
+        self._set_error(outcome.error)
         table = self.query_one("#results-table", ResultsTable)
         table.show_result(outcome)
         self.query_one("#results-status", Static).update(outcome.status)
@@ -1642,7 +1657,6 @@ class D8RApp(App):
         active = self.query_one("#result-tabs", TabbedContent).active
         tab = self._data_tabs.get(active)
         self.query_one("#results-actions").display = active == "tab-results" or tab is not None
-        self.query_one("#results-close").display = tab is not None
         pin = self.query_one("#results-pin", Button)
         pinned = tab is not None and tab["pinned"]
         pin.label = "Unpin" if pinned else "Pin"
@@ -1734,12 +1748,23 @@ class D8RApp(App):
         tabs.remove_pane(tab_id)
 
     @on(Button.Pressed, "#results-close")
-    def _close_result_tab(self) -> None:
-        active = self.query_one("#result-tabs", TabbedContent).active
-        if active in self._data_tabs:
+    def action_close_result_tab(self) -> None:
+        tabs = self.query_one("#result-tabs", TabbedContent)
+        active = tabs.active
+        if active == "tab-results":
+            # Keep the live widget mounted for the next run, not its buffer.
+            self._render_results(None)
+            self.set_pane("results", False)
+        elif active in self._data_tabs:
             self._remove_data_tab(active)
             self._sync_data_tabs()
             self._fit_result_tabs()
+        else:
+            return
+        if tabs.display:
+            tabs.query_one(Tabs).focus()
+        else:
+            self._focus_editor()
 
     def _active_results_table(self) -> ResultsTable:
         """The grid the active tab shows: the run's own, or a pinned data tab."""

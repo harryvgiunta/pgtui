@@ -365,8 +365,10 @@ The next run replaces unpinned results. Pin on Results 1 keeps a separate snapsh
 Pin on another result keeps that tab. Pinned tabs are marked ◆.
 Drag the vertical dividers to resize Explorer or Conversations. Drag the horizontal
 line beside **Query results**, or the title itself, to resize the editor and results.
-The toolbar copies or exports the selected result; **Close** removes an extra tab,
-while **[x]** hides the whole results pane.
+**Close** or **Ctrl+W** closes the selected result tab, including **Results 1**.
+Other tabs stay open, and the next run can show fresh results. **[x]** or **Escape**
+with results focused hides the whole output window without discarding its tabs.
+If the grid has a selection, Escape clears it first. Use `\results` to reopen the window.
 After a successful run, each result tab shows its statement’s row count and timing.
 The footer shows `Ready` for a single result or the number of results for a batch.
 Hover a button to see its bound keyboard shortcut. New Query preserves the current

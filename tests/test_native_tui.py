@@ -157,6 +157,64 @@ async def test_results_drag_bar_operates_on_current_tab_and_preserves_pins(parqu
 
 
 @async_test
+async def test_close_first_result_then_remaining_tabs_and_run_again(parquet_source):
+    session = Session({parquet_source.id: parquet_source})
+    session.update_settings(panes={"sql": False, "history": False})
+    app = D8RApp(session)
+    async with app.run_test(size=(100, 36)) as pilot:
+        tabs = app.query_one("#result-tabs", TabbedContent)
+        app.editor.load_text("SELECT 11 AS n; SELECT 22 AS n")
+        await pilot.press("f5")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.click("#results-pin")
+        pinned = tabs.active
+        await pilot.click(tabs.get_tab("tab-results"))
+        await pilot.click("#results-close")
+        assert not tabs.get_tab("tab-results").display
+        assert tabs.get_pane(tabs.active).query_one(ResultsTable).raw_rows == ((22,),)
+        await pilot.press("ctrl+w")
+        assert tabs.active == pinned
+        assert tabs.get_pane(pinned).query_one(ResultsTable).raw_rows == ((11,),)
+        await pilot.press("ctrl+w")
+        assert not app.query_one("#output-slot").display and app.editor.has_focus
+
+        app.editor.load_text("SELECT 33 AS n")
+        await pilot.press("f5")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert tabs.display and tabs.active == "tab-results"
+        assert app.query_one("#results-table", ResultsTable).raw_rows == ((33,),)
+
+
+@async_test
+async def test_escape_clears_result_selection_then_hides_window_across_runs(parquet_source):
+    app = D8RApp(Session({parquet_source.id: parquet_source}))
+    async with app.run_test(size=(100, 36)) as pilot:
+        app.editor.load_text("SELECT 1 AS n; SELECT 2 AS n")
+        app.editor.move_cursor((0, 6))
+        await pilot.press("f5")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        grid = app.query_one("#results-table", ResultsTable)
+        grid.focus()
+        await pilot.press("ctrl+a", "escape")
+        assert not grid.selected_rows and grid.has_focus
+        await pilot.press("escape")
+        assert not app.query_one("#output-slot").display
+        assert app.editor.has_focus and app.editor.cursor_location == (0, 6)
+
+        app.editor.load_text("SELECT 3 AS n; SELECT 4 AS n")
+        await pilot.press("f5")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert not app.query_one("#output-slot").display
+        app.action_toggle_results()
+        await pilot.pause()
+        assert app.query_one("#output-slot").display and grid.raw_rows == ((3,),)
+
+
+@async_test
 async def test_paged_d1_read_navigates_grid_not_editor(d1_source, d1_harness):
     session = Session({d1_source.id: d1_source})
     session.update_settings(default_rows=1)
