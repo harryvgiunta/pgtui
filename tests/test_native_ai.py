@@ -14,7 +14,7 @@ from d8r.ai import context as context_module
 from d8r.ai.client import AIConfig, AIEvent
 from d8r.ai.context import AIContext, AIProposal
 from d8r.ai.page_details import generate_details
-from d8r.sql import FnDef
+from d8r.sql import ColumnDef, FnDef
 from d8r.tui.ai import AIChat, AIChats, AITarget
 from d8r.tui.session import Session
 
@@ -66,6 +66,11 @@ def test_multiple_sql_pages_and_function_metadata(session):
     assert context.validate_replacement(proposal) is None
     with pytest.raises(ValueError, match="matching titles"):
         context.read_proposal("```sql\nSELECT 1\n```\n```sql\nSELECT 2\n```")
+    with pytest.raises(ValueError, match="fences are incomplete"):
+        context.read_proposal(
+            '```sql\nSELECT 1\n```\n```sql\nSELECT 2\n'
+            '```json\n{"kind":"queries","titles":["One","Two"]}\n```'
+        )
     function = context.read_proposal(
         '```sql\nSELECT * FROM data WHERE id = @n\n```\n'
         '```json\n{"kind":"function","original_name":null,"name":"by_id",'
@@ -118,6 +123,52 @@ async def test_metadata_is_cached_native_columns(session, monkeypatch):
     assert [col["name"] for col in result["tables"][0]["columns"]] == ["id", "label"]
     assert "capabilities" not in result
     assert (await tool(context, "schema", query="not_a_column"))["tables"] == []
+
+
+@run_async
+async def test_schema_discovery_stays_compact_and_finds_named_tables_past_inventory(session):
+    session.update_settings(ai_allow_schema_refreshes=True)
+    context = context_for(session)
+    wide = tuple(ColumnDef(f"unrelated_{n}", "character varying") for n in range(200))
+    target = '"reporting"."Interview Changes"'
+    context.source.datasets = {
+        **{f'"legacy"."wide_{n}"': {"columns": wide, "doc": "irrelevant prose" * 100} for n in range(50)},
+        '"other"."counts"': {"columns": (ColumnDef("interview_id", "text"),)},
+        target: {"columns": (*wide, ColumnDef("interview_event_id", "bigint", values=("never-share",)))},
+    }
+    inventory = await context.call_tool("schema", {})
+    packet = json.loads(inventory)
+    assert len(inventory.encode()) < 4096 and "unrelated_" not in inventory and "irrelevant prose" not in inventory
+    assert len(packet["tables"]) == packet["next_offset"] == 40
+    assert all(table["column_count"] == 200 for table in packet["tables"])
+    assert target not in {table["name"] for table in packet["tables"]}
+
+    second = await tool(context, "schema", offset=packet["next_offset"])
+    assert second["tables"][-1]["name"] == target and second["next_offset"] is None
+    found = await tool(context, "schema", query="INTERVIEW")
+    assert [table["name"] for table in found["tables"]] == [target, '"other"."counts"']
+    exact = await tool(context, "schema", table=target)
+    assert exact["tables"][0]["column_count"] == 201 and exact["next_offset"] == 100
+    filtered = await tool(context, "schema", table=target, query="EVENT_ID")
+    assert filtered["tables"][0]["columns"] == [{"name": "interview_event_id", "type": "bigint"}]
+    assert filtered["next_offset"] is None and "never-share" not in str(filtered)
+
+
+@run_async
+async def test_schema_pages_by_utf8_size_without_splitting_records(session):
+    session.update_settings(ai_allow_schema_refreshes=True)
+    context = context_for(session)
+    columns = tuple(ColumnDef(f"col_{n}", "type_" + "中" * 950) for n in range(5))
+    huge = ColumnDef("oversized", "界" * 12_000)
+    context.source.datasets["data"] = {"columns": (huge, *columns)}
+    first_raw = await context.call_tool("schema", {"table": "data"})
+    first = json.loads(first_raw)
+    assert len(first_raw.encode()) < 13_000
+    assert first["oversized_records_omitted"] == 1 and first["next_offset"] == 5
+    second = await tool(context, "schema", table="data", offset=first["next_offset"])
+    shown = first["tables"][0]["columns"] + second["tables"][0]["columns"]
+    assert shown == [{"name": col.name, "type": col.type} for col in columns]
+    assert second["next_offset"] is None
 
 
 @run_async
@@ -206,6 +257,25 @@ async def test_questions_validate_before_callback_and_resume(session):
     assert "error" in await tool(context, "ask_user", question="Which rows?",
                                  options=[{"label": "All"}, {"label": "Other"}])
     assert len(received) == 1
+
+
+@run_async
+async def test_eager_immediate_context_tools_release_lane_before_next_call(session):
+    session.update_settings(ai_allow_schema_refreshes=True)
+    context = context_for(session)
+    manager = AIChats(SimpleNamespace(screen_stack=[]), session)
+    chat = AIChat("chat", "target", provider_snapshot=(session.ai_provider_revision, session.ai_config))
+    loop = asyncio.get_running_loop()
+    factory = loop.get_task_factory()
+    loop.set_task_factory(asyncio.eager_task_factory)
+    try:
+        for name, args, key in (("schema", {}, "tables"), ("schema", {"table": "data"}, "tables"),
+                                ("functions", {}, "functions"), ("query_history", {}, "history")):
+            result = json.loads(await manager._call_tool(chat, context, name, args, 0))
+            assert key in result, result
+            assert not session.busy and not manager.context_tasks
+    finally:
+        loop.set_task_factory(factory)
 
 
 @run_async

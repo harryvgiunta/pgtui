@@ -682,9 +682,16 @@ class AIChats:
         self.session.busy = "AI context lookup running"
         task = asyncio.create_task(read)
         self.context_tasks.add(task)
-        task.add_done_callback(self._context_finished)
-        # A cancelled request cannot release a sample/check still running in a thread.
-        result = await asyncio.shield(task)
+        try:
+            # A cancelled request cannot release a sample/check still running in a thread.
+            result = await asyncio.shield(task)
+        finally:
+            if task.done():
+                # Eager/immediate tasks can finish before shield yields. Clear
+                # ownership before the caller starts another tool in this batch.
+                self._context_finished(task)
+            else:
+                task.add_done_callback(self._context_finished)
         if self.closing or generation != chat.generation or not self._provider_current(chat):
             raise asyncio.CancelledError
         return result
@@ -734,7 +741,8 @@ class AIChats:
                 raise client.AIError("SQL repair does not allow tool calls.")
             return await self._call_tool(chat, context, name, args, generation)
 
-        async for event in client.run_turn(config, messages, [] if repair else context.tools, call_tool):
+        async for event in client.run_turn(config, messages, [] if repair else context.tools, call_tool,
+                                           max_output_tokens=client.CHAT_OUTPUT_TOKENS):
             if self.closing or generation != chat.generation or not self._provider_current(chat):
                 raise asyncio.CancelledError
             if event.kind == "text":

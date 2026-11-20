@@ -51,7 +51,6 @@ from .editor_tools import FindBar, format_editor
 from .ai import AIChats, AIPanel, AITarget, ConversationTabs, DeleteOptionList
 from .palette import CommandPalette, EditorPane
 from .query_editor import QueryTextArea
-from .query_folds import QueryFoldView
 from .page_details import PageDetails
 from .results import ResultsTable
 from .session import RunOutcome, Session
@@ -225,7 +224,7 @@ class D8RApp(App):
         Binding("f8", "cancel_operation", "Cancel query or connection", priority=True, show=False),
         Binding("ctrl+f", "find_sql", "Find in SQL", priority=True, show=False),
         Binding("ctrl+shift+f", "format_sql", "Format SQL", priority=True, show=False),
-        Binding("f7", "query_sections", "Fold / expand SQL sections", priority=True, show=False),
+        Binding("f7", "query_sections", "Collapse or expand all SQL sections", priority=True, show=False),
         Binding("ctrl+k", "compile", "SQL preview", priority=True),
         Binding("ctrl+w", "close_result_tab", "Close result tab", show=False),
         Binding("escape", "close_output", "Hide results window", show=False),
@@ -341,7 +340,7 @@ class D8RApp(App):
                                      tooltip=binding_tooltip(self.BINDINGS, "format_sql") + " · Selection or whole draft")
                         yield Button("Find", id="open-find", compact=True,
                                      tooltip=binding_tooltip(self.BINDINGS, "find_sql"))
-                        yield Button("Sections", id="query-sections", compact=True,
+                        yield Button("Fold/Expand All", id="query-sections", compact=True,
                                      tooltip=binding_tooltip(self.BINDINGS, "query_sections"))
                         yield Button("SQL ↔ dbt", id="dbt-toggle", compact=True,
                                      tooltip="Convert this page between PostgreSQL SQL and dbt Jinja without running it")
@@ -349,7 +348,6 @@ class D8RApp(App):
                     with EditorPane(id="editor-pane"):
                         yield QueryTextArea(self._initial_document, dialect=self.session.source.dialect,
                                             show_line_numbers=True, id="editor")
-                        yield QueryFoldView()
                         yield CommandPalette(self.session, id="palette", markup=False)
                     yield FnEditor(self, id="function-editor")
                 with PaneSplitter("#editor-slot", "height", "editor", min_size=8,
@@ -828,9 +826,7 @@ class D8RApp(App):
         return self.function_editor.query_one("#fn-body", QueryTextArea) if self.function_mode else self.editor
 
     def _focus_editor(self) -> None:
-        editor = self.active_sql_editor()
-        editor.reveal_for_edit()
-        editor.focus()
+        self.active_sql_editor().focus()
 
     def action_find_sql(self) -> None:
         self._open_find(from_toolbar=False)
@@ -841,8 +837,6 @@ class D8RApp(App):
 
     def _open_find(self, *, from_toolbar: bool) -> None:
         editor = self.active_sql_editor()
-        from_toolbar = from_toolbar or editor.parent.query_one(QueryFoldView).has_focus_within
-        editor.reveal_for_edit(focus=False)
         editor.parent.query_one(CommandPalette).close()
         self.query_one(FindBar).open(editor, from_toolbar=from_toolbar)
 
@@ -850,7 +844,6 @@ class D8RApp(App):
     def action_format_sql(self) -> None:
         editor = self.active_sql_editor()
         self.query_one(FindBar).close(restore_focus=False)
-        editor.reveal_for_edit()
         editor.parent.query_one(CommandPalette).close()
         try:
             changed = format_editor(editor, editor.dialect)
@@ -861,11 +854,12 @@ class D8RApp(App):
         editor.focus()
 
     @on(Button.Pressed, "#query-sections")
+    def _fold_all_clicked(self) -> None:
+        self.action_query_sections()
+        self.active_sql_editor().focus()
+
     def action_query_sections(self) -> None:
-        self.query_one(FindBar).close(restore_focus=False)
-        editor = self.active_sql_editor()
-        editor.parent.query_one(CommandPalette).close()
-        editor.action_toggle_folds()
+        self.active_sql_editor().action_toggle_folds()
 
     def _ai_target(self) -> AITarget:
         if self.function_mode:
@@ -1582,7 +1576,6 @@ class D8RApp(App):
         to_sql = document == views["jinja"]
         next_view = "sql" if to_sql else "jinja"
         self.query_one(FindBar).close(restore_focus=False)
-        editor.reveal_for_edit(focus=False)
         self._replace_dbt_draft(editor, views[next_view])
         editor.focus()
         self._capture_workspace()

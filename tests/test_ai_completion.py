@@ -68,6 +68,7 @@ async def test_inline_transport_sends_bounded_sql_context_without_values_or_tool
     assert 'never-send-cached-row' not in body and 'never-send-function-body' not in body
     payload = json.loads(body)
     assert 'tools' not in payload
+    assert 'max_tokens' not in payload  # Long-form chat's allocation is not used for inline edits.
     data = json.loads(payload['messages'][-1]['content'])
     assert data['sql_before'] == 'SELECT r.'
     assert data['replace'] == 'la' and data['sql_after'] == ' FROM records r'

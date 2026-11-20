@@ -16,32 +16,63 @@ class _Scope:
     clause: str = ""
     cases: int = 0
     between: bool = False
+    projection: list[int] | None = None
+    distinct_on: bool = False
+
+    def finish_projection(self, end: int, breaks: dict[int, int]) -> None:
+        if self.projection is None:
+            return
+        # DuckDB allows a trailing comma: the clause or closing delimiter that
+        # follows it is not another projection.
+        if self.projection[-1] == end:
+            self.projection.pop()
+        if len(self.projection) >= _VERTICAL_PROJECTIONS:
+            breaks.update((i, self.indent + 1) for i in self.projection)
+        self.projection = None
+        self.distinct_on = False
 
 
 _JOIN_PREFIX = frozenset("NATURAL INNER LEFT RIGHT FULL OUTER CROSS ASOF SEMI ANTI POSITIONAL".split())
 _SET = frozenset({"UNION", "INTERSECT", "EXCEPT"})
 _CLAUSES = frozenset({"WHERE", "HAVING", "WINDOW", "QUALIFY", "LIMIT", "OFFSET"})
 _PAIRS = {"(": ")", "[": "]", "{": "}"}
+_VERTICAL_PROJECTIONS = 5  # Keep small lists compact, independent of existing line breaks.
 
 
-def _breaks(tokens: list[Token], dialect: str, line_starts: set[int]) -> dict[int, int]:
-    """New lines keyed by token index. Expression parentheses are *not* query scopes."""
-    words = [t.text.upper() if t.kind == "word" else "" for t in tokens]
+def _breaks(
+    tokens: list[Token], dialect: str, line_starts: set[int],
+) -> tuple[dict[int, int], dict[int, int]]:
+    """Clause and projection breaks keyed by token index (ignoring expression nesting)."""
+    # Qualified names and prefixed parameters can contain clause keywords.
+    words = [
+        t.text.upper() if t.kind == "word" and not (
+            i and (tokens[i - 1].text == "." or
+                   (tokens[i - 1].text in {":", "$"} and tokens[i - 1].end == t.start))
+        ) else ""
+        for i, t in enumerate(tokens)
+    ]
     heads = {"SELECT", "WITH"} | ({"FROM"} if dialect == "duckdb" else set())
-    if not words or words[0] not in heads:
-        return {}
+    head = 0
+    while dialect != "sqlite" and head < len(tokens) and tokens[head].text == "(":
+        head += 1
+    if head == len(words) or words[head] not in heads:
+        return {}, {}
+    clauses = _CLAUSES if dialect == "duckdb" else _CLAUSES - {"QUALIFY"}
+    if dialect == "sqlite":
+        clauses = clauses - {"OFFSET", "WINDOW"}
     ctes = dict(cte_declarations(tokens))
     bodies = set(ctes.values())
     scopes = [_Scope("", 0, True)]
     lines: dict[int, int] = {}
     continuations: dict[int, int] = {}
+    projections: dict[int, int] = {}
     for i, (word, token) in enumerate(zip(words, tokens)):
         scope = scopes[-1]
         text = token.text
         prev = words[i - 1] if i else ""
         following = words[i + 1] if i + 1 < len(words) else ""
         # A projection or relation may already start on its own line. Indent
-        # that line under its clause without splitting inline lists or literals.
+        # that line under its clause, without changing gaps between literals.
         if i in line_starts and scope.query and scope.clause and not scope.cases and (
             prev in {"SELECT", "DISTINCT", "FROM", "JOIN", "WHERE", "HAVING", "BY", "ON", "AND", "OR"}
             or tokens[i - 1].text == "," or text == ","
@@ -53,14 +84,20 @@ def _breaks(tokens: list[Token], dialect: str, line_starts: set[int]) -> dict[in
             if query:
                 # Don't turn pathological nesting into quadratically more whitespace.
                 if scopes[-1].indent > 64:
-                    return {}
+                    return {}, {}
                 lines[i + 1] = scopes[-1].indent
         elif text in (")", "]", "}"):
             if text != scope.close:
-                return {}
+                return {}, {}
             scopes.pop()
+            parent = scopes[-1]
+            if parent.distinct_on:
+                # DISTINCT ON (...) is a SELECT modifier, not its first expression.
+                parent.projection = [i + 1]
+                parent.distinct_on = False
             if scope.query:
-                lines[i] = scopes[-1].indent
+                scope.finish_projection(i, projections)
+                lines[i] = parent.indent
         elif not scope.query:
             continue
         elif word == "CASE":
@@ -71,10 +108,18 @@ def _breaks(tokens: list[Token], dialect: str, line_starts: set[int]) -> dict[in
         elif i in ctes and i and tokens[i - 1].text == ",":
             lines[i] = scope.indent
         elif word == "SELECT":
+            scope.finish_projection(i, projections)
             if i:
                 lines[i] = scope.indent
             scope.clause = word
-        elif word == "FROM" and prev != "DISTINCT":
+            first = i + 1 + int(following in {"ALL", "DISTINCT"})
+            scope.projection = [first]
+            scope.distinct_on = (following == "DISTINCT" and first + 1 < len(tokens)
+                                 and words[first] == "ON" and tokens[first + 1].text == "(")
+        elif word == "FROM" and not (
+            words[i - 2:i] == ["IS", "DISTINCT"] or words[i - 3:i] == ["IS", "NOT", "DISTINCT"]
+        ):
+            scope.finish_projection(i, projections)
             if i:
                 lines[i] = scope.indent
             scope.clause = word
@@ -87,10 +132,22 @@ def _breaks(tokens: list[Token], dialect: str, line_starts: set[int]) -> dict[in
         elif word == "ON" and scope.clause == "JOIN":
             lines[i] = scope.indent + 1
             scope.clause = word
-        elif (word in _SET or word in _CLAUSES or
-              (word in {"ORDER", "GROUP"} and following == "BY")):
+        elif (word in _SET or word in clauses or
+              (word in {"ORDER", "GROUP"} and following == "BY") or
+              (word == "OFFSET" and scope.clause == "LIMIT") or
+              (word == "WINDOW" and i + 3 < len(tokens) and words[i + 2] == "AS"
+               and tokens[i + 3].text == "(")):
+            scope.finish_projection(i, projections)
             lines[i] = scope.indent
             scope.clause = word
+        elif scope.projection is not None and (
+            (dialect == "postgres" and word == "INTO") or
+            (dialect != "sqlite" and word == "FETCH" and following in {"FIRST", "NEXT"}) or
+            (dialect == "postgres" and word == "FOR" and following in {"UPDATE", "SHARE", "NO", "KEY"})
+        ):
+            scope.finish_projection(i, projections)
+        elif text == "," and scope.projection is not None:
+            scope.projection.append(i + 1)
         elif word == "BETWEEN":
             scope.between = True
             continue
@@ -102,7 +159,10 @@ def _breaks(tokens: list[Token], dialect: str, line_starts: set[int]) -> dict[in
             continue
         if i in lines and word != "AND":
             scope.between = False
-    return continuations | lines if len(scopes) == 1 else {}
+    if len(scopes) != 1:
+        return {}, {}
+    scopes[0].finish_projection(len(tokens), projections)
+    return continuations | lines, projections
 
 
 @dataclass(frozen=True)
@@ -168,7 +228,8 @@ def layout_edits(sql: str, dialect: str, start: int, end: int) -> Iterator[Layou
             continue
         line_starts = {i for i, j in enumerate(significant) if j and raw[j - 1].kind == "whitespace"
                        and ("\n" in raw[j - 1].text or "\r" in raw[j - 1].text)}
-        breaks = _breaks(tokens, dialect, line_starts)
+        breaks, projections = _breaks(tokens, dialect, line_starts)
+        breaks.update(projections)
         for i, raw_index in enumerate(significant):
             if i not in breaks or not raw_index:
                 continue
@@ -178,10 +239,12 @@ def layout_edits(sql: str, dialect: str, start: int, end: int) -> Iterator[Layou
             if not (start <= before and at < end):
                 continue
             gap = sql[before:at]
-            # Insert absent whitespace only at known delimiters. In particular, don't
-            # split :from, $where, .key, native operators, or prefixes on literals.
+            # Insert absent whitespace only at known boundaries. A projection
+            # can also touch its SELECT keyword or an intervening block comment.
             if not gap and previous.text not in {"(", ")", ","} and tokens[i].text != ")":
-                continue
+                # A tight @name can lex differently once separated from a word.
+                if i not in projections or tokens[i].text == "@":
+                    continue
             if gap.strip(" \t\r\n"):
                 continue  # Python's definition of whitespace is wider than native SQL's.
             # Keep every existing line ending (including the LF after a line comment)

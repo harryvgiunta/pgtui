@@ -39,6 +39,54 @@ where a.i between 1 and 9
     )
 
 
+def test_long_second_cte_expands_only_its_projection_list():
+    items = [
+        "x",
+        "y",
+        "COALESCE(y, z) AS fallback",
+        "ARRAY[1, 2] AS pair",
+        "CASE WHEN x > 0 THEN 'a,b' ELSE 'c' END AS flag",
+        "x IS NOT DISTINCT FROM y AS same",
+        "ROW(x, y) AS coords",
+        *(f"{i} AS c{i}" for i in range(8, 22)),
+    ]
+    sql = (
+        "WITH base AS (SELECT x, y, z FROM records), "
+        f"report AS (SELECT DISTINCT ON (x, y) {', '.join(items)} FROM base ORDER BY x, y) "
+        "SELECT * FROM report;"
+    )
+    vertical = ",\n        ".join(items)
+    expected = (
+        "WITH base AS (\n    SELECT x, y, z\n    FROM records\n),\n"
+        f"report AS (\n    SELECT DISTINCT ON (x, y)\n        {vertical}\n    FROM base\n    ORDER BY x, y\n)\n"
+        "SELECT *\nFROM report;"
+    )
+    assert format_sql(sql) == expected
+    assert format_sql(expected) == expected
+
+
+@pytest.mark.parametrize(("dialect", "sql", "expected"), [
+    ("postgres", "SELECT * FROM (SELECT a,b,c,d,e FROM t UNION ALL SELECT DISTINCT f,g,h,i,j FROM u) s;",
+     "SELECT *\nFROM (\n    SELECT\n        a,\n        b,\n        c,\n        d,\n        e\n    FROM t\n"
+     "    UNION ALL\n    SELECT DISTINCT\n        f,\n        g,\n        h,\n        i,\n        j\n    FROM u\n) s;"),
+    ("postgres", "(SELECT a,b,c,d,e) UNION SELECT f,g,h,i,j;",
+     "(\n    SELECT\n        a,\n        b,\n        c,\n        d,\n        e\n)\n"
+     "UNION\nSELECT\n    f,\n    g,\n    h,\n    i,\n    j;"),
+    ("sqlite", "SELECT:from,$where,@arg,/* keep */[x,y],window FROM data LIMIT 1 OFFSET 0;",
+     "SELECT\n    :from,\n    $where,\n    @arg,/* keep */\n    [x,y],\n    window\nFROM data\nLIMIT 1\nOFFSET 0;"),
+    ("duckdb", "FROM t SELECT ALL a, {'k': [1, 2]}, coalesce(b, c), d, e, ORDER BY a, b;",
+     "FROM t\nSELECT ALL\n    a,\n    {'k': [1, 2]},\n    coalesce(b, c),\n    d,\n    e,\nORDER BY a, b;"),
+    ("duckdb", "SELECT a, {'k': [1, 2]}, coalesce(b, c), d, FROM t;",
+     "SELECT a, {'k': [1, 2]}, coalesce(b, c), d,\nFROM t;"),
+])
+def test_projection_boundaries_are_local_to_each_select(dialect, sql, expected):
+    assert format_sql(sql, dialect) == expected
+    assert format_sql(expected, dialect) == expected
+    assert [(t.kind, t.text) for t in lex_sql(expected, dialect=dialect) if t.kind != "whitespace"] == [
+        (t.kind, t.text) for t in lex_sql(sql, dialect=dialect) if t.kind != "whitespace"
+    ]
+
+
 @pytest.mark.parametrize(("dialect", "sql"), [
     ("postgres", "/* SELECT x FROM y */; SELECT x FROM y; "
      "WITH q AS (SELECT $tag$ select ' from (\n) $tag$, E'a\\' from', @name::text "
@@ -121,6 +169,20 @@ def test_format_selected_span_is_one_undoable_edit_on_both_editors():
                 assert editor.selection.is_empty
                 assert editor.document.get_line(editor.cursor_location[0]) == "from data;"
                 assert editor.cursor_location[1] == len("from data")
+                editor.action_undo()
+                assert editor.text == original
+                original = ("with a as (select a,b,c,d,e from t),\n"
+                            "b as (select all a,b,c,d,e from a)\n"
+                            "select a,b,c,d,e from b;")
+                editor.load_text(original)
+                selected = original.splitlines()[1]
+                editor.selection = Selection((1, len(selected)), (1, 0))
+                assert format_editor(editor, "postgres")
+                vertical = "b as (\n    select all\n        a,\n        b,\n        c,\n        d,\n        e\n    from a\n)"
+                assert editor.text == original.replace(selected, vertical)
+                assert editor.selected_text == vertical
+                assert editor.selection.end == (1, 0)
+                assert not format_editor(editor, "postgres")
                 editor.action_undo()
                 assert editor.text == original
                 editor.load_text("select * from ")

@@ -712,6 +712,39 @@ async def test_sql_colors_refresh_on_edit_undo_redo_and_load(parquet_source):
         assert color() == keyword
 
 
+@pytest.mark.parametrize("lead", ["", "SELECT * FROM "])
+@async_test
+async def test_schema_prefix_enter_narrows_postgres_popup(lead):
+    from d8r.engine.datasources import DataSource
+    from d8r.sql import ColumnDef, relation_name
+
+    recruiter = relation_name("hrdw", "recruiter")
+    in_schema = {relation_name("recruiting", name) for name in ("applications", "candidates")}
+    source = DataSource("postgres", "PostgreSQL", "", "disconnected", "postgres",
+                        datasets={name: {"rows": None, "columns": (ColumnDef("id", "integer"),)}
+                                  for name in sorted(in_schema | {recruiter})})
+    app = D8RApp(Session({source.id: source}))
+    async with app.run_test(size=(140, 45)) as pilot:
+        await load_editor(app, pilot, lead, (0, len(lead)))
+        await pilot.press(*"recrui")
+        await pilot.pause()
+        assert app.palette.is_open and app.palette.highlighted == 0
+        entries = app.palette.view.entries
+        assert (entries[0].kind, entries[0].insert) == ("schema", "recruiting.")
+        assert any(entry.table == recruiter for entry in entries)
+
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.editor.text == lead + "recruiting."
+        assert app.editor.cursor_location == (0, len(app.editor.text))
+        assert app.palette.is_open
+        assert {entry.table for entry in app.palette.view.entries} == in_schema
+
+        await pilot.press("ctrl+z")
+        assert app.editor.text == lead + "recrui"
+        assert not app.session.history
+
+
 @pytest.mark.parametrize("scenario", ["fresh", "qualified", "after_semicolon", "dismissed", "new_page"])
 @async_test
 async def test_postgres_table_first_typing_needs_no_manual_completion(postgres_source, scenario):

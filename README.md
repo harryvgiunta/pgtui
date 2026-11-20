@@ -310,10 +310,11 @@ older builds did not write a durable snapshot that could be recovered retroactiv
   Table and column slots still prioritize matching names; typo/subsequence matches
   are fallbacks. `WITH` declarations offer `AS (` after the name and `SELECT` at
   the start of the body or main query.
-- Starting a fresh PostgreSQL statement, including after a semicolon, with a table
-  or schema prefix automatically offers matching tables: `etl`, `etl.` and
-  `etl.dataset_sy` all work without Ctrl+Space. Acceptance inserts
-  `SELECT  FROM "schema"."table" AS alias` with the caret between SELECT and FROM.
+- In a relation slot or at the start of a PostgreSQL statement, a matching schema
+  prefix leads partial table-name matches. Accept the schema to insert `schema.`
+  and narrow suggestions to that schema. Accepting a table at the start of a
+  statement inserts `SELECT  FROM "schema"."table" AS alias` with the caret
+  between SELECT and FROM.
 - **Esc** in the query editor pauses SQL suggestions across typing, newlines and
   page changes. Backslash commands still work. Press **Esc** again to resume if
   IntelliSense is enabled in Settings. Neither keypress requests AI completion.
@@ -418,13 +419,17 @@ because it also works with the suggestion list closed.
 Tab remains an alternate accept key. Esc still dismisses inline AI after the
 IntelliSense toggle is rebound.
 
-In query and function SQL, **Format SQL** indents CTE bodies and lays out clauses
-and join conditions. It formats the selection, or the whole draft if nothing is
+In query and function SQL, **Format SQL** indents CTE bodies, lays out clauses and
+join conditions, and puts long SELECT lists on separate lines, including inside
+CTEs and subqueries. It formats the selection, or the whole draft if nothing is
 selected, in one undo step. Table names have a separate syntax color. **Find**
 selects literal matches; Enter / Shift+Enter moves forward / back and wraps.
-**Sections** opens a foldable view of statements, multiline CTEs and subqueries.
-Use ↑/↓ and Enter to expand or collapse a header, **E** to edit there, or **Esc**
-to return to the original selection. Folding changes neither the draft nor what runs.
+Fold arrows appear alongside line numbers for multiline sections. Click an arrow
+or press **Shift+F7** on its line to collapse or expand that section. **Fold/Expand
+All** (**F7**) expands any folds, or collapses the sections when all are expanded.
+Folds never leave the editor or change the SQL. Selection endpoints stay visible;
+copying or running a selection still includes any folded lines it spans. Find opens
+folds that hide a match.
 
 | Keys | Action |
 |---|---|
@@ -432,7 +437,8 @@ to return to the original selection. Folding changes neither the draft nor what 
 | F8 | Cancel the pending connection or interrupt the running query |
 | Ctrl+F in SQL | Find in the current draft; Esc closes Find |
 | Ctrl+Shift+F in SQL | Format the selection or whole draft |
-| F7 in SQL | Open or close Sections |
+| F7 in SQL | Collapse or expand all sections |
+| Shift+F7 in SQL | Toggle the section at the caret's line |
 | Shift+F5 | Run one guarded read-only statement |
 | Ctrl+Shift+F5 | Explicit native execution instead of guarded paging |
 | Ctrl+Right / Ctrl+Left in a result grid | Fetch next / previous page |
@@ -551,6 +557,15 @@ draft, and permitted schema/history/function context. Complete proposals use SQL
 fences. Manual Apply is required unless Auto accept AI updates is enabled; neither
 path executes SQL. Explicitly requested workspace function saves can persist through
 the guarded save tool without opening the function form.
+
+Schema discovery returns table names and column counts, not the full catalog of
+columns. The `schema` tool takes `query` to find tables or `table` to retrieve
+typed columns. With `table` set, `query` filters column names. A `next_offset`
+can be passed back as `offset` with the same filters to read the next page.
+Chat and SQL repair requests send `max_tokens: 8192`. Logs distinguish a provider
+stopping at its length limit from PGTUI stopping an oversized response stream.
+Neither can make an incomplete response applicable. Inline completion retains
+its separate, smaller response budget.
 
 For data questions, chat gets a short list of saved function names for the current
 source and is instructed to check their definitions before writing equivalent SQL.

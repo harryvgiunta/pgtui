@@ -15,6 +15,10 @@ from urllib.parse import urlsplit
 import httpx
 
 MAX_RESPONSE_BYTES = 1_048_576
+# Token-sized SSE deltas repeat the envelope (IDs, model, choice, etc.). Budget
+# those bytes separately from answer text and from small auxiliary requests.
+MAX_CHAT_STREAM_BYTES = 8_388_608
+CHAT_OUTPUT_TOKENS = 8_192
 MAX_EVENT_BYTES = 262_144
 MAX_CONTENT_BYTES = 262_144
 MAX_ARGUMENT_BYTES = 65_536
@@ -239,7 +243,7 @@ def _object(text: str) -> dict:
     return value
 
 
-async def _sse(response: httpx.Response) -> AsyncIterator[tuple[str, str]]:
+async def _sse(response: httpx.Response, max_bytes: int) -> AsyncIterator[tuple[str, str]]:
     """Frame SSE before decoding UTF-8; even unterminated lines have a byte cap."""
     line = bytearray()
     data: list[str] = []
@@ -249,8 +253,8 @@ async def _sse(response: httpx.Response) -> AsyncIterator[tuple[str, str]]:
     first_line = True
     async for chunk in response.aiter_bytes():
         total += len(chunk)
-        if total > MAX_RESPONSE_BYTES:
-            raise AIError("The AI response exceeded the size limit.")
+        if total > max_bytes:
+            raise AIError(f"The AI stream exceeded PGTUI's response size limit ({max_bytes:,} bytes); no proposal is available.")
         for byte in chunk:
             if skip_lf:
                 skip_lf = False
@@ -259,7 +263,7 @@ async def _sse(response: httpx.Response) -> AsyncIterator[tuple[str, str]]:
             if byte not in {10, 13}:
                 line.append(byte)
                 if len(line) + event_size > MAX_EVENT_BYTES:
-                    raise AIError("An AI stream event exceeded the size limit.")
+                    raise AIError("An AI stream event exceeded PGTUI's event size limit; no proposal is available.")
                 continue
             skip_lf = byte == 13
             try:
@@ -269,7 +273,7 @@ async def _sse(response: httpx.Response) -> AsyncIterator[tuple[str, str]]:
             event_size += len(line) + 1
             line.clear()
             if event_size > MAX_EVENT_BYTES:
-                raise AIError("An AI stream event exceeded the size limit.")
+                raise AIError("An AI stream event exceeded PGTUI's event size limit; no proposal is available.")
             if first_line:
                 text = text.removeprefix("\ufeff")
                 first_line = False
@@ -318,7 +322,7 @@ class _ToolCall:
                 raise AIError("The AI provider returned invalid tool arguments.")
             self.argument_size += _size(arguments)
             if self.argument_size > MAX_ARGUMENT_BYTES:
-                raise AIError("AI tool arguments exceeded the size limit.")
+                raise AIError("AI tool arguments exceeded PGTUI's size limit; no proposal is available.")
             self.arguments.append(arguments)
 
 
@@ -357,7 +361,7 @@ class _Response:
                 raise AIError("The AI provider returned invalid response content.")
             self.content_size += _size(content)
             if self.content_size > MAX_CONTENT_BYTES:
-                raise AIError("The AI answer exceeded the size limit.")
+                raise AIError("The AI answer exceeded PGTUI's text size limit; no proposal is available.")
             self.content.append(content)
             self.started |= bool(content)
         fragments = delta.get("tool_calls", [])
@@ -375,8 +379,13 @@ class _Response:
         self.started |= bool(self.calls)
         finish = choice.get("finish_reason")
         if finish is not None:
+            if finish == "length":
+                raise AIError("The AI provider reached its output token limit (finish_reason=length); "
+                              "no proposal is available. Ask for a shorter draft or split the request.")
+            if finish == "content_filter":
+                raise AIError("The AI provider blocked the response (finish_reason=content_filter); no proposal is available.")
             if finish not in ("stop", "tool_calls"):
-                raise AIError("The AI response was cut short or blocked; no proposal is available.")
+                raise AIError("The AI provider returned an unsupported finish reason; no proposal is available.")
             if (finish == "tool_calls") != bool(self.calls):
                 raise AIError("The AI provider returned an incomplete tool response.")
             self.finish = finish
@@ -448,6 +457,8 @@ async def run_turn(
     messages: list[dict],
     tools: list[dict],
     call_tool: Callable[[str, dict], Awaitable[str]],
+    *,
+    max_output_tokens: int | None = None,
 ) -> AsyncIterator[AIEvent]:
     """Stream a turn; only normal iterator exhaustion makes the answer complete.
 
@@ -462,6 +473,8 @@ async def run_turn(
     cancellable; provider requests and all other tools retain their deadlines.
     Provider timeouts measure inactivity between complete stream events, not
     total generation time. Keepalive comments alone do not extend the deadline.
+    Long-form chat and repairs request a provider token budget and use the larger
+    SSE envelope cap. Small auxiliary requests retain the standard transport cap.
     Tool-budget guidance is merged into the initial system message on a copy;
     it never enters ``messages`` or creates a second system message.
     Diagnostic events expose request stages and model/tool output, not HTTP
@@ -476,6 +489,7 @@ async def run_turn(
     if not url.endswith("/chat/completions"):
         url += "/chat/completions"
     headers = _request_headers(config, "text/event-stream")
+    max_stream_bytes = MAX_RESPONSE_BYTES if max_output_tokens is None else MAX_CHAT_STREAM_BYTES
     retries = rounds = 0
     request_number = 0
     loop = asyncio.get_running_loop()
@@ -483,6 +497,8 @@ async def run_turn(
         while True:
             state = _Response(max_tool_calls=config.max_tool_calls)
             payload = {"model": config.model.strip(), "messages": messages, "stream": True}
+            if max_output_tokens is not None:
+                payload["max_tokens"] = max_output_tokens
             if tools:
                 payload["tools"] = tools
                 remaining = config.max_tool_rounds - rounds
@@ -517,6 +533,9 @@ async def run_turn(
             yield AIEvent("diagnostic", f"Request {request_number}: {rounds}/{config.max_tool_rounds} tool rounds used; "
                           f"tools {'disabled' if rounds >= config.max_tool_rounds or not tools else 'available'}. "
                           f"Limit: {config.max_tool_calls} calls per round.")
+            if max_output_tokens is not None:
+                yield AIEvent("diagnostic", f"Request {request_number}: provider max_tokens={max_output_tokens:,}; "
+                              f"PGTUI decoded stream cap={max_stream_bytes:,} bytes.")
             try:
                 async with asyncio.timeout(config.timeout) as deadline:
                     async with client.stream("POST", url, headers=headers, json=payload) as response:
@@ -535,7 +554,7 @@ async def run_turn(
                             raise AIError("The AI provider did not return an event stream.")
                         deadline.reschedule(loop.time() + config.timeout)
                         done = False
-                        async for event_type, data in _sse(response):
+                        async for event_type, data in _sse(response, max_stream_bytes):
                             if event_type == "error":
                                 raise AIError("The AI provider reported a streaming error.")
                             if data.strip() == "[DONE]":
@@ -550,7 +569,8 @@ async def run_turn(
                         message, requests = state.complete()
             except _Retryable as exc:
                 failure = exc
-            except AIError:
+            except AIError as exc:
+                yield AIEvent("diagnostic", f"Request {request_number}: {exc}")
                 if state.started:
                     yield AIEvent("diagnostic", state.diagnostic())
                 raise

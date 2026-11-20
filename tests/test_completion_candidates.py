@@ -525,6 +525,45 @@ def apply_completion(result, document, item):
     return document[:start] + item.insert + document[end:]
 
 
+@pytest.mark.parametrize("lead", ["", "SELECT * FROM ", "SELECT * FROM public.teams t JOIN ", "INSERT INTO "])
+def test_schema_prefix_precedes_table_prefix_and_narrows_catalog(lead):
+    schema = SchemaContext((
+        TableDef("hrdw.recruiter", foreign_keys=(ForeignKey(("team_id",), "public.teams", ("id",)),)),
+        TableDef("hrdw.recrueter"),
+        TableDef("public.teams"),
+        TableDef("recruiting.applications"),
+        TableDef("recruiting.candidates"),
+    ))
+    result, document = complete_marked(lead + "recrui|", schema, usage={("dataset", "", "hrdw.recruiter"): 0})
+    first = result.items[0]
+    assert (first.kind, first.label) == ("schema", "recruiting.")
+    assert any(item.kind == "table" and item.table == "hrdw.recruiter" for item in result.items)
+    assert not any(item.table == "hrdw.recrueter" for item in result.items)
+    qualified = apply_completion(result, document, first)
+    assert qualified == lead + "recruiting."
+    narrowed = engine.complete(qualified, len(qualified), schema)
+    assert {item.table for item in narrowed.items} == {"recruiting.applications", "recruiting.candidates"}
+
+
+def test_schema_prefix_keeps_statement_keyword_priority():
+    schema = SchemaContext((TableDef("selection.events"), TableDef("archive.selector")))
+    result, _ = complete_marked("sel|", schema)
+    assert (result.items[0].kind, result.items[0].label) == ("keyword", "SELECT")
+    assert any(item.kind == "schema" and item.label == "selection." for item in result.items)
+
+
+@pytest.mark.parametrize("marked,table", [
+    ('SELECT * FROM "Recruit|" AS chosen', '"Recruit"'),
+    ('SELECT * FROM "Recruiting"."Open Roles|" AS chosen', '"Recruiting"."Open Roles"'),
+])
+def test_schema_prefix_keeps_exact_quoted_relations(marked, table):
+    schema = SchemaContext((TableDef('"Recruit"'), TableDef('"Recruiting"."Open Roles"'),
+                            TableDef('archive."Open Roles"')))
+    result, document = complete_marked(marked, schema)
+    assert result.items[0].table == table
+    assert apply_completion(result, document, result.items[0]) == document
+
+
 @pytest.mark.parametrize("marked,insert", [
     ("SELECT * FROM us|", "users AS u"),
     ("SELECT * FROM users u JOIN us|", "users AS u2"),

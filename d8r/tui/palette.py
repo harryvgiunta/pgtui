@@ -23,6 +23,7 @@ from d8r.completion.engine import complete
 from d8r.completion.context import analyze, command_span
 from d8r.completion.models import Field, Signature
 from d8r.keybindings import DEFAULT_COMPLETION_KEYS, is_typing_key, key_label
+from .query_editor import QueryTextArea
 from .session import Session
 
 ACTIONS: tuple[tuple[str, str, str], ...] = (
@@ -766,6 +767,10 @@ class EditorPane(Vertical):
     def _editor_caret_moved(self) -> None:
         self.palette.caret_changed()
 
+    @on(QueryTextArea.FoldsChanged)
+    def _editor_folds_changed(self) -> None:
+        self._queue_palette_placement()
+
     @on(OptionList.OptionSelected)
     def _palette_clicked(self, event: OptionList.OptionSelected) -> None:
         event.stop()
@@ -809,8 +814,7 @@ class EditorPane(Vertical):
         self.palette.request_ai()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        # These priority shortcuts target the canonical editor, never a sibling
-        # (e.g. Enter on a folded section must not insert a newline in SQL).
+        # Completion shortcuts target the SQL editor, not another focused control.
         if self.is_mounted and self.app.focused is not self.editor:
             return False
         if action == "scroll_details":

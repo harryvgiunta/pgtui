@@ -68,10 +68,10 @@ async def no_tools(name, arguments):
     pytest.fail("An answer without tool calls must not invoke a tool")
 
 
-async def collect(messages, *, config=CONFIG, tools=(), callback=no_tools, events=None):
+async def collect(messages, *, config=CONFIG, tools=(), callback=no_tools, events=None, max_output_tokens=None):
     if events is None:
         events = []
-    async for item in ai.run_turn(config, messages, list(tools), callback):
+    async for item in ai.run_turn(config, messages, list(tools), callback, max_output_tokens=max_output_tokens):
         events.append(item)
     return events
 
@@ -277,6 +277,31 @@ def test_truncated_or_malformed_response_never_completes(transport, body):
     assert SECRET not in str(error.value)
 
 
+@pytest.mark.parametrize("reason", ["length", "content_filter"])
+def test_provider_finish_reason_is_not_a_client_size_limit(transport, reason):
+    partial = "```sql\nSELECT 1\n```"  # Even a closed fence cannot override an incomplete provider finish.
+    requests = transport(lambda request: stream_response(
+        event(delta(partial)), event(delta(finish=reason)), b"data: [DONE]\n\n",
+    ))
+    events, messages = [], []
+    with pytest.raises(ai.AIError, match=f"finish_reason={reason}"):
+        asyncio.run(collect(messages, events=events, max_output_tokens=ai.CHAT_OUTPUT_TOKENS))
+    assert len(requests) == 1 and not messages
+    trace = "\n".join(item.text for item in events if item.kind == "diagnostic")
+    assert f"finish_reason={reason}" in trace
+    assert "Incomplete assistant response (not applicable)" in trace and partial in trace
+
+
+def test_json_success_response_does_not_bypass_stream_contract(transport):
+    requests = transport(lambda request: httpx.Response(200, json={"choices": [
+        {"message": {"role": "assistant", "content": "```sql\nSELECT 1\n```"}, "finish_reason": "stop"},
+    ]}))
+    messages = []
+    with pytest.raises(ai.AIError, match="did not return an event stream"):
+        asyncio.run(collect(messages, max_output_tokens=ai.CHAT_OUTPUT_TOKENS))
+    assert len(requests) == 1 and not messages
+
+
 def test_invalid_later_tool_arguments_prevent_all_tool_execution(transport):
     body = event(delta(tools=[tool_call(), tool_call(index=1, id="call_b", arguments="[]")], finish="tool_calls"))
     transport(lambda request: stream_response(body, b"data: [DONE]\n\n"))
@@ -462,13 +487,18 @@ def test_streamed_tool_arguments_are_size_bounded(transport, monkeypatch):
     assert messages == []
 
 
-def test_keepalive_events_cannot_bypass_total_response_limit(transport, monkeypatch):
-    monkeypatch.setattr(ai, "MAX_RESPONSE_BYTES", 64)
-    transport(lambda request: stream_response(*(b": ping\n\n" for _ in range(10))))
-    messages = []
-    with pytest.raises(ai.AIError):
-        asyncio.run(collect(messages))
-    assert messages == []
+@pytest.mark.parametrize("chat", [False, True])
+def test_keepalive_events_cannot_bypass_total_response_limit(transport, monkeypatch, chat):
+    monkeypatch.setattr(ai, "MAX_CHAT_STREAM_BYTES" if chat else "MAX_RESPONSE_BYTES", 256)
+    partial = "```sql\nSELECT 1\n```"
+    requests = transport(lambda request: stream_response(event(delta(partial)), *(b": ping\n\n" for _ in range(50))))
+    events, messages = [], []
+    with pytest.raises(ai.AIError, match="PGTUI's response size limit"):
+        asyncio.run(collect(messages, events=events, max_output_tokens=ai.CHAT_OUTPUT_TOKENS if chat else None))
+    assert len(requests) == 1 and not messages
+    trace = "\n".join(item.text for item in events if item.kind == "diagnostic")
+    assert "PGTUI's response size limit" in trace and "finish_reason=length" not in trace
+    assert "Incomplete assistant response (not applicable)" in trace and partial in trace
 
 
 def test_answer_limit_counts_utf8_bytes(transport, monkeypatch):

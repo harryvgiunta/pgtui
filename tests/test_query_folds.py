@@ -1,13 +1,14 @@
-"""The fold projection never becomes an editable or executable document."""
+"""Inline folds change visual rows, never the source SQL under selection or Run."""
 import asyncio
 
 import pytest
-from textual.widgets import OptionList
+from textual.widgets import Input
 
 from d8r.sql import lex_sql
 from d8r.tui.app import D8RApp
 from d8r.tui.query_editor import _table_offsets
-from d8r.tui.query_folds import QueryFoldView, sections
+from d8r.tui.query_folds import sections
+from d8r.tui.session import Session
 
 
 @pytest.mark.parametrize("dialect, sql, names", [
@@ -42,73 +43,104 @@ def test_statement_ranges_use_native_boundaries_and_not_matching_comment_text():
     assert len(sections(opaque, "postgres")) == 2
 
 
-def test_folds_hide_expand_navigate_and_never_replace_sql_or_selection():
+def test_gutter_folds_keep_mouse_selection_and_run_in_the_editor(parquet_source):
     async def run():
-        app = D8RApp()
+        session = Session({parquet_source.id: parquet_source})
+        session.update_settings(intellisense=False)
+        app = D8RApp(session)
         async with app.run_test(size=(140, 45)) as pilot:
             editor = app.editor
-            view = editor.parent.query_one(QueryFoldView)
-            options = view.query_one(OptionList)
+            sql = ("WITH alpha AS (\r\n SELECT 1 AS id\r\n), beta AS (\r\n"
+                   " SELECT * FROM (SELECT\r\n  2 AS id\r\n ) s\r\n)\r\n"
+                   "SELECT id FROM alpha;\r\nSELECT 33;")
+            editor.load_text(sql)
+            editor.focus()
+            await pilot.pause()
+
+            def lines():
+                return [editor.render_line(y).text for y in range(editor.virtual_size.height)]
+
+            async def click_arrow(row):
+                y = editor.wrapped_document.location_to_offset((row, 0)).y - editor.scroll_offset.y
+                assert await pilot.click(editor, offset=(editor.gutter.left + editor.gutter_width - 2, editor.gutter.top + y))
+
+            assert sum(line.count("▾") for line in lines()) == 3
+            assert len(lines()) == 9
+            await click_arrow(0)
+            assert lines()[0].count("▸") == 1 and len(lines()) == 8
+            assert "SELECT 1 AS id" not in "\n".join(lines())
+            await click_arrow(3)  # A nested arrow below a hidden body.
+            visible = "\n".join(lines())
+            assert "2 AS id" not in visible and "), beta AS (" in visible and " ) s" in visible
+            assert editor.has_focus and editor.text == sql
+
+            editor.move_cursor((0, 1))
+            await pilot.press("down")
+            assert editor.cursor_location == (2, 1)
+
+            y = editor.gutter.top + editor.wrapped_document.location_to_offset((8, 0)).y - editor.scroll_offset.y
+            x = editor.gutter.left + editor.gutter_width
+            start, end = (x, y), (x + len("SELECT 33;"), y)
+            await pilot.mouse_down(editor, offset=start)
+            await pilot.hover(editor, offset=end)
+            await pilot.mouse_up(editor, offset=end)
+            assert editor.selected_text == "SELECT 33;"
+            await pilot.press("ctrl+enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert app._main_outcome.ok and app._main_outcome.rows == [[33]]
+            assert editor.text == sql and editor.selected_text == "SELECT 33;"
+
+            assert await pilot.click("#query-sections")
+            assert editor.has_focus and editor.selected_text == "SELECT 33;" and len(lines()) == 9
+            await pilot.press("f7")
+            assert editor.has_focus and editor.selected_text == "SELECT 33;"
+            assert len(lines()) == 4 and "SELECT id FROM alpha;" in "\n".join(lines())
+            editor.move_cursor((0, 0))
+            await pilot.press("ctrl+f")
+            app.query_one("#find-query", Input).value = "2 AS id"
+            await pilot.pause()
+            assert editor.selected_text == "2 AS id"
+            assert "2 AS id" in "\n".join(lines()) and "SELECT 1 AS id" not in "\n".join(lines())
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("soft_wrap", [False, True])
+def test_fold_coordinates_survive_reflow_edits_and_undo(soft_wrap):
+    async def run():
+        session = Session()
+        session.update_settings(intellisense=False)
+        app = D8RApp(session)
+        async with app.run_test(size=(140, 45)) as pilot:
+            editor = app.editor
+            editor.soft_wrap = soft_wrap
+            sql = "SELECT\n    '" + "long text " * 20 + "';\nSELECT 42;"
+            editor.load_text(sql)
+            editor.focus()
+            await pilot.pause()
+            await pilot.press("shift+f7")
+            assert editor.virtual_size.height == 2
+            await pilot.resize_terminal(100, 35)
+            assert editor.virtual_size.height == 2
+            await pilot.press("down", "end")
+            assert editor.cursor_location == (2, len("SELECT 42;"))
+            editor.insert("-- comment\n", (0, 0))
+            assert editor.virtual_size.height == 3 and editor.cursor_location[0] == 3
+            await pilot.press("ctrl+z")
+            assert editor.text == sql and editor.virtual_size.height == 2
+            await pilot.press("ctrl+a")
+            assert editor.selected_text == sql  # Selection includes the folded body.
+            editor.load_text(sql)  # A new page must not inherit stale fold offsets.
+            assert editor.virtual_size.height > 2
+
             editor.load_text('SELECT a.id FROM "G".\r\n"two\r\nlines" AS a')
+
             def ink(row, column):
                 return editor.get_line(row).get_style_at_offset(app.console, column).color
 
             table_ink = ink(0, len('SELECT a.id FROM '))
             assert table_ink is not None and table_ink == ink(1, 2) == ink(2, 2)
             assert table_ink != ink(0, 0) and table_ink != ink(0, 9) and table_ink != ink(2, 10)
-            sql = ("WITH alpha AS (\n SELECT 'secret alpha'\n), beta AS (\n"
-                   " SELECT * FROM (SELECT\n  'secret nested') s\n) SELECT * FROM alpha;\nSELECT 2;")
-            editor.load_text(sql)
-            editor.move_cursor((1, 2))
-            editor.move_cursor((1, 9), select=True)
-            selected = editor.selected_text
-            selection = editor.selection
-            editor.action_toggle_folds()
-            await pilot.pause()
-
-            def labels():
-                return [str(o.prompt) for o in options.options]
-
-            assert options.has_focus and not editor.display
-            assert not any('secret alpha' in label or 'secret nested' in label for label in labels())
-            assert editor.text == sql and editor.selected_text == selected and selected
-            assert 'CTE alpha' in labels()[options.highlighted]
-            await pilot.press('enter')
-            assert any('secret alpha' in label for label in labels())
-            assert not any('secret nested' in label for label in labels())
-            await pilot.click(view.query_one('.fold-toggle'))
-            assert not any('secret alpha' in label for label in labels())
-            await pilot.press('escape')
-            assert editor.has_focus and editor.selection == selection and editor.text == sql
-
-            editor.action_toggle_folds()
-            await pilot.pause()
-            options.highlighted = next(i for i, label in enumerate(labels()) if 'CTE beta' in label)
-            await pilot.press('enter')
-            subquery = next(i for i, label in enumerate(labels()) if 'Subquery' in label)
-            await pilot.press(*(['down'] * (subquery - options.highlighted)))
-            assert 'Subquery' in labels()[options.highlighted]
-            await pilot.press('enter')
-            assert any('secret nested' in label for label in labels())
-            await pilot.press('e')
-            assert editor.has_focus and editor.cursor_location == (3, len(' SELECT * FROM '))
-            assert editor.text == sql
-
-            # Formatting, replacing SQL programmatically, and retargeting even
-            # to identical SQL must never leave stale rows or offsets visible.
-            editor.history.checkpoint()
-            editor.action_toggle_folds()
-            editor.insert(' /* format */', (0, 0))
-            assert editor.display and not view.display
-            editor.action_toggle_folds()
-            editor.undo()
-            assert editor.display and editor.text == sql
-            editor.action_toggle_folds()
-            editor.load_text(sql)
-            assert not view.display and editor.display
-            editor.action_toggle_folds()
-            editor.reveal_for_edit()
-            editor.move_cursor((1, 1))
-            assert editor.display and editor.cursor_location == (1, 1)
 
     asyncio.run(run())

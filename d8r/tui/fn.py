@@ -34,7 +34,6 @@ from .ai import AIPanel, AITarget
 
 from .palette import CommandPalette, EditorPane, prompt
 from .query_editor import QueryTextArea
-from .query_folds import QueryFoldView
 
 if TYPE_CHECKING:
     from .app import D8RApp
@@ -257,11 +256,6 @@ class FnEditor(Vertical):
     # In the SQL body, completion has priority over the form's Back action.
     BINDINGS = [Binding("escape", "back", "Back to query", show=False)]
 
-    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        if action == "back" and self.query_one(QueryFoldView).has_focus_within:
-            return False  # Esc closes the fold view before leaving the function.
-        return super().check_action(action, parameters)
-
 
     def __init__(self, ide: "D8RApp", **kwargs) -> None:
         super().__init__(**kwargs)
@@ -317,7 +311,6 @@ class FnEditor(Vertical):
             with FnBodyPane(id="fn-body-pane"):
                 yield QueryTextArea(self._initial_fields["body"], id="fn-body", show_line_numbers=True,
                                     dialect=self.session.sources[self.source_id].dialect)
-                yield QueryFoldView()
                 yield CommandPalette(
                     self.session, source_id=self.source_id, workspace_actions=False,
                     parameters=self._parameter_names, id="fn-palette", markup=False,

@@ -391,9 +391,16 @@ def _tables(document: str, context: Context, schema: SchemaContext, offers: _Off
     if not qualifier:
         schemas = {_parts(table.name, dialect)[0] for table in schema.tables
                    if len(_parts(table.name, dialect)) > 1}
+        # A literal namespace prefix is more useful than another relation's bare
+        # name prefix. Keep exact matches, empty slots, and SQL entry unchanged.
+        prefix = context.token.casefold()
+        if fresh and any(key[0] <= 1 and item.kind == "keyword" for key, _, item in offers.rows):
+            prefix = ""
         for name in schemas:
+            folded = name.casefold()
+            relevance = -1 if prefix and folded != prefix and folded.startswith(prefix) else 3
             offers.add(Suggestion(name + ".", _identifier(name, dialect, context.quote) + ("" if following_dot else "."),
-                                  "schema", "schema"), name=name, relevance=3)
+                                  "schema", "schema"), name=name, relevance=relevance)
 
 
 def _functions(document: str, context: Context, schema: SchemaContext,

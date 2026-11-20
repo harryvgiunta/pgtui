@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import replace
 from functools import wraps
 from pathlib import Path
 
+import httpx
 import pytest
 from textual import on
 from textual.app import App, ComposeResult
@@ -15,11 +17,13 @@ from textual.worker import WorkerCancelled
 from d8r.ai import client
 from d8r.ai.client import AIConfig, AIEvent
 from d8r.ai.context import AIContext
+from d8r.sql import ColumnDef
 from d8r.tui.ai import (
     AIChats, AIPanel, AITarget, ConversationHistory, ConversationTab,
     ConversationTabs, DeleteOptionList, stage_saying,
 )
 from d8r.tui.session import Session
+from tests.test_ai_client import completed, delta, event, stream_response, tool_call
 
 
 def async_test(function):
@@ -149,7 +153,8 @@ async def test_final_pages_checked_before_apply_without_provider_tools(session, 
     second = "SELECT unknown_column FROM data"
     drafts, feedback = [], []
 
-    async def provider(config, messages, tools, callback):
+    async def provider(config, messages, tools, callback, *, max_output_tokens):
+        assert max_output_tokens == client.CHAT_OUTPUT_TOKENS  # Repairs use the long-form budget too.
         if drafts:
             feedback.append(messages[-1]["content"])
         detail = (second if not drafts else "SELECT id FROM data" if mode == "default" else
@@ -201,7 +206,7 @@ async def test_unusable_repair_preserves_last_query_for_manual_edit(session, mon
     draft = "SELECT 'unterminated"
     answers = iter([f"```sql\n{draft}\n```", "No replacement."])
 
-    async def provider(config, messages, tools, callback):
+    async def provider(config, messages, tools, callback, *, max_output_tokens):
         answer = next(answers, None)
         if answer is None:
             # Even a provider ignoring the empty tool list cannot save a function.
@@ -252,7 +257,7 @@ async def test_hover_conversation_tab_paints_literal_details(session):
 async def test_switch_close_reopen_preserves_running_request_and_drafts(session, monkeypatch):
     started, release = asyncio.Event(), asyncio.Event()
 
-    async def provider(config, messages, tools, callback):
+    async def provider(config, messages, tools, callback, *, max_output_tokens):
         started.set()
         await release.wait()
         answer = "```sql\nSELECT 2\n```"
@@ -367,7 +372,7 @@ async def test_actual_tool_stages_and_retry_status_without_timers(session, monke
         observed.append((name, chat.stage, chat.status_text))
         return await original_tool(context, name, arguments)
 
-    async def provider(config, messages, tools, callback):
+    async def provider(config, messages, tools, callback, *, max_output_tokens):
         yield AIEvent("status", "Retrying AI request in 1s (2/3).")
         retrying.set()
         await release.wait()
@@ -400,7 +405,7 @@ async def test_actual_tool_stages_and_retry_status_without_timers(session, monke
 async def test_cancel_and_provider_error_remain_honest(session, monkeypatch):
     started = asyncio.Event()
 
-    async def pending(config, messages, tools, callback):
+    async def pending(config, messages, tools, callback, *, max_output_tokens):
         started.set()
         await asyncio.Event().wait()
         yield AIEvent("text", "unreachable")
@@ -419,7 +424,7 @@ async def test_cancel_and_provider_error_remain_honest(session, monkeypatch):
         assert "Cancelled" in chat.status_text
         assert chat.proposal is None and not app.applied
 
-        async def failing(config, messages, tools, callback):
+        async def failing(config, messages, tools, callback, *, max_output_tokens):
             raise client.AIError("The AI connection failed. Retry manually.")
             yield AIEvent("text", "unreachable")
 
@@ -437,7 +442,7 @@ async def test_provider_roundtrip_revokes_chat_tools_and_redacts_headers(session
     started, release = asyncio.Event(), asyncio.Event()
     session.update_settings(ai=replace(session.ai_config, headers="X-Device: synthetic-header-secret"))
 
-    async def provider(config, messages, tools, callback):
+    async def provider(config, messages, tools, callback, *, max_output_tokens):
         yield AIEvent("diagnostic", "Gateway echoed synthetic-header-secret")
         started.set()
         await release.wait()
@@ -465,3 +470,90 @@ async def test_provider_roundtrip_revokes_chat_tools_and_redacts_headers(session
         assert chat.proposal is None and not app.applied
         assert "SELECT 99" not in chat.transcript
         assert app.query_one("#editor", TextArea).text == "SELECT 1"
+
+
+@pytest.mark.parametrize("finish", ["stop", "length", "client_limit"])
+@async_test
+async def test_streamed_dataset_batch_after_schema_and_clarification(session, monkeypatch, finish):
+    session.update_settings(ai_test_queries=False, ai_auto_accept=True)
+    if finish == "client_limit":
+        monkeypatch.setattr(client, "MAX_CHAT_STREAM_BYTES", client.MAX_RESPONSE_BYTES)
+    datasets = session.sources[session.active_id].datasets
+    wide = tuple(ColumnDef(f"unrelated_col_{n}", "character varying") for n in range(200))
+    datasets.update({f"unrelated_table_{n}": {"columns": wide} for n in range(45)})
+    datasets["changes"] = {"columns": (ColumnDef("application_id", "integer"), ColumnDef("stage", "text"))}
+    first = "SELECT id FROM data"
+    second = "SELECT application_id, stage FROM changes"
+    prefix = f"```sql\n{first}\n```\n```sql\nSELECT application_id, "
+    suffix = 'stage FROM changes\n```\n```json\n{"kind":"queries","titles":["Summary","Changes"]}\n```'
+    done = b"data: [DONE]\n\n"
+
+    def tool_response(*calls):
+        return stream_response(event(delta(tools=calls, finish="tool_calls")), done)
+
+    requests = []
+    waiting = asyncio.Event()
+    ask = AIChats._ask_user
+
+    async def track_question(manager, *args):
+        waiting.set()
+        return await ask(manager, *args)
+
+    def respond(request):
+        payload = json.loads(request.content)
+        requests.append(payload)
+        assert payload["stream"] is True and payload["max_tokens"] == client.CHAT_OUTPUT_TOKENS
+        assert "finish every\nrequested SQL block" in payload["messages"][0]["content"]
+        number = len(requests)
+        if number == 1:
+            return tool_response(tool_call(id="inventory"))
+        if number == 2:
+            result = payload["messages"][-1]["content"]
+            assert "unrelated_col_" not in result and len(result) < 4096
+            return tool_response(tool_call(arguments='{"table":"data"}', id="summary"),
+                                 tool_call(arguments='{"table":"changes"}', index=1, id="changes"))
+        if number == 3:
+            results = payload["messages"][-2:]
+            assert [item["tool_call_id"] for item in results] == ["summary", "changes"]
+            assert [[column["name"] for column in json.loads(item["content"])["tables"][0]["columns"]]
+                    for item in results] == [["id", "label"], ["application_id", "stage"]]
+            return tool_response(tool_call("ask_user", json.dumps({
+                "question": "Include all stages?", "options": [{"label": "All"}, {"label": "Interviews only"}],
+            }), id="question"))
+        assert number == 4, "A cutoff must not start another provider request"
+        assert json.loads(payload["messages"][-1]["content"]) == {"answer": "All"}
+        if finish == "length":
+            return stream_response(event(delta(prefix)), event(delta(finish="length")), done)
+        # Reasoning/metadata in the SSE envelope can exceed the old 1 MiB cap
+        # midway through a small visible answer. It must not enter the draft/log.
+        frame = delta()
+        frame["id"] = "chunk-id"
+        frame["choices"][0]["delta"]["reasoning_content"] = "hidden-reasoning-" * 24
+        overhead = event(frame) * 3000
+        assert len(overhead) > client.MAX_RESPONSE_BYTES
+        return stream_response(event(delta(prefix)), overhead, completed(suffix))
+
+    monkeypatch.setattr(client, "create_client", lambda config: httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), timeout=config.timeout))
+    monkeypatch.setattr(AIChats, "_ask_user", track_question)
+    app = ConversationHost(session)
+    async with app.run_test(size=(100, 42)) as pilot:
+        chat = await send(app, pilot, "Make summary and change datasets for a dashboard")
+        await asyncio.wait_for(waiting.wait(), 3)
+        assert chat.question is not None and not session.busy
+        assert app.ai_chats.answer_question(chat, "All")
+        await app.workers.wait_for_complete()
+        assert len(requests) == 4 and not session.history and not session.busy
+        if finish == "stop":
+            assert chat.status == "idle" and len(app.applied) == 1
+            assert [(q.title, q.body) for q in app.applied[0].queries] == [("Summary", first), ("Changes", second)]
+            assert "hidden-reasoning" not in chat.diagnostics.text
+        else:
+            assert chat.status == "error"
+            reason = "finish_reason=length" if finish == "length" else "PGTUI's response size limit"
+            assert reason in chat.status_text and reason in chat.diagnostics.text
+            assert chat.proposal is None and not app.applied and not app.ai_chats.apply(chat, app.panel)
+            assert app.query_one("#editor", TextArea).text == "SELECT 1"
+            assert prefix not in chat.transcript and prefix in chat.diagnostics.text
+            assert "Completed clarification answers were retained" in chat.messages[-1]["content"]
+            assert json.loads(chat.messages[-2]["content"]) == {"answer": "All"}
