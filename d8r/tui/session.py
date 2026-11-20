@@ -16,7 +16,8 @@ from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from threading import RLock
+from threading import Event, RLock
+from typing import TextIO
 from uuid import UUID, uuid4
 
 from d8r.ai.client import AIConfig
@@ -25,8 +26,8 @@ from d8r.credentials import CredentialError
 
 from d8r.engine import (
     DataSource, EngineError, add_d1_source, add_parquet_source, add_postgres_source,
-    cancel_source, close_source, column_values, execute_sql, load,
-    refresh_source_schema, transaction_open,
+    cancel_source, close_source, column_values, execute_sql, export_query_csv, load,
+    preflight_source, refresh_source_schema, transaction_open,
 )
 from d8r.sql import (
     FnDef, SQLDocument, SchemaContext, SqlError, TableDef, function_query,
@@ -97,6 +98,7 @@ class ResultPage:
     """A position in the original expanded query, not a live cursor or transaction."""
 
     source: DataSource = field(repr=False)
+    sql: str
     size: int
     offset: int
 
@@ -621,6 +623,17 @@ class Session:
         source = self.sources.get(self.active_id if source_id is None else source_id)
         return source is not None and source.con is not None and not getattr(source.con, "closed", False)
 
+    def preflight_run(self, source: DataSource) -> bool:
+        """Check a captured Run target in its reserved worker, before user SQL.
+
+        True permits one dispatch, False permits reconnect, EngineError stops
+        the submission. The caller rechecks cancellation and target identity
+        after this check and any reconnect. Never call as a post-error retry.
+        """
+        if self.sources.get(source.id) is not source:
+            raise EngineError("Run target changed; nothing was executed")
+        return preflight_source(source)
+
 
     def restore_source(self, key: str, *, activate: bool = True) -> str:
         """Restore saved target identity without opening a file or connection."""
@@ -869,6 +882,19 @@ class Session:
         if snapshot is None or snapshot.dialect != source.dialect:
             return ""
         return f"Cached metadata from {snapshot.captured_at} · may be stale"
+
+    def reload_schema(self, source: DataSource) -> None:
+        """Worker-only native discovery for a captured, still-registered target."""
+        with source._lock:
+            if self.sources.get(source.id) is not source or not self.source_connected(source.id):
+                raise EngineError("Schema refresh requires the original live connection")
+            refresh_source_schema(source)
+        if self.sources.get(source.id) is not source or not self.source_connected(source.id):
+            raise EngineError("Schema refresh requires the original live connection")
+        self.clear_value_cache(source.id)
+        self.cache_source_schema(source)  # Only committed, non-temporary metadata persists.
+        if source is self.source:
+            self.refresh_schema()
 
     def refresh_schema(self) -> None:
         """Replace this session's snapshot; in-flight parses retain the old one."""
@@ -1135,7 +1161,8 @@ class Session:
         """Execute the document and return its first outcome; use run_all for all."""
         return self.run_all(doc, record=record)[0]
 
-    def run_all(self, doc: str, record: bool = True, *, paged_read: bool | None = None) -> list[RunOutcome]:
+    def run_all(self, doc: str, record: bool = True, *, paged_read: bool | None = None,
+                cancel_event: Event | None = None) -> list[RunOutcome]:
         """Execute native statements in order, stopping at the first server error.
 
         Lexical/expansion errors prevent all execution. Native SQL transaction
@@ -1144,6 +1171,8 @@ class Session:
 
         By default each read is paged and writes run once. True requires a
         single guarded read; False explicitly requests driver-native execution.
+        A per-submission event stops queued statements; native interruption of
+        the in-flight statement is separate and does not release ownership.
         """
         document = self.parse(doc)
         if document.errors:
@@ -1161,22 +1190,37 @@ class Session:
             return [RunOutcome(status=message, error=message, doc=doc)]
         authored = split_statements(doc, dialect=self.source.dialect)
         outcomes = []
+        source = self.source
         for sql, text in zip(document.statements, authored):
-            outcome = self._run_statement(sql, text, record=record, readonly=paged_read is True,
-                                          page_reads=paged_read is None)
+            if cancel_event is not None and cancel_event.is_set():
+                message = "Run cancelled; remaining statements were not executed"
+                outcomes.append(RunOutcome(status=message, error=message, source=source.id,
+                                           dialect=source.dialect, doc=text))
+                break
+            outcome = self._run_statement(sql, text, record=record, source=source,
+                                          readonly=paged_read is True, page_reads=paged_read is None)
             outcomes.append(outcome)
             if outcome.error:
                 break
         return outcomes
 
+    def has_result_source(self, page: ResultPage | None) -> bool:
+        return page is not None and page.source is self.source and self.source_connected()
+
+    def export_result_csv(self, page: ResultPage, output: TextIO) -> int:
+        """Export the tab's expanded read, never the editor, script or a replacement source."""
+        if not self.has_result_source(page):
+            raise EngineError("Full export requires the result's original connection")
+        return export_query_csv(page.source, page.sql, output, d1_page_size=page.size)
+
     def result_page(self, previous: RunOutcome, direction: int) -> RunOutcome:
         """Re-read one page on demand, never the editor, script or a replacement source."""
         page = previous.page
-        if page is None or page.source is not self.source or not self.source_connected():
+        if not self.has_result_source(page):
             raise EngineError("This result is not pageable on the current connection")
         if direction not in (-1, 1) or (direction == 1 and not previous.capped) or (direction == -1 and not page.offset):
             raise EngineError("No page in that direction")
-        return self._run_statement(previous.sql, previous.doc, record=False, source=page.source,
+        return self._run_statement(page.sql, previous.doc, record=False, source=page.source,
                                    readonly=True, size=page.size, offset=page.offset + direction * page.size)
 
     def _run_statement(self, sql: str, doc: str, *, record: bool,
@@ -1192,19 +1236,17 @@ class Session:
                 self.refresh_schema()
             return RunOutcome(status=message, error=message, source=source.id,
                               dialect=source.dialect, sql=sql, doc=doc)
-        if not readonly:
+        if not readonly and not result["schema_changed"]:
             self.clear_value_cache(self._source_identity(source))
         schema_warning = ""
         if result["schema_changed"]:
             try:
-                refresh_source_schema(source)
-                self.cache_source_schema(source)
+                self.reload_schema(source)
                 schema_warning = self.metadata_cache_warning
-                if source is self.source:
-                    self.refresh_schema()
             except Exception as exc:
                 # The SQL already succeeded; a metadata failure must not invite
                 # retrying a write or conceal its successful result/history.
+                self.clear_value_cache(self._source_identity(source))
                 schema_warning = "schema not refreshed: " + self.execution_error(
                     exc, operation="Schema refresh",
                 )
@@ -1213,7 +1255,7 @@ class Session:
             columns=result["columns"], dtypes=result["dtypes"], rows=result["rows"],
             total=result["total"], ms=result["ms"], sql=result["sql"],
             schema_changed=result["schema_changed"], doc=doc,
-            page=ResultPage(source, size, offset) if result["pageable"] and (readonly or page_reads) else None,
+            page=ResultPage(source, sql, size, offset) if result["pageable"] and (readonly or page_reads) else None,
         )
         outcome.status = " · ".join(part for part in (
             result["status"], self._status_for(outcome), schema_warning,

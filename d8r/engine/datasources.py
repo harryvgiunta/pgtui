@@ -8,6 +8,9 @@ import threading
 from d8r.sql import ColumnDef, ForeignKey, RoutineDef, quote_identifier, relation_name
 
 POSTGRES_VERSION = "18.7"
+_RUN_PROBE_SECONDS = 2.0
+_TRANSACTION_TIMEOUTS = {"25P03", "25P04"}
+_TERMINATED = _TRANSACTION_TIMEOUTS | {"57P01", "57P02", "57P04", "57P05"}
 
 
 class EngineError(ValueError):
@@ -355,12 +358,98 @@ def refresh_source_schema(source: DataSource) -> None:
             raise _safe_error(exc, "Schema discovery") from None
 
 
+def _postgres_disconnected(con, exc=None) -> bool:
+    """Distinguish a lost session from server errors on a working session."""
+    import psycopg
+    from psycopg.pq import TransactionStatus
+
+    if con.closed or con.info.transaction_status == TransactionStatus.UNKNOWN:
+        return True
+    if isinstance(exc, psycopg.Error):
+        state = exc.sqlstate or ""
+        # LOCK/statement timeouts and user cancellation are statement errors,
+        # not transport timeouts. Never match localized driver message text.
+        if state:
+            # SQL can explicitly RAISE an arbitrary SQLSTATE at ERROR severity
+            # without terminating the connection (including in a user txn).
+            return (exc.diag.severity_nonlocalized != "ERROR"
+                    and (state.startswith("08") or state in _TERMINATED))
+        return isinstance(exc, psycopg.OperationalError)
+    return isinstance(exc, (ConnectionError, TimeoutError))
+
+
+def _discard_connection(source: DataSource) -> None:
+    """Retire an unusable handle under the source lock. Do not cancel or retry."""
+    con, source.con = source.con, None
+    source._transaction = False
+    if con is not None:
+        try:
+            con.close()
+        except Exception:
+            pass  # Already unusable; never expose driver close diagnostics.
+
+
+def preflight_source(source: DataSource) -> bool:
+    """Worker-only liveness check BEFORE dispatch. False permits reconnect."""
+    if source.kind != "postgres-live":
+        return source.con is not None and not getattr(source.con, "closed", False)
+
+    from psycopg import errors, generators
+    from psycopg.pq import ExecStatus, TransactionStatus
+
+    if not source._lock.acquire(blocking=False):
+        raise EngineError("PostgreSQL connection is busy; nothing was executed")
+    try:
+        con = source.con
+        if con is None:
+            return False
+        if _postgres_disconnected(con):
+            lost_transaction = source._transaction
+            _discard_connection(source)
+            if lost_transaction:
+                raise EngineError("PostgreSQL connection lost during your transaction; this submission was not executed")
+            return False
+        status = con.info.transaction_status
+        if status in (TransactionStatus.INTRANS, TransactionStatus.INERROR):
+            # Even SELECT 1 (or a cancelled probe) can change an open
+            # transaction. Let the user's own SQL run exactly once instead.
+            source._transaction = True
+            return True
+        if status != TransactionStatus.IDLE:
+            raise EngineError("PostgreSQL connection is busy; nothing was executed")
+        source._transaction = False
+        try:
+            # Empty simple-query round trip, no relation/function lookup or
+            # result rows. Use libpq's nonblocking path with a client-side
+            # deadline: a server-side timeout cannot bound a broken socket.
+            con.pgconn.send_query(b"")
+            results = con.wait(generators.execute(con.pgconn), timeout=_RUN_PROBE_SECONDS)
+            if results and results[0].status == ExecStatus.FATAL_ERROR:
+                raise errors.error_from_result(results[0])
+        except Exception as exc:
+            if _postgres_disconnected(con, exc):
+                _discard_connection(source)
+                if isinstance(exc, errors.Error) and exc.sqlstate in _TRANSACTION_TIMEOUTS:
+                    raise EngineError("PostgreSQL transaction timed out; this submission was not executed") from None
+                return False
+            if con.info.transaction_status == TransactionStatus.ACTIVE:
+                _discard_connection(source)  # Probe interrupted before ReadyForQuery.
+            raise _safe_error(exc, "PostgreSQL health check") from None
+        if len(results) != 1 or results[0].status != ExecStatus.EMPTY_QUERY:
+            _discard_connection(source)
+            raise EngineError("Unexpected PostgreSQL health check response; nothing was executed")
+        return True
+    finally:
+        source._lock.release()
+
+
 def transaction_open(source: DataSource) -> bool:
-    if source.con is None:
+    con = source.con
+    if con is None:
         return False
     if source.kind == "postgres-live":
         from psycopg.pq import TransactionStatus
-        return source.con.info.transaction_status in (TransactionStatus.INTRANS, TransactionStatus.INERROR, TransactionStatus.ACTIVE)
+        return con.info.transaction_status in (TransactionStatus.INTRANS, TransactionStatus.INERROR, TransactionStatus.ACTIVE)
     if source.kind == "d1-live":
         return False
     return source._transaction

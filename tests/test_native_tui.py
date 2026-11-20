@@ -215,7 +215,7 @@ async def test_escape_clears_result_selection_then_hides_window_across_runs(parq
 
 
 @async_test
-async def test_paged_d1_read_navigates_grid_not_editor(d1_source, d1_harness):
+async def test_paged_d1_read_navigates_grid_not_editor(d1_source, d1_harness, tmp_path):
     session = Session({d1_source.id: d1_source})
     session.update_settings(default_rows=1)
     app = D8RApp(session)
@@ -237,7 +237,16 @@ async def test_paged_d1_read_navigates_grid_not_editor(d1_source, d1_harness):
         assert str(app.query_one("#result-page-number", Static).content) == "Page 2"
         grid.action_export()
         assert isinstance(app.screen, ExportModal) and app.screen.snapshot.rows == ((3,),)
-        await pilot.press("escape")
+        await pilot.pause()
+        destination = tmp_path / "full.csv"
+        app.screen.query_one("#export-path", Input).value = str(destination)
+        app.screen.query_one("#export-scope", Select).value = "full"
+        await pilot.pause()
+        await pilot.click("#export-save")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert destination.read_text(encoding="utf-8").splitlines() == ["id", "2", "3"]
+        assert grid.raw_rows == ((3,),) and grid.page_offset == 1
         grid.focus()
         await pilot.press("ctrl+left")
         await app.workers.wait_for_complete()

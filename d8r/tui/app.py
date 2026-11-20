@@ -10,7 +10,8 @@ import json
 from time import monotonic
 from collections.abc import Callable
 from copy import deepcopy
-from functools import partial
+from threading import Event
+from typing import TypeVar
 from uuid import uuid4
 
 from rich.rule import Rule
@@ -38,15 +39,17 @@ from textual.widgets.option_list import Option
 
 from d8r.ai.context import AIProposal
 from d8r.completion.engine import function_insertion
-from d8r.engine import POSTGRES_VERSION, DataSource
+from d8r.engine import POSTGRES_VERSION, DataSource, EngineError
 from d8r.sql import ColumnDef, format_parameters
 from d8r.themes import COZY_PASTEL
 
 from .add_source import AddSourceModal
 from .connection import ConnectionProgress, build_saved_source, saved_source_label
+from .editor_tools import FindBar, format_editor
 from .ai import AIChats, AIPanel, AITarget, ConversationTabs, DeleteOptionList
 from .palette import CommandPalette, EditorPane
 from .query_editor import QueryTextArea
+from .query_folds import QueryFoldView
 from .page_details import PageDetails
 from .results import ResultsTable
 from .session import RunOutcome, Session
@@ -56,7 +59,8 @@ from .layout import PaneSplitter
 from . import splash
 
 
-KEY_HINTS = "ctrl+enter run · ctrl+k SQL preview · ctrl+space complete · F4 AI complete · ctrl+comma settings · \\ actions · ctrl+q quit"
+KEY_HINTS = "ctrl+enter run · F8 cancel · ctrl+f find · ctrl+k SQL preview · ctrl+space complete · F4 AI complete · ctrl+comma settings · \\ actions · ctrl+q quit"
+T = TypeVar("T")
 
 
 
@@ -208,6 +212,10 @@ class D8RApp(App):
         Binding("f5", "run", "Run", priority=True, show=False),
         Binding("shift+f5", "run(True)", "Read-only page", priority=True),
         Binding("ctrl+shift+f5", "run(False)", "Run native SQL", priority=True),
+        Binding("f8", "cancel_operation", "Cancel query or connection", priority=True, show=False),
+        Binding("ctrl+f", "find_sql", "Find in SQL", priority=True, show=False),
+        Binding("ctrl+shift+f", "format_sql", "Format SQL", priority=True, show=False),
+        Binding("f7", "query_sections", "Fold / expand SQL sections", priority=True, show=False),
         Binding("ctrl+k", "compile", "SQL preview", priority=True),
         Binding("ctrl+w", "close_result_tab", "Close result tab", show=False),
         Binding("escape", "close_output", "Hide results window", show=False),
@@ -238,8 +246,8 @@ class D8RApp(App):
         self._workspace_ready = False
         self._workspace_snapshot: dict = {}
         self._autosave_error = ""
-        self.run_busy = False
-        self._run_task: asyncio.Task[list[RunOutcome]] | None = None
+        self._run_task: asyncio.Task[None] | None = None
+        self._cancel_run: Callable[[], None] | None = None
         self._closing = False
         self.function_mode = False
         self._function_started = bool(self.session.workspace.get("function_draft"))
@@ -249,6 +257,8 @@ class D8RApp(App):
         self._function_pick: tuple | None = None
         self._connection_progress: ConnectionProgress | None = None
         self._connection_generation = 0
+        self._connection_target: str | None = None
+        self._after_connect: Callable[[DataSource | None], None] | None = None
         self._startup_connection_started = False
         self._data_tabs: dict[str, dict] = {}
         self._data_tab_seq = 0
@@ -277,6 +287,8 @@ class D8RApp(App):
                 with ExplorerTabs(initial="tab-" + initial_tab, id="explorer-tabs"):
                     with TabPane("Schema", id="tab-schema"):
                         with Vertical(id="schema-pane"):
+                            yield Button("Refresh schema", id="refresh-schema", compact=True,
+                                         tooltip="Reload tables, columns and routines from the active source")
                             yield Tree(Text("datasets"), id="schema-tree")
                     with TabPane("Pages", id="tab-pages"):
                         with Horizontal(id="page-actions"):
@@ -311,9 +323,20 @@ class D8RApp(App):
                             yield Button("Show Page Details", id="page-details-toggle", compact=True)
                             yield Button("Reconnect", id="reconnect-source", compact=True)
                         yield PageDetails(self, id="page-details")
+                    with Horizontal(id="editor-tools"):
+                        yield Button("Cancel query", id="cancel-query", variant="warning", compact=True,
+                                     tooltip=binding_tooltip(self.BINDINGS, "cancel_operation"))
+                        yield Button("Format SQL", id="format-query", compact=True,
+                                     tooltip=binding_tooltip(self.BINDINGS, "format_sql") + " · Selection or whole draft")
+                        yield Button("Find", id="open-find", compact=True,
+                                     tooltip=binding_tooltip(self.BINDINGS, "find_sql"))
+                        yield Button("Sections", id="query-sections", compact=True,
+                                     tooltip=binding_tooltip(self.BINDINGS, "query_sections"))
+                    yield FindBar(id="sql-find")
                     with EditorPane(id="editor-pane"):
                         yield QueryTextArea(self._initial_document, dialect=self.session.source.dialect,
                                             show_line_numbers=True, id="editor")
+                        yield QueryFoldView()
                         yield CommandPalette(self.session, id="palette", markup=False)
                     yield FnEditor(self, id="function-editor")
                 with PaneSplitter("#editor-slot", "height", "editor", min_size=8,
@@ -336,7 +359,7 @@ class D8RApp(App):
                     with TabbedContent(id="result-tabs"):
                         with TabPane("Results 1", id="tab-results"):
                             yield Static("", id="results-error", markup=False)
-                            yield ResultsTable(id="results-table", zebra_stripes=True, cursor_type="cell")
+                            yield ResultsTable(id="results-table", session=self.session, zebra_stripes=True, cursor_type="cell")
                             yield Static("", id="results-status", markup=False)
                         with TabPane("SQL", id="tab-sql"):
                             yield TextArea("", read_only=True, soft_wrap=False, id="sql-text")
@@ -429,9 +452,6 @@ class D8RApp(App):
         self.session.clear_value_cache()
         self.ai_chats.shutdown()
         self._flush_workspace()
-        if self.run_busy and self._run_task is None:
-            self.run_busy = False
-            self.session.busy = ""
 
     def exit(self, *args, **kwargs) -> None:
         """Flush live widget values even if their change messages are still queued."""
@@ -519,6 +539,7 @@ class D8RApp(App):
 
     def _load_source_workspace(self, page: dict | None = None) -> None:
         """Restore this source's last page and function draft without executing."""
+        self.query_one(FindBar).close(restore_focus=False)
         self._workspace_key = self.session.source_key()
         with self.prevent(Select.Changed):
             self.query_one("#source-select", Select).set_options(self._source_options())
@@ -590,17 +611,20 @@ class D8RApp(App):
         state = (width, self._document_identity, rows)
         if state == self._page_rows:
             return
+        active_changed = not self._page_rows or self._page_rows[1] != self._document_identity
         self._page_rows = state
         highlighted = listing.highlighted
         highlighted_id = (listing.get_option_at_index(highlighted).id
                           if highlighted is not None and listing.option_count else None)
         listing.clear_options()
-        for page in sorted(reversed(pages), key=lambda page: page["id"] != self._document_identity):
+        for page in pages:
             title = page["title"] or next((line.strip() for line in page["document"].splitlines()
                                             if line.strip()), "Untitled query")
             marker = "• " if page["id"] == self._document_identity else ""
             listing.add_option(Option(self._page_label(title, page["source"], marker, width), id=page["id"]))
-        if highlighted_id is not None and any(page["id"] == highlighted_id for page in pages):
+        if active_changed and any(page["id"] == self._document_identity for page in pages):
+            listing.highlighted = listing.get_option_index(self._document_identity)
+        elif highlighted_id is not None and any(page["id"] == highlighted_id for page in pages):
             listing.highlighted = listing.get_option_index(highlighted_id)
         elif pages:
             listing.highlighted = min(highlighted or 0, len(pages) - 1)
@@ -718,6 +742,7 @@ class D8RApp(App):
 
     def _restore_page(self, page: dict) -> None:
         """Swap the stable draft and its offline target without running or connecting."""
+        self.query_one(FindBar).close(restore_focus=False)
         for palette in self.query(CommandPalette):
             palette.close()
         self._cancel_connection()
@@ -769,9 +794,9 @@ class D8RApp(App):
     # -- widgets ------------------------------------------------------------
 
     @property
-    def editor(self) -> TextArea:
+    def editor(self) -> QueryTextArea:
         """The document editor."""
-        return self.query_one("#editor", TextArea)
+        return self.query_one("#editor", QueryTextArea)
 
     @property
     def palette(self) -> CommandPalette:
@@ -786,11 +811,48 @@ class D8RApp(App):
     def function_editor(self) -> FnEditor:
         return self.query_one("#function-editor", FnEditor)
 
+    def active_sql_editor(self) -> QueryTextArea:
+        return self.function_editor.query_one("#fn-body", QueryTextArea) if self.function_mode else self.editor
+
     def _focus_editor(self) -> None:
-        if self.function_mode:
-            self.function_editor.query_one("#fn-body", TextArea).focus()
+        editor = self.active_sql_editor()
+        editor.reveal_for_edit()
+        editor.focus()
+
+    def action_find_sql(self) -> None:
+        self._open_find(from_toolbar=False)
+
+    @on(Button.Pressed, "#open-find")
+    def _find_query_clicked(self) -> None:
+        self._open_find(from_toolbar=True)
+
+    def _open_find(self, *, from_toolbar: bool) -> None:
+        editor = self.active_sql_editor()
+        from_toolbar = from_toolbar or editor.parent.query_one(QueryFoldView).has_focus_within
+        editor.reveal_for_edit(focus=False)
+        editor.parent.query_one(CommandPalette).close()
+        self.query_one(FindBar).open(editor, from_toolbar=from_toolbar)
+
+    @on(Button.Pressed, "#format-query")
+    def action_format_sql(self) -> None:
+        editor = self.active_sql_editor()
+        self.query_one(FindBar).close(restore_focus=False)
+        editor.reveal_for_edit()
+        editor.parent.query_one(CommandPalette).close()
+        try:
+            changed = format_editor(editor, editor.dialect)
+        except ValueError as exc:
+            self._set_status(str(exc))
         else:
-            self.editor.focus()
+            self._set_status("SQL formatted · undo to restore" if changed else "No formatting changes")
+        editor.focus()
+
+    @on(Button.Pressed, "#query-sections")
+    def action_query_sections(self) -> None:
+        self.query_one(FindBar).close(restore_focus=False)
+        editor = self.active_sql_editor()
+        editor.parent.query_one(CommandPalette).close()
+        editor.action_toggle_folds()
 
     def _ai_target(self) -> AITarget:
         if self.function_mode:
@@ -813,17 +875,18 @@ class D8RApp(App):
         if proposal.queries:
             if not self.pane_visible("schema") and not self.update_settings(panes={"schema": True}):
                 raise ValueError("Pages could not be shown; resolve the settings error and retry.")
-            pages = [page for page in self.session.workspace["pages"]
-                     if page["id"] != self._document_identity]
-            # Pages displays newest first. Keep the requested order and the
-            # active page's stable identity; unrelated drafts are untouched.
-            for index in range(len(proposal.queries) - 1, -1, -1):
-                query = proposal.queries[index]
-                pages.append({
-                    "id": self._document_identity if index == 0 else str(uuid4()),
-                    "title": query.title, "document": query.body, "cursor": [0, 0],
-                    "source": self.session.source_key(), "dialect": self.session.dialect,
-                })
+            pages = list(self.session.workspace["pages"])
+            # Applying the first draft edits the open page in place. Only the
+            # additional drafts are new pages; append them in proposal order.
+            slot = next((i for i, page in enumerate(pages) if page["id"] == self._document_identity), len(pages))
+            for index, query in enumerate(proposal.queries):
+                draft = {"id": self._document_identity if index == 0 else str(uuid4()),
+                         "title": query.title, "document": query.body, "cursor": [0, 0],
+                         "source": self.session.source_key(), "dialect": self.session.dialect}
+                if index == 0 and slot < len(pages):
+                    pages[slot] = {**pages[slot], **draft}
+                else:
+                    pages.append(draft)
             self.editor.load_text(proposal.queries[0].body)
             self.editor.move_cursor((0, 0))
             self.palette.close()
@@ -864,6 +927,10 @@ class D8RApp(App):
         ]
 
     def _refresh_header(self) -> None:
+        running = self._cancel_run is not None
+        self.query_one("#cancel-query", Button).display = running
+        self.query_one("#run-query", Button).disabled = running
+        self.query_one("#refresh-schema", Button).disabled = running
         self.query_one("#reconnect-source", Button).display = not self.session.source_connected()
         source = self.session.source
         self.editor.dialect = source.dialect
@@ -1108,6 +1175,13 @@ class D8RApp(App):
             self.exit()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action == "cancel_operation":
+            return (self._connection_progress is not None or self._cancel_run is not None) and not self._modal_open()
+        if action in {"find_sql", "format_sql", "query_sections"}:
+            if not self._workspace_ready or self._modal_open():
+                return False
+            return (self.active_sql_editor().parent.has_focus_within or self.query_one(FindBar).has_focus_within
+                    or self.query_one("#editor-tools").has_focus_within)
         if action in {"close_result_tab", "close_output"}:
             if not self._workspace_ready or self._modal_open() or self.function_mode:
                 return False
@@ -1176,71 +1250,122 @@ class D8RApp(App):
             if paged_read is None:
                 self.function_editor.action_preview()
             return
-        if self.refuse_busy("Run"):
-            return
         document = self.editor.selected_text or self.editor.text
-        if not self.session.source_connected():
-            target = self.session.source_key()
-            self.reconnect_source(
-                self.session.active_id,
-                lambda source: self._run_after_connect(source, document, target, paged_read),
-            )
-            return
-        self._start_run(document, paged_read)
+        self.submit_sql(self.session.source, "Query",
+                        lambda source, stop: self.session.run_all(document, paged_read=paged_read, cancel_event=stop),
+                        self._publish_run)
 
-    def _run_after_connect(self, source: DataSource | None, document: str, target: str, paged_read: bool | None) -> None:
-        if source is None:
-            return
-        self._source_added(source)
-        if self.session.source_key() != target:
-            self._set_status("Source changed while reconnecting; press Run to query the new target.")
-            return
-        self._start_run(document, paged_read)
+    def submit_sql(self, source: DataSource, label: str, work: Callable[[DataSource, Event], T],
+                   publish: Callable[[DataSource, T], None], *, reconnect: bool = True) -> None:
+        """One owner from liveness check through driver completion (including Cancel).
 
-    def _start_run(self, document: str, paged_read: bool | None) -> None:
-        if self.refuse_busy("Run"):
+        Only a failed *pre-dispatch* check may continue on a new connection.
+        Never replay a driver call: even a failed read can have side effects.
+        """
+        if self.refuse_busy(label):
             return
-        source = self.session.source
-        self._submit_query(partial(self.session.run_all, document, paged_read=paged_read),
-                           partial(self._publish_run, source), "running")
+        target = self.session.source_key(source.id)
+        workspace_source = self.session.source
+        page = self._document_identity
+        function = self.function_editor._draft_identity if self.function_mode else None
 
-    def _submit_query(self, work: Callable[[], list[RunOutcome]],
-                      publish: Callable[[list[RunOutcome]], None], label: str) -> None:
-        self.palette.cancel_ai()
-        self.palette.sync()
-        self.run_busy = True
-        self.session.busy = "Query running"
-        self._set_status(f"{label} · {self.session.active_id} · {self.session.dialect} · cached SQL completion remains available")
-        self.run_worker(
-            self._run_query(work, publish), name="Run query", group="query",
-            exit_on_error=False,
-        )
+        def connected(built: DataSource | None) -> None:
+            if built is None:
+                return
+            self._source_added(built, activate=source is workspace_source)
+            if (self.session.source_key(built.id) != target or self._document_identity != page
+                    or (self.function_editor._draft_identity if self.function_mode else None) != function):
+                self._set_status(f"{label} not started · target changed while connecting")
+                return
+            self.submit_sql(built, label, work, publish, reconnect=False)
 
-    async def _run_query(self, work, publish) -> None:
-        self._run_task = asyncio.create_task(asyncio.to_thread(work))
-        self._run_task.add_done_callback(lambda task: self._run_finished(task, publish))
-        try:
-            # Textual cancels workers on exit, not database writes. Keep the
-            # real task alive; its callback releases ownership without touching
-            # widgets after shutdown. No replacement run cancels this worker.
-            await asyncio.shield(self._run_task)
-        except Exception:
-            pass  # _run_finished reports unexpected failures on the UI thread.
-
-    def _run_finished(self, task: asyncio.Task[list[RunOutcome]], publish) -> None:
-        self._run_task = None
-        self.run_busy = False
-        self.session.busy = ""
-        if task.cancelled():
+        if (reconnect and self._connection_progress is not None and self._connection_target == source.id
+                and self._connection_progress.can_continue):
+            # A startup/explicit connection is already in flight. Attach the
+            # latest submission instead of opening the same connection twice.
+            self._after_connect = connected
             return
-        try:
-            outcomes = task.result()
-        except Exception as exc:
-            message = self.session.execution_error(exc)
-            outcomes = [RunOutcome(status=message, error=message)]
-        if self._closing or not self.is_running:
-            return
-        publish(outcomes)
+        self._cancel_connection()
+        for palette in self.query(CommandPalette):
+            palette.cancel_ai()
+        stop = Event()
+        interrupt: asyncio.Task | None = None
+
+        def cancel() -> None:
+            nonlocal interrupt
+            if not stop.is_set():
+                stop.set()
+                # psycopg cancellation can itself block on the network.
+                interrupt = asyncio.create_task(asyncio.to_thread(self.session.cancel, source.id))
+                self.query_one("#cancel-query", Button).disabled = True
+                self._set_status(f"{label} cancellation requested · waiting for the driver")
+
+        def dispatch() -> T:
+            if stop.is_set():
+                raise EngineError(f"{label} cancelled before execution")
+            if self.session.source is not workspace_source or self.session.sources.get(source.id) is not source:
+                raise EngineError(f"{label} target changed; nothing was executed")
+            return work(source, stop)
+
+        async def run() -> None:
+            error = ""
+            dispatched = False
+            try:
+                ready = await asyncio.to_thread(self.session.preflight_run, source)
+                if ready and not stop.is_set() and not self._closing:
+                    dispatched = True
+                    result = await asyncio.to_thread(dispatch)
+            except Exception as exc:
+                error = self.session.execution_error(exc, operation=label)
+            finally:
+                # A late interrupt must not land on the *next* query. Keep the
+                # lane until both the actual work and its interrupt have ended.
+                try:
+                    if interrupt is not None:
+                        await interrupt
+                finally:
+                    self.session.busy = ""
+                    self._run_task = self._cancel_run = None
+            if self._closing or not self.is_running:
+                return
+            self._refresh_header()
+            if error:
+                self._set_status(error)
+            elif dispatched:
+                publish(source, result)
+            elif stop.is_set():
+                self._set_status(f"{label} cancelled before execution")
+            elif reconnect:
+                self.reconnect_source(source.id, connected)
+            else:
+                self._set_status(f"{label} not started · connection unavailable")
+
+        self.session.busy = f"{label} running"
+        self._cancel_run = cancel
+        self.query_one("#cancel-query", Button).disabled = False
+        self._refresh_header()
+        self._set_status(f"{label} · {source.display} · F8 to cancel")
+        self._run_task = asyncio.create_task(run())
+        # Worker teardown stops waiting, not a native write already dispatched.
+        self.run_worker(asyncio.shield(self._run_task), name=label, group="query", exit_on_error=False)
+
+    @on(Button.Pressed, "#cancel-query")
+    def action_cancel_operation(self) -> None:
+        if self._connection_progress is not None:
+            self._cancel_connection()
+            self._set_status("Connection cancelled · nothing executed")
+        elif self._cancel_run is not None:
+            self._cancel_run()
+
+    @on(Button.Pressed, "#refresh-schema")
+    def action_refresh_schema(self) -> None:
+        def refreshed(source: DataSource, _: None) -> None:
+            self._schema_updated(source)
+            self._set_status(f"Schema refreshed · {len(source.datasets)} tables"
+                             + (f" · {self.session.metadata_cache_warning}" if self.session.metadata_cache_warning else ""))
+
+        self.submit_sql(self.session.source, "Schema refresh", lambda source, stop: self.session.reload_schema(source),
+                        refreshed)
 
     def _publish_run(self, source: DataSource, outcomes: list[RunOutcome]) -> None:
         if self.session.source is not source:
@@ -1324,15 +1449,24 @@ class D8RApp(App):
                     and self.session.sources.get(source_id) is target_source)
 
         def completed(built: DataSource) -> None:
-            self._connection_progress = None
-            connected(built)
+            callback = self._after_connect
+            self._connection_progress = self._connection_target = self._after_connect = None
+            if callback is not None:
+                callback(built)
+
+        def failed(message: str) -> None:
+            self._connection_progress = self._connection_target = self._after_connect = None
+            self._set_status(message)
 
         progress = ConnectionProgress(
             saved_source_label(profile=profile),
             lambda: build_saved_source(self.session, profile=profile),
-            completed, valid=valid, failed=self._set_status,
+            completed, valid=valid, failed=failed,
         )
         self._connection_progress = progress
+        self._connection_target = source_id
+        self._after_connect = connected
+        self._set_status("Connecting · F8 to cancel")
         screen.mount(progress)
 
     def _cancel_connection(self) -> None:
@@ -1340,6 +1474,7 @@ class D8RApp(App):
         if self._connection_progress is not None:
             self._connection_progress.cancel()
             self._connection_progress = None
+        self._connection_target = self._after_connect = None
 
     def action_toggle_results(self) -> None:
         """`\\results` — show or hide the results pane."""
@@ -1494,6 +1629,7 @@ class D8RApp(App):
             if not self.update_settings(panes={"schema": True}):
                 return
         self._cancel_connection()
+        self.query_one(FindBar).close(restore_focus=False)
         self.palette.close()
         self.ai_panel._flush_chat()
         self._flush_workspace()
@@ -1516,6 +1652,7 @@ class D8RApp(App):
         if self._modal_open():
             return
         self._cancel_connection()
+        self.query_one(FindBar).close(restore_focus=False)
         self.function_editor.flush_draft()
         self.function_editor.query_one(CommandPalette).close()
         self.ai_panel._flush_chat()
@@ -1620,7 +1757,7 @@ class D8RApp(App):
         """Use a stable widget ID independent of the source's visible numbering."""
         self._data_tab_seq += 1
         tab_id = f"tab-data-{self._data_tab_seq}"
-        table = ResultsTable(id=f"data-{tab_id}", classes="data-table", zebra_stripes=True, cursor_type="cell")
+        table = ResultsTable(id=f"data-{tab_id}", classes="data-table", session=self.session, zebra_stripes=True, cursor_type="cell")
         pane = TabPane(
             "Results",
             table,
@@ -1698,12 +1835,11 @@ class D8RApp(App):
                 or self.refuse_busy("Result page")):
             return
 
-        def publish(outcomes: list[RunOutcome]) -> None:
+        def publish(source: DataSource, outcome: RunOutcome) -> None:
             # A closed/pinned/replaced tab must never receive a late page.
             if self._result_for_tab(tab_id) is not previous or self.session.source is not previous.page.source:
                 self._set_status("Page discarded · result changed")
                 return
-            outcome = outcomes[0]
             if outcome.error:
                 self._set_status(outcome.status)  # Keep the last good buffer and selection.
                 return
@@ -1717,7 +1853,8 @@ class D8RApp(App):
                 self._sync_result_pager()
             self._set_status("Ready")
 
-        self._submit_query(lambda: [self.session.result_page(previous, direction)], publish, "loading page")
+        self.submit_sql(previous.page.source, "Result page", lambda source, stop: self.session.result_page(previous, direction),
+                        publish, reconnect=False)
 
     @on(Button.Pressed, "#results-pin")
     def _toggle_result_pin(self) -> None:
@@ -1778,8 +1915,9 @@ class D8RApp(App):
         """Register a built source; function targets need not switch the workspace."""
         if source is None:
             return
+        function_key = self.session.source_key(self.function_editor.source_id)
         self.session.register(source, activate=False)
-        self.function_editor.retarget(source)
+        self.function_editor.retarget(source, function_key)
         with self.prevent(Select.Changed):
             self.query_one("#source-select", Select).set_options(self._source_options())
         self._sync_source_select()
@@ -2050,6 +2188,7 @@ class D8RApp(App):
             self._load_document(entry.doc)
 
     def _load_document(self, document: str) -> None:
+        self.query_one(FindBar).close(restore_focus=False)
         self._document_identity = str(uuid4())
         self.editor.load_text(document)
         self.palette.close()

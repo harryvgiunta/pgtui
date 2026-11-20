@@ -30,7 +30,7 @@ ACTIONS: tuple[tuple[str, str, str], ...] = (
     ("Functions…", "open the SQL function library", "fn"),
     ("dbt…", "import/export project models and configuration", "dbt"),
     ("Query to function", "create a function draft from this document", "query-to-fn"),
-    ("Export results", "save selected or buffered rows as CSV", "export-results"),
+    ("Export results", "save selected rows, the buffer or the full query result as CSV", "export-results"),
     ("AI", "chat and review an AI-proposed replacement", "ai"),
     ("History", "show/hide the history pane", "history"),
     ("Pages", "show/hide the query pages pane", "toggle_pages"),
@@ -774,6 +774,10 @@ class EditorPane(Vertical):
         self.palette.request_ai()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        # These priority shortcuts target the canonical editor, never a sibling
+        # (e.g. Enter on a folded section must not insert a newline in SQL).
+        if self.is_mounted and self.app.focused is not self.editor:
+            return False
         if action == "scroll_details":
             details = self.palette.details
             return bool(details and details.display and details.max_scroll_y > 0)

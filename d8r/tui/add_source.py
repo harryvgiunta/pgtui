@@ -22,7 +22,7 @@ from .connection import CONNECTION_TIMEOUT, ConnectionStatus, build_connection, 
 class AddSourceModal(ModalScreen):
     """An asynchronous connection form; cancellation never remembers credentials."""
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [Binding("escape,f8", "cancel", "Cancel connection")]
     CONNECTION_TIMEOUT = CONNECTION_TIMEOUT
 
     def __init__(self, session, *, profile: dict | None = None, **kwargs) -> None:

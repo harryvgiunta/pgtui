@@ -8,6 +8,7 @@ import io
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Literal
 
 from rich.style import Style
@@ -21,7 +22,7 @@ from textual.geometry import Size
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, Select, Static
 
-from .session import RunOutcome
+from .session import ResultPage, RunOutcome, Session
 
 MIN_COLUMN_WIDTH = 4
 
@@ -32,7 +33,7 @@ class ResultSnapshot:
     rows: tuple[tuple[object, ...], ...]
     total: int
     selected: tuple[int, ...]
-    offset: int = 0
+    page: ResultPage | None = None
 
 
 class ResultsTable(DataTable):
@@ -67,11 +68,12 @@ class ResultsTable(DataTable):
         Binding("ctrl+c,super+c", "copy_selection", "Copy selection", show=False),
     ]
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, session: Session | None = None, **kwargs) -> None:
+        self._session = session
         self.raw_columns: tuple[str, ...] = ()
         self.raw_rows: tuple[tuple[object, ...], ...] = ()
         self.result_total = 0
-        self.page_offset = 0
+        self._page: ResultPage | None = None
         self.selected_rows: set[int] = set()
         self._cell_bounds: tuple[int, int, int, int] | None = None
         self._range_anchor: Coordinate | None = None
@@ -82,13 +84,17 @@ class ResultsTable(DataTable):
         self.border_title = "Drag / Shift+arrows select · Ctrl+C copy · Alt+←/→ resize"
         self._selection_caption()
 
+    @property
+    def page_offset(self) -> int:
+        return self._page.offset if self._page else 0
+
     def show_result(self, outcome: RunOutcome) -> None:
         """Replace the grid and its raw buffer, resetting selection and cursor."""
         self.clear(columns=True)
         self.raw_columns = tuple(outcome.columns) if not outcome.error else ()
         self.raw_rows = tuple(tuple(row) for row in outcome.rows) if self.raw_columns else ()
         self.result_total = outcome.total if self.raw_columns else 0
-        self.page_offset = outcome.page.offset if outcome.page else 0
+        self._page = outcome.page
         self._end_drag()
         self.action_clear_selection()
         if not self.raw_columns:
@@ -303,9 +309,9 @@ class ResultsTable(DataTable):
         snapshot = ResultSnapshot(
             self.raw_columns, deepcopy(self.raw_rows), self.result_total,
             tuple(self._selected_indices()[0]) if self.selected_rows or self._cell_bounds else (),
-            self.page_offset,
+            self._page,
         )
-        self.app.push_screen(ExportModal(snapshot))
+        self.app.push_screen(ExportModal(snapshot, session=self._session))
 
     def action_narrow_column(self) -> None:
         self._resize_column(-2)
@@ -332,7 +338,7 @@ class ResultsTable(DataTable):
 
 
 class ExportModal(ModalScreen):
-    """Export a captured buffer only; creating or replacing files is explicit."""
+    """Export a captured buffer or explicitly re-read its full query result."""
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
     DEFAULT_CSS = """
@@ -357,9 +363,12 @@ class ExportModal(ModalScreen):
     }
     """
 
-    def __init__(self, snapshot: ResultSnapshot, **kwargs) -> None:
+    def __init__(self, snapshot: ResultSnapshot, *, session: Session | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self.snapshot = snapshot
+        self._session = session
+        self._can_export_full = (session is not None and session.has_result_source(snapshot.page)
+                                 and not session.tx_state().open)
         self._overwrite_path: Path | None = None
         self._busy = False
 
@@ -367,13 +376,15 @@ class ExportModal(ModalScreen):
         from .settings import binding_tooltip
 
         with Vertical(id="export-dialog"):
-            yield Static("Export buffered results to CSV", id="export-title")
+            yield Static("Export results to CSV", id="export-title")
             with VerticalScroll(id="export-form"):
                 yield Static("Destination path (UTF-8 CSV; NULL becomes an empty cell)", markup=False)
                 yield Input(placeholder="Enter a destination .csv path", id="export-path")
                 options = [("All buffered rows", "all")]
                 if self.snapshot.selected:
                     options.append(("Selected rows", "selected"))
+                if self._can_export_full:
+                    options.append(("Full query result (rerun)", "full"))
                 yield Select(options, value="selected" if self.snapshot.selected else "all",
                              allow_blank=False, id="export-scope")
                 yield Static("", id="export-summary", markup=False)
@@ -387,19 +398,33 @@ class ExportModal(ModalScreen):
         self._update_summary()
         self.query_one("#export-path", Input).focus()
 
-    def _indices(self) -> tuple[int, ...] | range:
-        if self.query_one("#export-scope", Select).value == "selected":
+    def _indices(self) -> tuple[int, ...] | range | None:
+        scope = self.query_one("#export-scope", Select).value
+        if scope == "full":
+            return None
+        if scope == "selected":
             return self.snapshot.selected
         return range(len(self.snapshot.rows))
 
     def _update_summary(self) -> None:
         snapshot = self.snapshot
         scope = self.query_one("#export-scope", Select).value
+        indices = self._indices()
+        summary = self.query_one("#export-summary", Static)
+        if indices is None:
+            text = ("Export every row returned by this tab’s read-only query, plus headers.\n"
+                    "The query runs again from the beginning. Its LIMIT and OFFSET still apply; data may have changed.")
+            if snapshot.page.source.kind == "d1-live":
+                text += "\nD1 reads separate pages. Use a unique ORDER BY; changes between pages can shift rows."
+            summary.update(text)
+            return
         extent = "More rows are available; their total was not counted." if snapshot.total > len(snapshot.rows) else "All returned rows are buffered."
-        if snapshot.offset:
-            extent = f"Current page only, at offset {snapshot.offset:,}."
-        self.query_one("#export-summary", Static).update(
-            f"Exporting {len(self._indices()):,} {scope} row(s), plus headers.\n"
+        if snapshot.page and snapshot.page.offset:
+            extent = f"Current page only, at offset {snapshot.page.offset:,}."
+        elif snapshot.total > len(snapshot.rows) and not self._can_export_full:
+            extent = "Full export requires a pageable read on its original connection."
+        summary.update(
+            f"Exporting {len(indices):,} {scope} row(s), plus headers.\n"
             f"{len(snapshot.rows):,} buffered rows. {extent}\n"
             "Only this captured buffer is exported; the query is not rerun."
         )
@@ -451,9 +476,19 @@ class ExportModal(ModalScreen):
         self.query_one("#export-message", Static).update("Writing CSV…")
         self.run_worker(self._export(path, indices, overwrite), name="Export CSV", exit_on_error=False)
 
-    async def _export(self, path: Path, indices: tuple[int, ...] | range, overwrite: bool) -> None:
+    async def _export(self, path: Path, indices: tuple[int, ...] | range | None, overwrite: bool) -> None:
         try:
-            await asyncio.to_thread(self._write_csv, path, indices, overwrite)
+            if indices is None:
+                if self._session.busy:
+                    raise ValueError(f"{self._session.busy}; wait for it to finish before exporting the full result.")
+                self._session.busy = "Full CSV export running"
+            task = asyncio.create_task(asyncio.to_thread(self._write_csv, path, indices, overwrite))
+            if indices is None:
+                # Closing the app cancels the UI worker, not the database thread.
+                task.add_done_callback(self._release_connection)
+                count = await asyncio.shield(task)
+            else:
+                count = await task
         except FileExistsError:
             self._overwrite_path = path
             self.query_one("#export-overwrite", Button).display = True
@@ -463,17 +498,38 @@ class ExportModal(ModalScreen):
         except (OSError, ValueError, csv.Error) as exc:
             self._show_error(exc)
         else:
-            self.app.notify(f"Exported {len(indices):,} buffered row(s) to {path}")
+            self.app.notify(f"Exported {count:,} row(s) to {path}")
             self.dismiss(path)
         finally:
-            self._set_busy(False)
+            if self.is_mounted:
+                self._set_busy(False)
 
-    def _write_csv(self, path: Path, indices: tuple[int, ...] | range, overwrite: bool) -> None:
-        # Exclusive creation also guards files appearing after the form opened.
-        with path.open("w" if overwrite else "x", encoding="utf-8", newline="") as output:
-            writer = csv.writer(output)
-            writer.writerow(self.snapshot.columns)
-            writer.writerows(self.snapshot.rows[index] for index in indices)
+    def _release_connection(self, task: asyncio.Task) -> None:
+        self._session.busy = ""
+        if not task.cancelled():
+            task.exception()  # Consume failures even if the dialog was unmounted.
+
+    def _write_csv(self, path: Path, indices: tuple[int, ...] | range | None, overwrite: bool) -> int:
+        # Never truncate an existing file before the last row has been fetched.
+        # For a new file, exclusive creation must succeed before any query runs.
+        output = (NamedTemporaryFile(mode="w", dir=path.parent, encoding="utf-8", newline="", delete=False)
+                  if overwrite else path.open("x", encoding="utf-8", newline=""))
+        written = Path(output.name)
+        try:
+            with output:
+                if indices is None:
+                    count = self._session.export_result_csv(self.snapshot.page, output)
+                else:
+                    writer = csv.writer(output)
+                    writer.writerow(self.snapshot.columns)
+                    writer.writerows(self.snapshot.rows[index] for index in indices)
+                    count = len(indices)
+            if overwrite:
+                written.replace(path)
+            return count
+        except BaseException:
+            written.unlink(missing_ok=True)
+            raise
 
     def _show_error(self, exc: Exception) -> None:
         message = f"CSV export failed: {exc}"

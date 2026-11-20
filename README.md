@@ -62,7 +62,8 @@ Test and Cancel save nothing. Add registers the connection. Remember stores
 PostgreSQL passwords and D1 API tokens in the native OS keyring; turning it off
 keeps credentials session-only. Metadata discovery reads catalogs, not table row counts. Startup
 reconnects only the selected saved target, without executing or changing its draft.
-Missing credentials leave the target disconnected.
+Missing credentials leave the target disconnected. Use **Cancel connection** or
+**F8** to abandon a pending connection; a late connection cannot run the queued SQL.
 
 Run it with a restricted database role while trying the alpha. Manual Run sends
 native SQL with your role's permissions, including writes and DDL; it is not a
@@ -101,15 +102,33 @@ do not offer navigation. **Shift+F5** requires one read-only statement. Use
 **Ctrl+Shift+F5** for an explicit native run, e.g. for a side-effecting function;
 a rejected paged read is never automatically retried as a native command.
 
+Before sending SQL on an idle PostgreSQL connection, Run checks that the server
+still answers. If the connection has expired, the same Run reconnects to the saved
+target and submits the captured SQL once. A lost transaction is not resumed on a
+fresh connection. If the connection breaks *after* SQL was sent, check its outcome
+before retrying: PGTUI does not replay it.
+
+**Cancel query** or **F8** requests a driver interrupt and stops the remaining
+statements in the batch. It does not undo earlier commits or guarantee rollback
+on D1. The connection stays busy until the driver finishes.
+
 The pager below each unpinned read result shows **Previous · Page N · Next**.
 Click a button or press **Ctrl+Left / Ctrl+Right** with the grid focused. Each
 page request re-reads only that statement, read-only, at the
 requested position; it does not rerun the script, modify the editor or add history.
 Authored `LIMIT` and `OFFSET` still apply. Pages are separate reads, not a frozen
 snapshot: use a unique `ORDER BY` for repeatable order; concurrent changes can
-still shift rows. CSV and clipboard use only the displayed buffer. Paging bounds
-the rows fetched, not the cost of sorting, aggregating or skipping a deep offset.
-The query deadline is 30 seconds.
+still shift rows. Paging bounds the rows fetched, not the cost of sorting,
+aggregating or skipping a deep offset. The query deadline is 30 seconds.
+
+**Export → Full query result (rerun)** writes every row returned by the result
+tab’s original read-only statement to CSV, starting at the first row regardless
+of the displayed page. Your SQL’s `LIMIT` and `OFFSET` still apply. PostgreSQL
+and DuckDB fetch the fresh result in batches; D1 reads separate bounded pages,
+so concurrent changes can shift rows during export. Full export requires a
+pageable result on its original connection, outside a user transaction. Choose
+**All buffered rows** or **Selected rows** to export the captured data without
+running SQL again. Clipboard copying still uses only the displayed buffer.
 
 Parquet connections are in-memory and restricted to the selected file. The file
 is never modified. External writes, attachments, extension loading and configuration
@@ -265,6 +284,8 @@ without contacting the database. The source header, completion details and permi
 AI schema context mark it **cached, with its capture time; it may be stale**.
 Reconnect replaces the snapshot with freshly discovered metadata, including an
 empty catalog if permissions or objects changed. No SQL is executed to restore it.
+Use **Schema → Refresh schema** to reload tables, columns and routines after an
+external change. This updates the explorer and completion without running the draft.
 
 Only committed catalog metadata is saved. Temporary PostgreSQL objects and routines,
 transactions, result rows, distinct-value pools and credentials are excluded. For
@@ -359,7 +380,8 @@ workspace's resizable layout. Metadata IntelliSense remains offline; predicate
 value reads and optional inline AI follow the controls above. Pages,
 functions, history and chats are isolated by connection identity. Pane resizing,
 result selection, clipboard copying and CSV export remain available.
-In Pages, Up from the first row or an empty list focuses search; Down returns to the list.
+Pages stay in creation order (oldest first), including when opened, edited or
+filtered. Up from the first row or an empty list focuses search; Down returns to the list.
 Query batches open **Results 1**, **Results 2**, and so on, one tab per statement.
 The next run replaces unpinned results. Pin on Results 1 keeps a separate snapshot;
 Pin on another result keeps that tab. Pinned tabs are marked ◆.
@@ -374,9 +396,21 @@ The footer shows `Ready` for a single result or the number of results for a batc
 Hover a button to see its bound keyboard shortcut. New Query preserves the current
 draft; connection forms retain field focus and selection across edits and connection work.
 
+In query and function SQL, **Format SQL** indents CTE bodies and lays out clauses
+and join conditions. It formats the selection, or the whole draft if nothing is
+selected, in one undo step. Table names have a separate syntax color. **Find**
+selects literal matches; Enter / Shift+Enter moves forward / back and wraps.
+**Sections** opens a foldable view of statements, multiline CTEs and subqueries.
+Use ↑/↓ and Enter to expand or collapse a header, **E** to edit there, or **Esc**
+to return to the original selection. Folding changes neither the draft nor what runs.
+
 | Keys | Action |
 |---|---|
 | Ctrl+Enter / F5 | Run SQL; reads are paged by default |
+| F8 | Cancel the pending connection or interrupt the running query |
+| Ctrl+F in SQL | Find in the current draft; Esc closes Find |
+| Ctrl+Shift+F in SQL | Format the selection or whole draft |
+| F7 in SQL | Open or close Sections |
 | Shift+F5 | Run one guarded read-only statement |
 | Ctrl+Shift+F5 | Explicit native execution instead of guarded paging |
 | Ctrl+Right / Ctrl+Left in a result grid | Fetch next / previous page |

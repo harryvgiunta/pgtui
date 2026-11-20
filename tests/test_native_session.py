@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import replace
+from io import StringIO
 from threading import Event
 
 import pytest
@@ -118,10 +119,15 @@ def test_result_page_uses_only_the_expanded_read_and_original_connection(parquet
     last = session.result_page(first, 1)
     assert last.rows == [[2]] and not last.capped
     assert last.sql == first.sql and session.result_page(last, -1).rows == [[1]]
+    csv_output = StringIO(newline="")
+    assert session.export_result_csv(last.page, csv_output) == 2
+    assert csv_output.getvalue().splitlines() == ["id", "1", "2"]
     assert len(session.history) == 2
     session.sources[session.active_id] = replace(parquet_source)
     with pytest.raises(EngineError, match="current connection"):
         session.result_page(first, 1)
+    with pytest.raises(EngineError, match="original connection"):
+        session.export_result_csv(last.page, StringIO())
 
 
 def test_multiple_native_statements_and_transactions(parquet_source):

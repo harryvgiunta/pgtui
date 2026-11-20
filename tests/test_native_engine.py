@@ -1,7 +1,9 @@
 """Native behavior tests; PostgreSQL integration is opt-in via a real DSN."""
 from __future__ import annotations
 
+import csv
 import hashlib
+import io
 import os
 import threading
 
@@ -10,7 +12,7 @@ import pytest
 
 from d8r.engine import (
     POSTGRES_VERSION, EngineError, add_parquet_source, add_postgres_source,
-    cancel_source, close_source, column_values, execute_sql, load,
+    cancel_source, close_source, column_values, execute_sql, export_query_csv, load,
     refresh_source_schema, sample_rows, transaction_open,
 )
 from d8r.sql import relation_name
@@ -223,6 +225,21 @@ def postgres_source():
         close_source(source)
 
 
+@pytest.mark.parametrize("fixture", ["parquet_source", "postgres_source"])
+def test_full_csv_crosses_preview_cap_but_respects_query_window(request, fixture):
+    source = request.getfixturevalue(fixture)
+    query = ("SELECT n, CASE WHEN n = 2 THEN 'café, \"ok\"' END AS label "
+             "FROM generate_series(1, 15000) AS s(n) ORDER BY n LIMIT 10240 OFFSET 1")
+    output = io.StringIO(newline="")
+    assert export_query_csv(source, query, output) == 10240
+    output.seek(0)
+    records = csv.reader(output)
+    assert next(records) == ["n", "label"]
+    assert next(records) == ["2", 'café, "ok"']
+    assert list(records) == [[str(n), ""] for n in range(3, 10242)]
+    assert not transaction_open(source)
+
+
 def test_postgres_native_dml_ddl_and_server_function(postgres_source):
     source = postgres_source
     assert source.server_version
@@ -255,6 +272,8 @@ def test_postgres_run_does_not_evaluate_the_unfetched_tail(postgres_source):
     assert not transaction_open(postgres_source)
     failed = session.result_page(first, 1)
     assert "SQLSTATE 22012" in failed.error  # Row 52 is demanded only on Next.
+    with pytest.raises(EngineError, match="SQLSTATE 22012"):
+        session.export_result_csv(first.page, io.StringIO())
     assert not transaction_open(postgres_source)
     assert [entry.doc for entry in session.history] == [sql]
     assert session.run("SELECT 42").rows == [[42]]

@@ -12,7 +12,7 @@ from textual.app import App, ComposeResult
 from textual.widgets import Button, Input, Select, Static
 
 from d8r.tui.results import ExportModal, ResultsTable
-from d8r.tui.session import PREVIEW_ROW_CAP, RunOutcome
+from d8r.tui.session import PREVIEW_ROW_CAP, RunOutcome, Session
 
 
 def outcome() -> RunOutcome:
@@ -33,12 +33,13 @@ def outcome() -> RunOutcome:
 class ResultsApp(App):
     CSS = "ResultsTable { height: 1fr; }"
 
-    def __init__(self, result: RunOutcome) -> None:
+    def __init__(self, result: RunOutcome, session: Session | None) -> None:
         super().__init__()
         self.result = result
+        self.session = session
 
     def compose(self) -> ComposeResult:
-        yield ResultsTable(id="grid", zebra_stripes=True, cursor_type="cell")
+        yield ResultsTable(id="grid", session=self.session, zebra_stripes=True, cursor_type="cell")
 
     def on_mount(self) -> None:
         table = self.query_one(ResultsTable)
@@ -46,8 +47,8 @@ class ResultsApp(App):
         table.focus()
 
 
-def run_grid(scenario, result: RunOutcome | None = None) -> None:
-    app = ResultsApp(result if result is not None else outcome())
+def run_grid(scenario, result: RunOutcome | None = None, *, session: Session | None = None) -> None:
+    app = ResultsApp(result if result is not None else outcome(), session)
 
     async def drive():
         async with app.run_test(size=(110, 35)) as pilot:
@@ -337,6 +338,39 @@ def test_export_errors_stay_in_modal_and_header_only_result_can_be_exported(tmp_
         assert read_csv(destination) == [result.columns]
 
     run_grid(scenario, result)
+
+
+def test_full_export_failing_on_later_page_preserves_destination(tmp_path, d1_source, d1_harness):
+    session = Session({d1_source.id: d1_source})
+    session.update_settings(default_rows=1)
+    # The preview and its lookahead succeed. Fetching row 3 overflows in SQLite.
+    result = session.run("SELECT id, CASE WHEN id=3 THEN abs(-9223372036854775808) END FROM records ORDER BY id")
+    assert result.capped
+    destination = tmp_path / "existing.csv"
+    destination.write_text("keep this file", encoding="utf-8")
+
+    async def scenario(app, pilot, table):
+        requests = len(d1_harness.requests)
+        table.action_export()
+        await pilot.pause()
+        modal = app.screen
+        modal.query_one("#export-scope", Select).value = "full"
+        modal.query_one("#export-path", Input).value = str(destination)
+        await pilot.pause()
+        await save(pilot, app)
+        assert len(d1_harness.requests) == requests  # No re-read before confirmation.
+        await save(pilot, app, "#export-overwrite")
+        assert app.screen is modal and not session.busy
+        assert "CSV export failed:" in str(modal.query_one("#export-message", Static).content)
+        assert destination.read_text(encoding="utf-8") == "keep this file"
+        new_file = tmp_path / "new.csv"
+        modal.query_one("#export-path", Input).value = str(new_file)
+        await pilot.pause()
+        await save(pilot, app)
+        assert not new_file.exists()
+        assert table.raw_rows == ((1, None),)
+
+    run_grid(scenario, result, session=session)
 
 
 def test_no_result_has_no_export_and_copy_does_not_destroy_clipboard():

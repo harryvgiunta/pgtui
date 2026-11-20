@@ -1,16 +1,21 @@
 """Bounded native execution, guarded result pages and explicit native runs."""
 from __future__ import annotations
 
+import csv
 import json
 import math
 import threading
 from contextlib import nullcontext
 from time import perf_counter
+from typing import TextIO
 from uuid import uuid4
 
 from d8r.sql import SqlError, cte_declarations, lex_sql, quote_identifier, relation_name, relation_parts, split_statements
 
-from .datasources import DataSource, EngineError, _safe_error, cancel_source, transaction_open
+from .datasources import (
+    DataSource, EngineError, _discard_connection, _postgres_disconnected, _safe_error,
+    cancel_source, transaction_open,
+)
 
 _DEFAULT_ROWS = 10000
 _PLAN_CHARS = 64000
@@ -91,6 +96,8 @@ def _pg_fetch_page(cursor, sql, cap, offset):
     try:
         cursor.execute(prefix + sql, prepare=False)
     except psycopg.Error as exc:
+        if _postgres_disconnected(cursor.connection, exc):
+            raise  # Keep native transport diagnostics for the connection owner.
         raise _safe_error(exc, position_offset=len(prefix)) from None
     try:
         if offset:
@@ -151,6 +158,18 @@ def _duck_result(con, sql, cap, statement_type, offset):
     return [], [], [], 0, statement_type
 
 
+def _cursor_to_csv(cursor, writer, batch_size, expired):
+    writer.writerow(column[0] for column in cursor.description)
+    count = 0
+    while not expired.is_set():
+        rows = cursor.fetchmany(batch_size)
+        if not rows:
+            return count
+        writer.writerows(rows)
+        count += len(rows)
+    raise EngineError("Query deadline exceeded")
+
+
 def execute_sql(source: DataSource, sql: str, *, max_rows=10000, readonly=False, timeout=30.0,
                 offset=0, page_reads=False) -> dict:
     """Execute one statement with a visible ``max_rows + 1`` lower-bound count.
@@ -178,6 +197,30 @@ def execute_sql(source: DataSource, sql: str, *, max_rows=10000, readonly=False,
                               offset=offset, page_reads=page_reads)
 
 
+def export_query_csv(source: DataSource, sql: str, output: TextIO, *, d1_page_size=1000, timeout=30.0) -> int:
+    """Write a fresh, guarded read from row one; return the actual CSV data row count."""
+    writer = csv.writer(output)
+    if source.kind == "d1-live":
+        # HTTP has no cursor. Keep the original response bound and reapply the
+        # read-only EXPLAIN guard on every page, including the first.
+        offset = 0
+        columns = None
+        while True:
+            page = execute_sql(source, sql, readonly=True, max_rows=d1_page_size, offset=offset, timeout=timeout)
+            if columns is None:
+                columns = page["columns"]
+                writer.writerow(columns)
+            elif columns != page["columns"]:
+                raise EngineError("Result columns changed during export; run the query again")
+            rows = page["rows"]
+            writer.writerows(rows)
+            offset += len(rows)
+            if page["total"] <= len(rows):
+                return offset
+    result = _execute_statement(source, sql, readonly=True, max_rows=1024, timeout=timeout, csv_writer=writer)
+    return result["total"]
+
+
 def prepare_sql(source: DataSource, sql: str, *, timeout=30.0) -> None:
     """Plan one read-only query on its native engine without running the query."""
     _execute_statement(source, sql, max_rows=1, readonly=True, timeout=timeout, prepare_only=True)
@@ -195,7 +238,7 @@ def explain_sql(source: DataSource, sql: str, *, timeout=30.0) -> dict:
 
 
 def _execute_statement(source, sql, *, max_rows, readonly, timeout, explain=False, prepare_only=False,
-                       offset=0, page_reads=False):
+                       offset=0, page_reads=False, csv_writer=None):
     cap = _row_limit(max_rows)
     if type(offset) is not int or not 0 <= offset <= 2**63 - 1 or (offset and not readonly):
         raise EngineError("Page offset must be a nonnegative integer and is only supported for read-only queries")
@@ -224,6 +267,10 @@ def _execute_statement(source, sql, *, max_rows, readonly, timeout, explain=Fals
     with source._lock:
         if source.con is None or source.kind not in {"postgres-live", "parquet"}:
             raise EngineError("Source is disconnected")
+        if source.kind == "postgres-live" and _postgres_disconnected(source.con):
+            lost = " Your transaction is no longer available." if source._transaction else ""
+            _discard_connection(source)
+            raise EngineError("PostgreSQL connection lost; this statement was not sent." + lost)
         user_transaction = transaction_open(source)
         if readonly and user_transaction:
             raise EngineError("Read-only tools cannot run inside your open transaction")
@@ -237,6 +284,7 @@ def _execute_statement(source, sql, *, max_rows, readonly, timeout, explain=Fals
         timer = threading.Timer(float(timeout), interrupt)
         timer.daemon = True
         own_transaction = False
+        disconnected = False
         statement_type = first
         timer.start()
         try:
@@ -282,6 +330,16 @@ def _execute_statement(source, sql, *, max_rows, readonly, timeout, explain=Fals
                 if expired.is_set():
                     raise EngineError("Query deadline exceeded")
                 return {**result, "ms": (perf_counter() - started) * 1000}
+            if csv_writer is not None:
+                if source.kind == "postgres-live":
+                    # A named cursor fetches each batch from one server-side result;
+                    # fetchmany on a regular psycopg cursor would buffer it in libpq.
+                    with source.con.cursor(name=f"pgtui_{uuid4().hex}") as cursor:
+                        cursor.execute(sql)
+                        count = _cursor_to_csv(cursor, csv_writer, cap, expired)
+                else:
+                    count = _cursor_to_csv(source.con.sql(sql), csv_writer, cap, expired)
+                return {"total": count}
             if source.kind == "postgres-live":
                 server_cursor = readonly or _pg_previewable(source.con, words, tokens)
                 # Never use WITH HOLD (commit would spool the remaining rows),
@@ -308,6 +366,11 @@ def _execute_statement(source, sql, *, max_rows, readonly, timeout, explain=Fals
         except EngineError:
             raise
         except Exception as exc:
+            if source.kind == "postgres-live" and _postgres_disconnected(source.con, exc):
+                disconnected = True
+                lost = " Your transaction is no longer available." if user_transaction else ""
+                raise EngineError("PostgreSQL connection lost during execution. The outcome may be unknown; "
+                                  "nothing was replayed. Check the database before retrying." + lost) from None
             if expired.is_set():
                 raise EngineError("Query deadline exceeded") from None
             raise _safe_error(exc) from None
@@ -316,7 +379,9 @@ def _execute_statement(source, sql, *, max_rows, readonly, timeout, explain=Fals
             # never cancel the next user statement or the cleanup ROLLBACK.
             timer.cancel()
             timer.join()
-            if own_transaction:
+            if disconnected:
+                _discard_connection(source)
+            elif own_transaction:
                 try:
                     if source.kind == "postgres-live":
                         source.con.rollback()
@@ -325,13 +390,12 @@ def _execute_statement(source, sql, *, max_rows, readonly, timeout, explain=Fals
                         source._transaction = False
                 except Exception:
                     # Do not return an unsafe connection to subsequent callers.
-                    con, source.con = source.con, None
-                    source._transaction = False
-                    try:
-                        con.close()
-                    except Exception:
-                        pass
+                    _discard_connection(source)
                     raise EngineError("Read-only transaction cleanup failed; reconnect the source") from None
+            if source.kind == "postgres-live" and source.con is not None and not source.con.closed:
+                # Keep the last known user state in case libpq reports UNKNOWN
+                # by the next Run (e.g. idle_in_transaction_session_timeout).
+                source._transaction = transaction_open(source)
 
 
 def _registered_table(source, table):

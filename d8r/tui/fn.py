@@ -11,7 +11,6 @@ Draft edits and AI Apply are autosaved separately; only Save or Run preview chan
 
 from __future__ import annotations
 
-import asyncio
 import json
 from time import monotonic
 
@@ -35,13 +34,14 @@ from .ai import AIPanel, AITarget
 
 from .palette import CommandPalette, EditorPane, prompt
 from .query_editor import QueryTextArea
+from .query_folds import QueryFoldView
 
 if TYPE_CHECKING:
     from .app import D8RApp
 
 NEW = "＋ New function…"
 
-HINT = "select a function · ctrl+r preview · ctrl+d delete · ctrl+space complete · F4 AI complete · escape / ctrl+q back"
+HINT = "select a function · ctrl+r preview · F8 cancel · ctrl+f find · ctrl+d delete · ctrl+space complete · F4 AI complete · escape / ctrl+q back"
 
 PARAMETER_GUIDE = """1. Declare ordered parameters
 min_id, source:relation, field:identifier
@@ -256,6 +256,11 @@ class FnEditor(Vertical):
 
     BINDINGS = [Binding("escape", "back", "Back to query", show=False, priority=True)]
 
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action == "back" and self.query_one(QueryFoldView).has_focus_within:
+            return False  # Esc closes the fold view before leaving the function.
+        return super().check_action(action, parameters)
+
 
     def __init__(self, ide: "D8RApp", **kwargs) -> None:
         super().__init__(**kwargs)
@@ -311,6 +316,7 @@ class FnEditor(Vertical):
             with FnBodyPane(id="fn-body-pane"):
                 yield QueryTextArea(self._initial_fields["body"], id="fn-body", show_line_numbers=True,
                                     dialect=self.session.sources[self.source_id].dialect)
+                yield QueryFoldView()
                 yield CommandPalette(
                     self.session, source_id=self.source_id, workspace_actions=False,
                     parameters=self._parameter_names, id="fn-palette", markup=False,
@@ -464,7 +470,7 @@ class FnEditor(Vertical):
         self._status(f"target · {self.session.sources[self.source_id].display}")
         self._queue_draft_save()
 
-    def retarget(self, source) -> None:
+    def retarget(self, source, previous_key: str) -> None:
         """Adopt a reconnected source's registry id when the draft's target died.
 
         A disconnected target is registered under its identity key; the live
@@ -472,9 +478,9 @@ class FnEditor(Vertical):
         Nothing else re-reads `source_id`, so a Save or preview after
         reconnecting would name a key no longer in the registry.
         """
-        if source.id == self.source_id or self.source_id in self.session.sources:
+        if self.session.source_key(source.id) != previous_key:
             return
-        if self.session.source_key(source.id) != self.session.source_key(self.source_id):
+        if self.source_id != source.id and self.source_id in self.session.sources:
             return
         select = self.query_one("#fn-source", Select)
         with self.prevent(Select.Changed):
@@ -650,36 +656,18 @@ class FnEditor(Vertical):
             return
         name = self.query_one("#fn-name", Input).value.strip()
         args_text = self.query_one("#fn-args", Input).value
-        source_id = self.source_id
         identity = self._draft_identity
-        self.session.busy = "Function preview running"
-        self._status("Running SQL preview…")
-        self.run_worker(self._preview(name, args_text, source_id, identity),
-                        group="function-preview", exit_on_error=False)
 
-    async def _preview(self, name: str, arguments: str, source_id: str, identity: str) -> None:
-        task = asyncio.create_task(asyncio.to_thread(
-            self.session.fn_preview, name, arguments, source_id=source_id,
-        ))
-        task.add_done_callback(lambda done: self._preview_finished(done, source_id, identity))
-        try:
-            await asyncio.shield(task)
-        except Exception:
-            pass  # The callback reports safe errors and releases the connection.
+        def publish(source, outcome) -> None:
+            if self.is_mounted and self.source_id == source.id and self._draft_identity == identity:
+                self._show_preview(outcome)
+                self.ide._set_status(outcome.status if outcome.error else "Ready")
 
-    def _preview_finished(self, task, source_id: str, identity: str) -> None:
-        self.session.busy = ""
-        if task.cancelled():
-            return
-        try:
-            outcome = task.result()
-        except Exception as exc:
-            if self.is_mounted and not self.ide._closing:
-                self._status(self.session.execution_error(exc), error=True)
-            return
-        if (not self.is_mounted or self.ide._closing or source_id != self.source_id
-                or identity != self._draft_identity):
-            return
+        self.ide.submit_sql(self.session.sources[self.source_id], "Function preview",
+                            lambda source, stop: self.session.fn_preview(name, args_text, source_id=source.id),
+                            publish)
+
+    def _show_preview(self, outcome) -> None:
         grid = self.preview_grid
         grid.clear(columns=True)
         if outcome.error:

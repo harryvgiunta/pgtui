@@ -144,7 +144,8 @@ class ConnectionStatus(Vertical):
         with Horizontal(classes="connection-heading"):
             yield LoadingIndicator()
             yield Static("", classes="connection-label", markup=False)
-        yield Button("Cancel", classes="connection-cancel", compact=True)
+        yield Button("Cancel connection", classes="connection-cancel", compact=True,
+                     tooltip="F8 · abandon this connection attempt")
 
     def start(self, target: str) -> None:
         self.query_one(".connection-label", Static).update(f"Connecting to\n{target}")
@@ -172,6 +173,10 @@ class ConnectionProgress(ConnectionStatus):
         self._timeout = timeout
         self._worker = None
         self._cancelled = False
+
+    @property
+    def can_continue(self) -> bool:
+        return not self._cancelled and self._valid()
 
     def on_mount(self) -> None:
         # Textual marks is_mounted only after Mount dispatch completes. Starting
