@@ -10,8 +10,8 @@ import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from textual import on
-from textual.app import ComposeResult
+from textual import events, on
+from textual.app import App as TextualApp, ComposeResult
 from textual.binding import Binding
 from textual.content import Content
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -22,14 +22,14 @@ from textual.widgets.option_list import Option
 from d8r.ai import client as ai_client
 from d8r.ai.client import AIConfig
 from d8r.ai.config import import_yolo_config
-
 from d8r.credentials import CredentialError
+from d8r.keybindings import key_identity, key_label, validate_completion_key
 from d8r.themes import THEMES, theme_label
 
 from .add_source import AddSourceModal
 from .dbt import DBTScreen
 from .editing import DraftTextArea
-from .palette import prompt
+from .palette import EditorPane, prompt
 
 if TYPE_CHECKING:
     from .app import D8RApp
@@ -54,6 +54,7 @@ class Row:
     detail: str = ""
     # pane | intellisense | entry-screen | default-rows | value-cache | value-limit | clear-values |
     # source | ai | ai-auto-accept | ai-sample-data | ai-schema-refreshes | add-source.
+    # completion-key edits one IntelliSense binding; other shortcut rows are read-only.
     action: str = ""
     value: str = ""
 
@@ -69,24 +70,17 @@ def binding_tooltip(bindings: list[Binding], action: str, *, context: str = "") 
     return f"{description} · {keys}" + (f" · {context}" if context else "") if matches else ""
 
 
-def binding_rows() -> list[Row]:
-    """Every key the IDE answers to, read from the classes that declare them.
+def binding_rows(completion_keys: dict[str, str]) -> list[Row]:
+    """Describe effective shortcuts using the app and widget binding definitions."""
 
-    Nothing is retyped here: each row is the `Binding` the widget or the app
-    actually carries, so the reference cannot drift from the keymap.
-    """
-    from textual.app import App as TextualApp
-
-    from .app import D8RApp, ExplorerSlot
-    from .results import ResultsTable
-    from .palette import EditorPane
     from .ai import AIDiagnosticsScreen, AIPanel, DeleteOptionList
-    from .results import ExportModal
+    from .app import D8RApp, ExplorerSlot
+    from .results import ExportModal, ResultsTable
 
     groups = (
         ("app", D8RApp.BINDINGS),
         ("explorer", ExplorerSlot.BINDINGS),
-        ("document", EditorPane.BINDINGS),
+        ("SQL editor", EditorPane.BINDINGS),
         ("results", ResultsTable.BINDINGS),
         ("settings", SettingsScreen.BINDINGS),
         ("add source", AddSourceModal.BINDINGS),
@@ -94,7 +88,7 @@ def binding_rows() -> list[Row]:
         ("AI logs", AIDiagnosticsScreen.BINDINGS),
         ("page / conversation lists", DeleteOptionList.BINDINGS),
         ("export", ExportModal.BINDINGS),
-        ("dbt exchange", DBTScreen.BINDINGS),
+        ("dbt settings", DBTScreen.BINDINGS),
         ("default rows", DefaultRowsScreen.BINDINGS),
         ("value cache limit", ValueCacheLimitScreen.BINDINGS),
         ("AI provider", AIProviderScreen.BINDINGS),
@@ -102,14 +96,18 @@ def binding_rows() -> list[Row]:
         # tab/shift+tab focus keys, so listing them would be a lie.
         ("textual", TextualApp.BINDINGS),
     )
-    rows: list[Row] = []
+    rows = [
+        Row(key_label(completion_keys[binding.id]), f"{binding.description} · IntelliSense",
+            "completion-key", binding.id)
+        for binding in EditorPane.BINDINGS if binding.id is not None and binding.id in completion_keys
+    ]
     for group, bindings in groups:
         for binding in bindings:
             key = str(binding.key)
             # Multi-key aliases (`ctrl+c,super+c`) are for terminals, not people.
-            if not binding.description or "," in key:
+            if binding.id in completion_keys or not binding.description or "," in key:
                 continue
-            rows.append(Row(key, f"{binding.description} · {group}"))
+            rows.append(Row(binding.key_display or key, f"{binding.description} · {group}"))
     return rows
 
 
@@ -184,8 +182,8 @@ class SettingsScreen(ModalScreen[None]):
                       "Completion uses cached metadata only and never queries while typing. "
                       "Values never go to disk and are cleared at exit. Changing these settings clears cached values.",
             "sources": "Connect PostgreSQL, Cloudflare D1 or a local Parquet file. SQL dialect and engine version follow the selected source.",
-            "dbt": "Exchange native SQL and local dbt models. Project home belongs to this source workspace. "
-                   "No dbt installation, execution, network or credential profiles; imports require manual Apply.",
+            "dbt": "Set the dbt project home for this source. Toggle pasted SQL or dbt Jinja in the query editor. "
+                   "Model file export is optional.",
             "ai": "Provider forms require Save & use to activate changes. Permission toggles save immediately. Schema refreshes control AI metadata lookups, not IDE indexing. "
                   "Test AI Queries checks final drafts and tries up to two SQL repairs. By default the database plans without running. Failed drafts require manual Apply anyway. "
                   "Run read-only test queries opts into bounded execution instead; reads can still be expensive. "
@@ -195,7 +193,8 @@ class SettingsScreen(ModalScreen[None]):
                   "AI completion while typing sends the current SQL window and permitted cached schema after an idle pause; "
                   "it never samples rows or auto-applies; SQL literals may contain sensitive data. F4 or Ctrl+Shift+Space requests it manually. "
                   "Disabling reads does not remove data already shared in chat.",
-            "keys": "Keyboard shortcuts from the running app. This reference is read-only.",
+            "keys": "Select an IntelliSense shortcut to change it. Other shortcuts are read-only. "
+                    "Keys can be reused where the contexts do not overlap.",
         }
         self.query_one("#settings-description", Static).update(
             f"{descriptions[self.menu]}\nSettings: {self.session.settings_path}\n"
@@ -208,9 +207,9 @@ class SettingsScreen(ModalScreen[None]):
             "theme": "enter / click apply and save theme",
             "values": "enter / click toggle, edit or clear",
             "sources": "enter / click select or add",
-            "dbt": "enter / click open project exchange",
+            "dbt": "enter / click open dbt settings",
             "ai": "enter / click toggle or edit",
-            "keys": "read-only reference",
+            "keys": "enter / click edit IntelliSense shortcuts",
         }[self.menu]
         self.query_one("#settings-hint", Static).update(
             f"↑↓ navigate · {action} · tab switch panel · esc back / close"
@@ -251,7 +250,7 @@ class SettingsScreen(ModalScreen[None]):
                 Row("Clear cache", f"{self.session.cached_value_columns} cached columns", "clear-values"),
             ]
         if self.menu == "keys":
-            return binding_rows()
+            return binding_rows(self.session.completion_keys)
         if self.menu == "sources":
             return [Row("Add data source", "PostgreSQL, Cloudflare D1 or Local Parquet", "add-source")] + [
                 Row(
@@ -265,7 +264,7 @@ class SettingsScreen(ModalScreen[None]):
                 for label, source_id in self.session.source_options()
             ]
         if self.menu == "dbt":
-            return [Row("Project home / import / export", self.session.dbt_project_dir or "not configured", "dbt")]
+            return [Row("Project home / export", self.session.dbt_project_dir or "not configured", "dbt")]
         if self.menu == "ai":
             config = self.session.ai_config
             return [
@@ -365,6 +364,15 @@ class SettingsScreen(ModalScreen[None]):
 
             self.app.push_screen(DefaultRowsScreen(self.ide), rows_saved)
             return
+        elif row.action == "completion-key":
+            binding = next(binding for binding in EditorPane.BINDINGS if binding.id == row.value)
+
+            def key_saved(_) -> None:
+                self._draw(event.option_index)
+                self.action_details()
+
+            self.app.push_screen(CompletionKeyScreen(self.ide, binding), key_saved)
+            return
         elif row.action == "dbt":
             self.app.push_screen(DBTScreen(self.ide), lambda _: self._draw(event.option_index))
             return
@@ -393,6 +401,112 @@ class SettingsScreen(ModalScreen[None]):
             self.dismiss(None)
         else:
             self.action_sidebar()
+
+
+class CompletionKeyScreen(ModalScreen[None]):
+    """Record one key for one IntelliSense action; apply only on Save."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    DEFAULT_CSS = """
+    CompletionKeyScreen { align: center middle; background: $background; }
+    #completion-key-settings {
+        width: 66; max-width: 100%; height: auto; max-height: 100%; padding: 1 2; border: round $accent;
+    }
+    #completion-key-settings Static { height: auto; margin-top: 1; }
+    #completion-key-buttons { height: auto; margin-top: 1; }
+    #completion-key-buttons Button { margin-right: 1; min-width: 10; }
+    #completion-key-error { color: $error; }
+    """
+
+    def __init__(self, ide: "D8RApp", binding: Binding) -> None:
+        assert binding.id is not None
+        super().__init__()
+        self.ide = ide
+        self.binding = binding
+        self.binding_id = binding.id
+        self._recording = True
+        self._candidate: str | None = None
+
+    def compose(self) -> ComposeResult:
+        current = self.ide.session.completion_keys[self.binding_id]
+        with VerticalScroll(id="completion-key-settings"):
+            yield Static(f"{self.binding.description} · IntelliSense", markup=False)
+            yield Static(f"Current: {key_label(current)}", markup=False)
+            yield Static("Press the new shortcut, then Save. After recording, Esc cancels.",
+                         id="completion-key-choice", markup=False)
+            yield Static("", id="completion-key-error", markup=False)
+            with Horizontal(id="completion-key-buttons"):
+                yield Button("Record key", id="completion-key-record", compact=True)
+                yield Button("Default", id="completion-key-default", compact=True)
+                yield Button("Save", id="completion-key-save", variant="primary", disabled=True, compact=True)
+                yield Button("Cancel", id="completion-key-cancel", compact=True)
+
+    def on_key(self, event: events.Key) -> None:
+        if self._recording:
+            event.stop()
+            event.prevent_default()
+            self._stage(event.key)
+
+    @on(Button.Pressed, "#completion-key-record")
+    def _record(self) -> None:
+        self._recording = True
+        self._candidate = None
+        self.query_one("#completion-key-choice", Static).update("Press the new shortcut, then Save.")
+        self.query_one("#completion-key-error", Static).update("")
+        self.query_one("#completion-key-save", Button).disabled = True
+
+    @on(Button.Pressed, "#completion-key-default")
+    def _restore_default(self) -> None:
+        self._stage(self.binding.key)
+
+    def _stage(self, key: str) -> None:
+        self._recording = False
+        self._candidate = None
+        save = self.query_one("#completion-key-save", Button)
+        choice = self.query_one("#completion-key-choice", Static)
+        error = self.query_one("#completion-key-error", Static)
+        label = key_label(key)
+        choice.update(f"New shortcut: {label}")
+        try:
+            validate_completion_key(key, action=self.binding_id)
+            conflict = self._conflicting_action(key)
+            if conflict:
+                raise ValueError(f"{label} is already used for {conflict} in the SQL editor.")
+        except ValueError as exc:
+            error.update(str(exc))
+            save.disabled = True
+            self.query_one("#completion-key-record", Button).focus()
+            return
+        error.update("")
+        self._candidate = key
+        save.disabled = False
+        save.focus()
+
+    def _conflicting_action(self, key: str) -> str:
+        # Check overlapping completion/application actions, not bindings local
+        # to Settings, the explorer, results, or other focused widgets.
+        keys = self.ide.session.completion_keys
+        identity = key_identity(key)
+        for binding in Binding.make_bindings((*EditorPane.BINDINGS, *self.ide.BINDINGS, *TextualApp.BINDINGS)):
+            if binding.id == self.binding_id or binding.action in {"close_output", "close_result_tab"}:
+                continue
+            other = keys.get(binding.id, binding.key) if binding.id is not None else binding.key
+            if key_identity(other) == identity:
+                return binding.description or "an application command"
+        if self.ide.ENABLE_COMMAND_PALETTE and identity == self.ide.COMMAND_PALETTE_BINDING:
+            return "the command palette"
+        return ""
+
+    @on(Button.Pressed, "#completion-key-save")
+    def _save(self) -> None:
+        if self._candidate is not None and self.ide.update_settings(
+            completion_keys={**self.ide.session.completion_keys, self.binding_id: self._candidate},
+        ):
+            self.dismiss(None)
+
+    @on(Button.Pressed, "#completion-key-cancel")
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class DefaultRowsScreen(ModalScreen[None]):

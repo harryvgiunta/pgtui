@@ -1,4 +1,4 @@
-"""Manual local dbt import/export, with a guarded, undoable editor handoff."""
+"""Set a local dbt project home and optionally export reviewed SQL."""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -50,21 +50,17 @@ class DBTScreen(ModalScreen[None]):
         self.edit_serial = getattr(self.editor, "user_edit_serial", None)
         self.dialect = ide.session.sources[self.target.source_id].dialect
         self.project: DbtProject | None = None
-        self.loaded_import = False
-        self.imported_config: dict = {}
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dbt-dialog"):
-            yield Static("dbt · local SQL/model exchange", id="dbt-title")
+            yield Static("dbt · project home and export", id="dbt-title")
             with VerticalScroll(id="dbt-form"):
-                yield Static("No dbt runtime, credentials, SQL execution or network. Advanced Jinja needs compiled artifacts. "
-                             "Mappings must match exact manifest relation names or literal YAML sources.", markup=False)
+                yield Static("Set the project home here, then use SQL ↔ dbt in a PostgreSQL query page. "
+                             "Conversion is offline and does not execute SQL or write model files.", markup=False)
                 yield Static("Workspace project home (directory containing dbt_project.yml)")
                 yield Input(self.ide.session.dbt_project_dir, placeholder="Local project directory", id="dbt-project-dir")
                 yield Button("Open & save project home", id="dbt-open")
-                yield Static("Import model (relative to project home)")
-                yield Select([], prompt="Open a project first", id="dbt-model")
-                yield Button("Load model SQL", id="dbt-load", disabled=True)
+                yield Static("Optional file export", classes="section-title")
                 yield Static("Model name")
                 yield Input(placeholder="model_name", id="dbt-name")
                 yield Static("Materialization")
@@ -72,15 +68,14 @@ class DBTScreen(ModalScreen[None]):
                              value="view", allow_blank=False, id="dbt-materialized")
                 yield Static("Description")
                 yield DraftTextArea("", id="dbt-description")
-                yield Static("Native SQL · review/edit before Apply or Export")
+                yield Static("Native SQL · review or edit before exporting")
                 yield DraftTextArea(self.target.document, id="dbt-sql", show_line_numbers=True)
                 yield Button("Use expanded editor SQL", id="dbt-editor")
                 yield Checkbox("I consent to replacing existing model SQL and updating its YAML metadata", id="dbt-overwrite")
                 yield Static("Export preserves unrelated YAML values, but YAML formatting/comments may change. "
-                             "No SQL is executed. Imported SQL is applied only by the button below.", markup=False)
-            yield Static("Open a project to list models. Your editor is unchanged.", id="dbt-message", markup=False)
+                             "No SQL is executed.", markup=False)
+            yield Static("Choose a project home. Your query editor is unchanged.", id="dbt-message", markup=False)
             with Horizontal(classes="dbt-buttons"):
-                yield Button("Apply imported SQL", id="dbt-apply", variant="primary", disabled=True)
                 yield Button("Export model files", id="dbt-export")
                 yield Button("Close", id="dbt-close")
 
@@ -92,7 +87,7 @@ class DBTScreen(ModalScreen[None]):
                           if self.ide.function_mode else self.ide.editor)
         if (current_editor is not self.editor or self.ide._ai_target() != self.target
                 or getattr(current_editor, "user_edit_serial", None) != self.edit_serial):
-            raise DbtError("The source, page, function or editor changed. Close and reopen dbt exchange before applying or exporting.")
+            raise DbtError("The source, page, function or editor changed. Close and reopen dbt settings.")
 
     def _project(self) -> DbtProject:
         directory = self.query_one("#dbt-project-dir", Input).value.strip()
@@ -121,35 +116,9 @@ class DBTScreen(ModalScreen[None]):
                     raise DbtError("Project home could not be saved. Check workspace storage permissions.")
                 self.project = project
                 self.query_one("#dbt-project-dir", Input).value = str(project.root)
-                self.query_one("#dbt-model", Select).set_options([(path, path) for path in project.models])
-                self.query_one("#dbt-load", Button).disabled = not project.models
-                self.loaded_import = False
-                self.imported_config = {}
-                self.query_one("#dbt-apply", Button).disabled = True
-                self._message(f"Opened {project.name}: {len(project.models)} SQL models. Choose a model or export reviewed SQL.")
-            elif event.button.id == "dbt-load":
-                self._guard()
-                path = self.query_one("#dbt-model", Select).value
-                if not isinstance(path, str):
-                    raise DbtError("Select a model to import.")
-                imported = self._project().import_model(path)
-                self.query_one("#dbt-sql", TextArea).load_text(imported.sql)
-                self.query_one("#dbt-name", Input).value = imported.name
-                materialized = self.query_one("#dbt-materialized", Select)
-                values = ("view", "table", "incremental", "ephemeral")
-                materialized.set_options([(value, value) for value in dict.fromkeys((*values, imported.materialized))])
-                materialized.value = imported.materialized
-                self.query_one("#dbt-description", TextArea).load_text(imported.description)
-                self.loaded_import = True
-                self.imported_config = imported.config
-                self.query_one("#dbt-apply", Button).disabled = False
-                self._message("Loaded actual compiled SQL; review before Apply." if imported.used_compiled else
-                              "Resolved literal ref/source/config locally; review before Apply. Editor unchanged.")
+                self._message(f"Saved project home for {project.name}. Use SQL ↔ dbt in the query editor.")
             elif event.button.id == "dbt-editor":
                 self.query_one("#dbt-sql", TextArea).load_text(self._native(self.target.document))
-                self.loaded_import = False
-                self.imported_config = {}
-                self.query_one("#dbt-apply", Button).disabled = True
                 self._message("Expanded saved functions locally. Review SQL, then Export; nothing executed.")
             elif event.button.id == "dbt-export":
                 project = self._project()
@@ -159,21 +128,10 @@ class DBTScreen(ModalScreen[None]):
                     str(self.query_one("#dbt-materialized", Select).value),
                     self.query_one("#dbt-description", TextArea).text,
                     overwrite=self.query_one("#dbt-overwrite", Checkbox).value,
-                    config=self.imported_config,
                 )
                 self.query_one("#dbt-overwrite", Checkbox).value = False
                 self.project = DbtProject(project.root, dialect=self.dialect)
-                self.query_one("#dbt-model", Select).set_options([(path, path) for path in self.project.models])
-                self.query_one("#dbt-load", Button).disabled = not self.project.models
                 self._message(f"Exported {result.sql_path.relative_to(project.root)} and {result.yaml_path.relative_to(project.root)}. Editor unchanged; nothing executed.")
-            elif event.button.id == "dbt-apply":
-                self._guard()
-                if not self.loaded_import:
-                    raise DbtError("Load and review a model before applying it.")
-                if self.ide.refuse_busy("Apply dbt import"):
-                    return
-                self.ide.apply_dbt_import(self.query_one("#dbt-sql", TextArea).text)
-                self.dismiss(None)
         except (DbtError, SqlError, OSError) as exc:
             self._message(str(exc))
 

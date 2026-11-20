@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from rich.rule import Rule
 from textual import events, on
+from textual.actions import SkipAction
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -39,6 +40,7 @@ from textual.widgets.option_list import Option
 
 from d8r.ai.context import AIProposal
 from d8r.completion.engine import function_insertion
+from d8r.dbt import DbtError, DbtProject
 from d8r.engine import POSTGRES_VERSION, DataSource, EngineError
 from d8r.sql import ColumnDef, format_parameters
 from d8r.themes import COZY_PASTEL
@@ -53,7 +55,7 @@ from .query_folds import QueryFoldView
 from .page_details import PageDetails
 from .results import ResultsTable
 from .session import RunOutcome, Session
-from .settings import SettingsScreen, binding_tooltip
+from .settings import CompletionKeyScreen, SettingsScreen, binding_tooltip
 from .fn import FnEditor, FnExplorer, HINT as FUNCTION_HINT
 from .layout import PaneSplitter
 from . import splash
@@ -83,6 +85,7 @@ class IdeScreen(Screen):
         Binding("tab", "noop", "Tab", show=False),
         Binding("shift+tab", "previous_field", "Shift Tab", show=False),
         Binding("ctrl+c,super+c", "screen.copy_text", "Copy selected text", show=False),
+        Binding("escape", "dismiss_completion_ai", "Cancel inline AI suggestion", show=False, priority=True),
     ]
 
     def action_noop(self) -> None:
@@ -93,6 +96,13 @@ class IdeScreen(Screen):
     def action_previous_field(self) -> None:
         if self.app.function_mode:
             self.focus_previous()
+
+    def action_dismiss_completion_ai(self) -> None:
+        editor = self.focused
+        if (editor is None or not isinstance(pane := editor.parent, EditorPane) or editor is not pane.editor
+                or self.app.session.completion_keys["completion_toggle"] == "escape"
+                or not pane.palette.dismiss_ai()):
+            raise SkipAction()
 
 
 
@@ -232,6 +242,7 @@ class D8RApp(App):
     def __init__(self, session: Session | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self.session = session if session is not None else Session()
+        self.update_keymap(self.session.completion_keys)
         self.register_theme(COZY_PASTEL)
         self.theme = self.session.theme
         self.ai_chats = AIChats(self, self.session)
@@ -332,6 +343,8 @@ class D8RApp(App):
                                      tooltip=binding_tooltip(self.BINDINGS, "find_sql"))
                         yield Button("Sections", id="query-sections", compact=True,
                                      tooltip=binding_tooltip(self.BINDINGS, "query_sections"))
+                        yield Button("SQL ↔ dbt", id="dbt-toggle", compact=True,
+                                     tooltip="Convert this page between PostgreSQL SQL and dbt Jinja without running it")
                     yield FindBar(id="sql-find")
                     with EditorPane(id="editor-pane"):
                         yield QueryTextArea(self._initial_document, dialect=self.session.source.dialect,
@@ -933,6 +946,7 @@ class D8RApp(App):
         self.query_one("#refresh-schema", Button).disabled = running
         self.query_one("#reconnect-source", Button).display = not self.session.source_connected()
         source = self.session.source
+        self.query_one("#dbt-toggle", Button).display = source.dialect == "postgres"
         self.editor.dialect = source.dialect
         label = "Cloudflare D1 · SQLite" if source.dialect == "sqlite" else (
             "PostgreSQL" if source.dialect == "postgres" else "DuckDB")
@@ -1001,7 +1015,9 @@ class D8RApp(App):
             self._set_status(str(exc))
             self.notify(str(exc), title="Settings could not be saved", severity="error")
             return False
-        if {"intellisense", "ai", "ai_completion", "ai_allow_schema_refreshes"} & changes.keys():
+        if "completion_keys" in changes:
+            self.update_keymap(self.session.completion_keys)
+        if {"intellisense", "completion_keys", "ai", "ai_completion", "ai_allow_schema_refreshes"} & changes.keys():
             for palette in self.query(CommandPalette):
                 palette.close()
         if self.session.value_cache_epoch != value_epoch:
@@ -1175,6 +1191,8 @@ class D8RApp(App):
             self.exit()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if self.screen_stack and isinstance(self.screen, CompletionKeyScreen):
+            return False  # Record keypresses without invoking application commands.
         if action == "cancel_operation":
             return (self._connection_progress is not None or self._cancel_run is not None) and not self._modal_open()
         if action in {"find_sql", "format_sql", "query_sections"}:
@@ -1523,10 +1541,54 @@ class D8RApp(App):
         explorer.show_functions(self.session.functions_for(source_id))
         self.call_after_refresh(explorer.focus_search)
 
+    @on(Button.Pressed, "#dbt-toggle")
     def action_dbt(self) -> None:
-        if not self._modal_open():
-            from .dbt import DBTScreen
-            self.push_screen(DBTScreen(self))
+        """Alternate the current page's text, never run it or write model files."""
+        if not self._workspace_ready or self._modal_open():
+            return
+        if self.function_mode or self.session.dialect != "postgres":
+            self._set_status("SQL ↔ dbt is available on PostgreSQL query pages")
+            return
+        directory = self.session.dbt_project_dir
+        if not directory:
+            self._set_status("Set a project home in Settings → DBT first")
+            return
+        editor = self.editor
+        document = editor.text
+        if not document.strip():
+            self._set_status("Paste a SQL query or a dbt model into the page first")
+            editor.focus()
+            return
+        page = next((item for item in self.session.workspace["pages"]
+                     if item["id"] == self._document_identity), {})
+        views = page.get("dbt_views")
+        if views is None or views["project_dir"] != directory or document not in (views["sql"], views["jinja"]):
+            source = self.session.source
+            target = source.postgres or self.session.saved_source_profile(source.id) or {}
+            try:
+                sql, jinja = DbtProject(directory).query_views(
+                    document, database=target.get("database", ""),
+                    schema=source.default_schema or target.get("schema", ""),
+                )
+            except (DbtError, OSError) as exc:
+                self._set_status(str(exc))
+                editor.focus()
+                return
+            if sql == jinja:
+                self._set_status("No dbt references to convert in this query")
+                editor.focus()
+                return
+            views = {"project_dir": directory, "sql": sql, "jinja": jinja}
+        to_sql = document == views["jinja"]
+        next_view = "sql" if to_sql else "jinja"
+        self.query_one(FindBar).close(restore_focus=False)
+        editor.reveal_for_edit(focus=False)
+        self._replace_dbt_draft(editor, views[next_view])
+        editor.focus()
+        self._capture_workspace()
+        # TextArea uses the document's newline style for inserted text.
+        if self.save_workspace(dbt_views={**views, next_view: editor.text}, **self._workspace_snapshot):
+            self._set_status("PostgreSQL SQL · nothing executed" if to_sql else "dbt Jinja · Run SQL renders this view")
 
     def set_dbt_project_dir(self, path: str) -> bool:
         workspaces = deepcopy(self.session.workspace["source_workspaces"])
@@ -1536,18 +1598,15 @@ class D8RApp(App):
         state["dbt_project_dir"] = path
         return self.save_workspace(source_workspaces=workspaces)
 
-    def apply_dbt_import(self, sql: str) -> None:
-        """Apply an explicitly imported model as one undoable native SQL edit."""
-        editor = self.function_editor.query_one("#fn-body", TextArea) if self.function_mode else self.editor
+    def _replace_dbt_draft(self, editor: TextArea, text: str) -> None:
         editor.history.checkpoint()
         end = editor.document.get_location_from_index(len(editor.text))
-        editor.replace(sql, (0, 0), end, maintain_selection_offset=False)
+        editor.replace(text, (0, 0), end, maintain_selection_offset=False)
         editor.move_cursor((0, 0))
         editor.history.checkpoint()
         for palette in self.query(CommandPalette):
             palette.close()
         self.ai_panel.target_changed()
-        self._set_status("dbt model imported · native SQL draft only; nothing executed")
 
     def action_query_to_fn(self) -> None:
         """Open a new function draft without saving or rewriting the document."""

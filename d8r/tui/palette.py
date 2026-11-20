@@ -11,6 +11,7 @@ from rich.cells import cell_len
 from rich.text import Text
 
 from textual import events, on
+from textual.actions import SkipAction
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
 from textual.content import Content
@@ -21,6 +22,7 @@ from textual.widgets.option_list import Option
 from d8r.completion.engine import complete
 from d8r.completion.context import analyze, command_span
 from d8r.completion.models import Field, Signature
+from d8r.keybindings import DEFAULT_COMPLETION_KEYS, is_typing_key, key_label
 from .session import Session
 
 ACTIONS: tuple[tuple[str, str, str], ...] = (
@@ -28,7 +30,7 @@ ACTIONS: tuple[tuple[str, str, str], ...] = (
     ("SQL preview", "ctrl+k · expand functions without executing", "compile"),
     ("Data source…", "ctrl+o · PostgreSQL, Cloudflare D1 or local Parquet", "add-source"),
     ("Functions…", "open the SQL function library", "fn"),
-    ("dbt…", "import/export project models and configuration", "dbt"),
+    ("dbt", "toggle this query page between PostgreSQL SQL and dbt Jinja", "dbt"),
     ("Query to function", "create a function draft from this document", "query-to-fn"),
     ("Export results", "save selected rows, the buffer or the full query result as CSV", "export-results"),
     ("AI", "chat and review an AI-proposed replacement", "ai"),
@@ -189,7 +191,7 @@ class CommandPalette(OptionList):
         self.details: CompletionDetails | None = None
         self._view: View | None = None
         self._preferred_width = 40
-        # Editor-local, not document-local: only Escape changes this flag.
+        # Editor-local, not document-local: only the toggle shortcut changes it.
         self._sql_muted = False
         self._preview_document: str | None = None
         self._sync_pending = False
@@ -210,6 +212,10 @@ class CommandPalette(OptionList):
     @property
     def is_open(self) -> bool:
         return self.has_class("open")
+
+    @property
+    def suggestions_visible(self) -> bool:
+        return self.is_open and self.styles.visibility == "visible"
 
     @property
     def view(self) -> View | None:
@@ -267,6 +273,13 @@ class CommandPalette(OptionList):
         self._ai_status = ""
         if self._view is not None and self._view.phase == "ai":
             self._hide()
+
+    def dismiss_ai(self) -> bool:
+        """Dismiss a pending or reviewable AI suggestion without muting SQL suggestions."""
+        if self._ai_snapshot is None:
+            return False
+        self.close()
+        return True
 
     def _guard_ai(self) -> None:
         if self._ai_snapshot is not None and (
@@ -437,12 +450,18 @@ class CommandPalette(OptionList):
                     allow_schema=self.session.ai_allow_schema_refreshes,
                     metadata_cache_info=self.session.schema_cache_info())
                 config = self.session.ai_config
-            self._ai_status = "AI · requesting suggestions… · Esc mutes completion"
+            keys = self.session.completion_keys
+            toggle = key_label(keys["completion_toggle"])
+            accept = key_label(keys["completion_accept"])
+            self._ai_status = f"AI · requesting suggestions… · {toggle} mutes completion"
             self._render_details()
             suggestions = await sql_completion.complete_sql(config, request)
             if not self._ai_current(generation, snapshot):
                 return
-            self._ai_status = "AI · review only · Tab/Enter accepts · Esc mutes completion" if suggestions else "AI · no suggestions"
+            self._ai_status = (
+                f"AI · review only · Tab/{accept} accepts · {toggle} mutes completion"
+                if suggestions else "AI · no suggestions"
+            )
             if suggestions:
                 entries = [Entry(f"AI suggestion {index + 1}", item.insert, item.detail,
                                  cursor_back=item.cursor_back, kind="AI",
@@ -594,7 +613,7 @@ class CommandPalette(OptionList):
 
     def _publish_history_preview(self) -> None:
         document = None
-        if (self.is_open and self.styles.visibility == "visible" and self._view is not None
+        if (self.suggestions_visible and self._view is not None
                 and self.highlighted is not None and self.highlighted < len(self._view.entries)):
             entry = self._view.entries[self.highlighted]
             if entry.replace_document:
@@ -609,17 +628,29 @@ class CommandPalette(OptionList):
         if self._sql_muted or (self._view is not None and self._view.phase == "command"):
             self.close()
         else:
-            self.sync()  # Restore current local offers; Escape is not an AI or value request.
+            self.sync()  # Restore local offers without requesting AI or values.
 
     def move(self, delta: int) -> None:
         if self.option_count:
             self.highlighted = (self.highlighted + delta) % self.option_count if self.highlighted is not None else 0
             self.scroll_to_highlight()
 
-    def accept_highlighted(self) -> bool:
+    def _visible_highlight(self) -> Entry | None:
+        view, index = self._view, self.highlighted
+        if self.suggestions_visible and view is not None and index is not None and 0 <= index < len(view.entries):
+            return view.entries[index]
+        return None
+
+    def accept_highlighted(self, *, visible_only: bool = False) -> bool:
         self._guard_ai()
+        # A typing key must not accept an entry that was hidden or not yet shown.
+        shown = self._visible_highlight() if visible_only else None
+        if visible_only and shown is None:
+            return False
         if self._sync_pending or (self._view is not None and self._view.phase != "ai"):
             self.sync()
+        if visible_only and self._visible_highlight() != shown:
+            return False
         return self._accept(self.highlighted) if self.highlighted is not None else False
 
     def accept(self, index: int) -> bool:
@@ -679,11 +710,16 @@ class CommandPalette(OptionList):
 class EditorPane(Vertical):
     """Scope completion keys to editors, leaving results column selection intact."""
     BINDINGS = [
-        Binding("up", "palette_up", "Cursor up", show=False, priority=True),
-        Binding("down", "palette_down", "Cursor down", show=False, priority=True),
-        Binding("enter", "palette_enter", "Newline", show=False, priority=True),
-        Binding("escape", "palette_escape", "Toggle SQL completion", show=False, priority=True),
-        Binding("tab", "palette_tab", "Accept suggestion", show=False, priority=True),
+        *(
+            Binding(DEFAULT_COMPLETION_KEYS[action], action, description, show=False, priority=True, id=action)
+            for action, description in (
+                ("completion_toggle", "Toggle IntelliSense"),
+                ("completion_previous", "Previous suggestion"),
+                ("completion_next", "Next suggestion"),
+                ("completion_accept", "Accept suggestion"),
+            )
+        ),
+        Binding("tab", "palette_tab", "Accept suggestion (alternate)", show=False, priority=True),
         Binding("ctrl+space", "complete_local", "SQL completion", show=False, priority=True),
         Binding("ctrl+shift+space,f4", "complete_ai", "AI completion", show=False, priority=True),
         Binding("alt+up", "scroll_details(-3)", "Scroll completion details up", show=False, priority=True),
@@ -738,30 +774,29 @@ class EditorPane(Vertical):
             self.palette.accept(event.option_index)
         self.editor.focus()
 
-    def action_palette_up(self) -> None:
-        self.palette.flush_sync()
-        if self.palette.is_open:
-            self.palette.move(-1)
-        else:
-            self.editor.action_cursor_up()
+    def _move_suggestion(self, action: str, delta: int) -> None:
+        palette = self.palette
+        visible_only = is_typing_key(palette.session.completion_keys[action])
+        if visible_only and not palette.suggestions_visible:
+            raise SkipAction()
+        palette.flush_sync()
+        if not palette.is_open or not palette.option_count or (visible_only and not palette.suggestions_visible):
+            raise SkipAction()
+        palette.move(delta)
 
-    def action_palette_down(self) -> None:
-        self.palette.flush_sync()
-        if self.palette.is_open:
-            self.palette.move(1)
-        else:
-            self.editor.action_cursor_down()
+    def action_completion_previous(self) -> None:
+        self._move_suggestion("completion_previous", -1)
 
-    def action_palette_enter(self) -> None:
-        if self.palette.accept_highlighted():
-            return
-        self.palette.close()
-        if not self.editor.read_only:
-            self.editor.user_edit_serial += 1
-            start, end = self.editor.selection
-            self.editor.replace("\n", start, end, maintain_selection_offset=False)
+    def action_completion_next(self) -> None:
+        self._move_suggestion("completion_next", 1)
 
-    def action_palette_escape(self) -> None:
+    def action_completion_accept(self) -> None:
+        palette = self.palette
+        visible_only = is_typing_key(palette.session.completion_keys["completion_accept"])
+        if not palette.accept_highlighted(visible_only=visible_only):
+            raise SkipAction()
+
+    def action_completion_toggle(self) -> None:
         self.palette.escape()
 
     def action_palette_tab(self) -> bool:

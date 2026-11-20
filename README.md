@@ -236,27 +236,38 @@ They are not a Soda contract runner or anomaly-detection service. Computation st
 inside PostgreSQL, D1 SQLite or the local DuckDB engine; no full dataset is fetched
 into Python, and no server-installed routines or Soda dependency are required.
 
-## dbt project exchange
+## SQL ↔ dbt
 
-Use `\dbt` or Settings → dbt project. Open a local directory containing
-`dbt_project.yml`; its home is saved for the selected source workspace, independently
-of other connections. Opening PGTUI does not scan the project or run dbt.
+Set up the project once per PostgreSQL source: open Settings → DBT →
+Project home / export, enter the directory containing `dbt_project.yml`,
+and choose **Open & save project home**. Close Settings and paste into a query page.
 
-- **Import:** choose a model and Load model SQL. Review its native SQL, materialization,
-  description and configuration before Apply imported SQL. Apply is one undoable edit;
-  Cancel leaves the editor unchanged. Neither action executes SQL.
-- **Export:** review the current SQL (Use expanded editor SQL expands local functions),
-  choose the model name/materialization/description, then Export model files. Writes
-  model SQL and model YAML under configured model paths. Existing files require the
-  explicit overwrite checkbox. Unrelated YAML values are preserved semantically,
-  but YAML comments and formatting can change.
-- Physical relation names convert to `ref()`/`source()` only through unambiguous,
-  exact manifest relation names or literal source YAML. Aliases, SQL comments, strings
-  and CTE scope are preserved. No schema/search-path guesses are made.
-- Literal `ref`, `source` and `config` calls resolve offline. Advanced Jinja, macros
-  and ephemeral dependencies require actual compiled SQL artifacts with matching
-  model source; generate/refresh them with your dbt tooling outside PGTUI. Arbitrary
-  Jinja is never evaluated here.
+- **dbt → SQL:** paste a query with literal `ref()`, `source()`, or `config()` calls.
+  Click **SQL ↔ dbt** (or use `\dbt`) to see the resolved SQL without `config()`.
+- **SQL → dbt:** paste a PostgreSQL query and click the same button. Mapped relations
+  become `source()` or `ref()` calls. The resolver uses manifest relation names or
+  literal source YAML. Unqualified names use the source's configured schema; qualify
+  them explicitly if your query uses a different search path.
+
+**Run SQL** and **Ctrl+Enter** work from either view. If you select text, only the
+selection runs. PGTUI resolves a single supported dbt query offline and sends the
+native SQL to PostgreSQL. The draft, selection, and saved view pair stay unchanged.
+History keeps the submitted Jinja.
+
+Toggling never runs SQL. Each toggle is one undoable edit. Flip an unchanged draft
+back to recover its exact prior text, including comments, formatting, and literal
+`config()`. The pair is saved with the query page. If a template cannot be resolved,
+nothing is executed. Compile macros, blocks, or ephemeral dependencies outside
+PGTUI and run the compiled SQL. Jinja markers found only inside SQL strings or
+comments are refused as ambiguous when toggling, but left untouched when running.
+
+### Optional file export
+
+In Settings → DBT, review the SQL (**Use expanded editor SQL** expands local
+functions), set the model name, materialization, and description, then click
+**Export model files**. This writes model SQL and YAML under configured model
+paths. Replacing existing files requires the overwrite checkbox. Unrelated YAML
+values are preserved, but formatting and comments can change.
 
 Model paths, target paths and file destinations stay inside the selected project;
 symlink escapes and traversal are refused. No dbt runtime, adapters, subprocesses,
@@ -340,9 +351,9 @@ older builds did not write a durable snapshot that could be recovered retroactiv
   through an offline source handoff. Restart starts with no cached row values.
   Reconnect, successful SQL execution, settings changes and Clear cache invalidate
   value pools. Startup, document loads and caret-only movement never fetch values.
-  Busy connections do not block local suggestions. Escape/blur/retarget
-  prevent late reads from reopening a popup; typing within the same predicate uses
-  its current literal. Explorer expansion shares the same cache and in-flight read.
+  Busy connections do not block local suggestions. Pausing IntelliSense, blur, and
+  retargeting prevent late reads from reopening a popup; typing within the same
+  predicate uses its current literal. Explorer expansion shares the same cache and in-flight read.
   Limits bound returned values, not scan cost.
 
 The popup shows kind, type, provenance and documentation. Long details and AI edit
@@ -368,8 +379,9 @@ data. Disabling schema sharing also removes schema context from inline requests.
 
 At most three bounded edits are returned, with a 15-second total deadline and no
 automatic retry. Edits, caret movement, source/schema/provider/parameter changes,
-page/function switches, Escape and app exit invalidate pending results. Inspect the
-preview, then Tab or Enter to accept; an invisible preview cannot be accepted.
+page/function switches, Escape, pausing IntelliSense and app exit invalidate pending
+results. Inspect the preview, then use the configured accept key (Enter by default)
+or Tab. An invisible preview cannot be accepted.
 Suggestions never apply automatically—even if chat Auto accept is enabled—and never
 execute SQL or save a function. For larger replacements, use the existing Ask AI chat.
 
@@ -395,6 +407,16 @@ After a successful run, each result tab shows its statement’s row count and ti
 The footer shows `Ready` for a single result or the number of results for a batch.
 Hover a button to see its bound keyboard shortcut. New Query preserves the current
 draft; connection forms retain field focus and selection across edits and connection work.
+
+In **Settings → Keybindings**, select one of the four IntelliSense actions, press
+the new shortcut, then choose **Save**. Changes apply immediately and are restored
+at startup. **Default** stages the original key for the selected action. The same
+key can be used in different contexts, but overlapping shortcuts are rejected.
+Typing keys such as Space can navigate or accept when suggestions are visible;
+otherwise they type normally. The IntelliSense toggle requires a non-typing key
+because it also works with the suggestion list closed.
+Tab remains an alternate accept key. Esc still dismisses inline AI after the
+IntelliSense toggle is rebound.
 
 In query and function SQL, **Format SQL** indents CTE bodies and lays out clauses
 and join conditions. It formats the selection, or the whole draft if nothing is
@@ -425,10 +447,11 @@ to return to the original selection. Folding changes neither the draft nor what 
 | Ctrl+A in a text editor or chat composer | Select the entire draft |
 | Alt/Option+Left / Right in a text editor or chat composer | Jump by word |
 | Alt/Option+Up / Down | Jump by page; scroll completion details instead when they overflow |
-| Tab / Enter with completion open | Accept completion |
-| Escape in the query editor | Pause SQL suggestions until Escape is pressed again |
+| Up Arrow / Down Arrow with completion open (defaults) | Navigate suggestions |
+| Tab / Enter with completion open (Enter configurable) | Accept completion |
+| Esc in the SQL editor (default toggle) | Pause or resume IntelliSense without changing the saved setting |
 | Escape in Explorer (Schema, Pages or Functions) | Hide Explorer and return to the query editor at the same cursor position |
-| Escape in the function editor | Return to the query and previous Explorer tab without discarding the function draft |
+| Escape in non-SQL function form fields | Return to the query and previous Explorer tab without discarding the function draft |
 | Escape in chat | Hide Conversations and return to the query editor without discarding the chat draft |
 | Ctrl+Q | Return from function mode; otherwise quit |
 

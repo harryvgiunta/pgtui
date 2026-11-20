@@ -1,4 +1,4 @@
-"""Offline, explicit dbt file exchange; never imports or invokes a dbt runtime.
+"""Offline dbt conversion and file exchange; never invokes a dbt runtime.
 
 Only literal ref/source/config calls are interpreted. Relation names come from
 manifest artifacts or literal source YAML, never profiles or schema guesses.
@@ -22,8 +22,24 @@ from d8r.sql import (
 )
 
 
+_JINJA_OPEN = re.compile(r"\{[{%#]")
+_JINJA_PART = re.compile(r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[{}'"]''', re.DOTALL)
+
+
 class DbtError(ValueError):
     """An actionable project or conversion error, safe to show in the form."""
+
+
+def has_query_jinja(document: str, *, dialect: str = "postgres") -> bool:
+    """Recognize template code without treating SQL strings or comments as Jinja."""
+    if not _JINJA_OPEN.search(document):
+        return False
+    try:
+        tokens = lex_sql(document, dialect=dialect)
+    except SqlError:
+        # Raw Jinja literals may use escapes that SQL does not recognize.
+        return True
+    return any(token.kind == "symbol" and _JINJA_OPEN.match(document, token.start) for token in tokens)
 
 
 class _UniqueLoader(yaml.SafeLoader):
@@ -210,6 +226,24 @@ def _call(expression: str) -> tuple[str, list[Any], dict[str, Any]]:
         raise DbtError("Advanced/dynamic Jinja requires an actual compiled artifact. Compile outside PGTUI, then reload.") from exc
 
 
+def _expression_end(text: str, start: int) -> int:
+    """Find the closing }} without mistaking literal strings or dictionaries for it."""
+    braces = 0
+    for part in _JINJA_PART.finditer(text, start):
+        if part[0] == "{":
+            braces += 1
+        elif part[0] == "}":
+            if braces:
+                braces -= 1
+            elif text.startswith("}}", part.start()):
+                return part.start()
+            else:
+                break
+        elif part[0] in {"'", '"'}:
+            break  # unterminated quoted literal
+    raise DbtError("Unbalanced Jinja expression; compile the model outside PGTUI.")
+
+
 class DbtProject:
     """A user-opened local project snapshot. Construction performs file reads only."""
 
@@ -363,7 +397,25 @@ class DbtProject:
             raise DbtError(f"Model {name!r} is described in multiple YAML files; resolve the ambiguity first.")
         return matches[0] if matches else (None, {})
 
-    def to_dbt(self, sql: str) -> str:
+    def render_query(self, jinja: str, *, database: str) -> str:
+        """Resolve supported Jinja to one native query without executing it."""
+        sql = self._simple_import(jinja, {}, database=database)
+        self._query_tokens(sql)
+        return sql
+
+    def query_views(self, document: str, *, database: str, schema: str = "") -> tuple[str, str]:
+        """Return (native SQL, dbt Jinja) for pasted text without reading model SQL files."""
+        if _JINJA_OPEN.search(document):
+            if not has_query_jinja(document, dialect=self.dialect):
+                raise DbtError("Jinja markers only inside SQL comments or quoted text are ambiguous; escape literal markers before toggling.")
+            return self.render_query(document, database=database), document
+        jinja = self.to_dbt(document, database=database, schema=schema)
+        if jinja != document:
+            # A unique mapping by physical name may still emit a call shared by two relations.
+            self._simple_import(jinja, {}, database=database)
+        return document, jinja
+
+    def _query_tokens(self, sql: str) -> tuple[Token, ...]:
         try:
             tokens = tuple(token for token in lex_sql(sql, dialect=self.dialect)
                            if token.kind not in {"whitespace", "comment"})
@@ -371,8 +423,12 @@ class DbtProject:
         except SqlError as exc:
             raise DbtError(str(exc)) from exc
         if len(statements) != 1 or not tokens or tokens[0].text.upper() not in {"SELECT", "WITH", "VALUES", "TABLE"}:
-            raise DbtError("Export one native SELECT/WITH/VALUES/TABLE query, not a script or DDL statement.")
-        if any(marker in sql for marker in ("{{", "{%", "{#")):
+            raise DbtError("Use one native SELECT/WITH/VALUES/TABLE query, not a script or DDL statement.")
+        return tokens
+
+    def to_dbt(self, sql: str, *, database: str = "", schema: str = "") -> str:
+        tokens = self._query_tokens(sql)
+        if _JINJA_OPEN.search(sql):
             raise DbtError("Export expects native SQL, not existing Jinja. Import the model first.")
         ctes = _cte_ranges(tokens, self.dialect)
         replacements = []
@@ -383,6 +439,13 @@ class DbtProject:
                 index == 0 or tokens[index - 1].text.upper() in {"(", "UNION", "INTERSECT", "EXCEPT", "ALL"}
             ):
                 sites.add(index + 1)
+
+        def in_database(parts: tuple[str, ...]) -> tuple[str, ...]:
+            # PostgreSQL's schema.table and current_database.schema.table are the same relation.
+            if self.dialect == "postgres" and database and len(parts) == 2:
+                return (database, *parts)
+            return parts
+
         for start in sorted(sites):
             end = _relation_end(tokens, start)
             if end < len(tokens) and tokens[end].text == "(":
@@ -393,8 +456,13 @@ class DbtProject:
                 continue
             if len(parts) == 1 and any(name == parts[0] and low <= start < high for name, low, high in ctes):
                 continue
+            if self.dialect == "postgres" and len(parts) == 1 and schema:
+                parts = (schema, *parts)
+            parts = in_database(parts)
+            if self.dialect == "postgres" and database and len(parts) == 3 and parts[0] != database:
+                raise DbtError(f"{raw!r} belongs to another database; choose this project's PostgreSQL target.")
             matches = [item for item in self.relations
-                       if relation_parts(item.relation, dialect=self.dialect) == parts]
+                       if in_database(relation_parts(item.relation, dialect=self.dialect) or ()) == parts]
             expressions = {item.expression() for item in matches}
             if len(expressions) != 1:
                 reason = "Ambiguous" if expressions else "No authoritative"
@@ -407,7 +475,7 @@ class DbtProject:
             sql = sql[:start] + replacement + sql[end:]
         return sql
 
-    def _resolve(self, kind: str, args: list, kwargs: dict) -> str:
+    def _resolve(self, kind: str, args: list, kwargs: dict, *, database: str = "") -> str:
         if kind == "source":
             if len(args) != 2 or kwargs or not all(isinstance(arg, str) for arg in args):
                 raise DbtError("source() requires two literal names.")
@@ -423,7 +491,12 @@ class DbtProject:
         values = {item.relation for item in matches}
         if len(values) != 1:
             raise DbtError(f"Cannot resolve {kind}{tuple(args)!r} unambiguously. Supply a current manifest with relation_name, or an actual compiled artifact.")
-        return values.pop()
+        relation = values.pop()
+        if self.dialect == "postgres" and database:
+            parts = relation_parts(relation, dialect=self.dialect)
+            if parts is not None and len(parts) == 3 and parts[0] != database:
+                raise DbtError(f"{relation!r} belongs to another database; refresh the project's target manifest.")
+        return relation
 
     def _compiled(self, path: str, raw: str, node: dict | None) -> str | None:
         if node is not None:
@@ -490,17 +563,17 @@ class DbtProject:
                              str(metadata.get("description", node.get("description", "") if node else "")),
                              config, used_compiled)
 
-    def _simple_import(self, raw: str, config: dict) -> str:
-        if "{%" in raw or "{#" in raw or "{{-" in raw or "-}}" in raw:
-            raise DbtError("Jinja blocks, comments and whitespace controls require compiled SQL.")
-        pattern = re.compile(r"{{(.*?)}}", re.DOTALL)
-        matches = list(pattern.finditer(raw))
-        if "{{" in pattern.sub("", raw) or "}}" in pattern.sub("", raw):
-            raise DbtError("Unbalanced Jinja expression; compile the model outside PGTUI.")
+    def _simple_import(self, raw: str, config: dict, *, database: str = "") -> str:
         result = []
         offset = 0
-        for match in matches:
-            kind, args, kwargs = _call(match.group(1))
+        while match := _JINJA_OPEN.search(raw, offset):
+            start = match.end()
+            if match[0] != "{{" or raw.startswith("-", start):
+                raise DbtError("Jinja blocks, comments and whitespace controls require compiled SQL.")
+            end = _expression_end(raw, start)
+            if raw[end - 1] == "-":
+                raise DbtError("Jinja whitespace controls require compiled SQL.")
+            kind, args, kwargs = _call(raw[start:end])
             if kind == "config":
                 if args:
                     if len(args) != 1 or not isinstance(args[0], dict) or kwargs:
@@ -511,9 +584,9 @@ class DbtProject:
                 config.update(kwargs)
                 replacement = ""
             else:
-                replacement = self._resolve(kind, args, kwargs)
+                replacement = self._resolve(kind, args, kwargs, database=database)
             result.extend((raw[offset:match.start()], replacement))
-            offset = match.end()
+            offset = end + 2
         result.append(raw[offset:])
         return "".join(result)
 

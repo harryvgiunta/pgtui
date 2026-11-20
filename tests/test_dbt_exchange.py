@@ -82,6 +82,94 @@ def test_manifest_alias_package_and_version_are_authoritative(tmp_path):
         DbtProject(root).to_dbt("SELECT * FROM custom.alias")
 
 
+def test_query_conversion_resolves_active_database_and_preserves_cte_scope(tmp_path):
+    root = project(tmp_path)
+    source(root)
+    manifest(root, {
+        "local": node("recent", '"warehouse"."analytics"."orders"'),
+        "other": node("remote", '"other_db"."analytics"."orders"'),
+    })
+    dbt = DbtProject(root)
+    sql = "WITH orders AS (SELECT * FROM orders) SELECT * FROM orders JOIN analytics.orders ON true"
+    _, jinja = dbt.query_views(sql, database="warehouse", schema="raw")
+    assert jinja == (
+        "WITH orders AS (SELECT * FROM {{ source('landing', 'orders') }}) "
+        "SELECT * FROM orders JOIN {{ ref('demo', 'recent') }} ON true"
+    )
+    native, _ = dbt.query_views(jinja, database="warehouse", schema="raw")
+    assert native == (
+        'WITH orders AS (SELECT * FROM "raw"."orders") '
+        'SELECT * FROM orders JOIN "warehouse"."analytics"."orders" ON true'
+    )
+    with pytest.raises(DbtError, match="another database"):
+        dbt.query_views("select * from {{ ref('remote') }}", database="warehouse", schema="raw")
+
+
+def test_query_conversion_leaves_sql_json_and_literal_config_intact(tmp_path):
+    root = project(tmp_path)
+    source(root)
+    dbt = DbtProject(root)
+    sql = """\nSELECT '{"nested": {"value": 1}}' FROM raw.orders -- keep }}\n"""
+    call = "{{ source('landing', 'orders') }}"
+    _, jinja = dbt.query_views(sql, database="warehouse")
+    assert jinja == sql.replace("raw.orders", call)
+    model = "{{ config(meta={'nested': {'marker': '}}'}}) }}" + jinja
+    assert dbt.query_views(model, database="warehouse") == (jinja.replace(call, '"raw"."orders"'), model)
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT '{{ config() }}' FROM raw.orders",
+    "SELECT $tag${% text$tag$ FROM raw.orders",
+    "-- {{ ref('example') }}\nSELECT * FROM raw.orders",
+])
+def test_query_conversion_refuses_ambiguous_quoted_template_markers(tmp_path, sql):
+    root = project(tmp_path)
+    source(root)
+    with pytest.raises(DbtError, match="ambiguous"):
+        DbtProject(root).query_views(sql, database="warehouse")
+
+
+def test_query_conversion_refuses_source_call_shared_by_multiple_relations(tmp_path):
+    root = project(tmp_path)
+    manifest(root, {}, {
+        "source.demo.landing.orders": node("orders", "raw.orders", source_name="landing", resource_type="source"),
+        "source.pkg.landing.orders": node("orders", "other.orders", source_name="landing", resource_type="source", package_name="pkg"),
+    })
+    with pytest.raises(DbtError, match="unambiguously"):
+        DbtProject(root).query_views("SELECT * FROM raw.orders", database="warehouse")
+
+
+def test_editor_toggle_preserves_crlf_and_is_undoable(tmp_path):
+    from d8r.engine import DataSource
+    from d8r.tui.app import D8RApp
+    from d8r.tui.session import Session
+
+    root = project(tmp_path)
+    source(root)
+    sql = 'SELECT * FROM raw -- keep\r\n  .orders AS "o";\r\n'
+    target = DataSource("offline", "PostgreSQL", "", "disconnected", "postgres")
+
+    async def scenario():
+        app = D8RApp(Session({target.id: target}, data_dir=tmp_path / "state"))
+        async with app.run_test(size=(140, 50)) as pilot:
+            assert app.set_dbt_project_dir(str(root))
+            app.editor.load_text(sql)
+            await pilot.click("#dbt-toggle")
+            jinja = app.editor.text
+            assert "{{ source('landing', 'orders') }} -- keep\r\n" in jinja
+            assert jinja.endswith(' AS "o";\r\n')
+            app.editor.action_undo()
+            assert app.editor.text == sql
+            await pilot.pause(0.25)  # Textual briefly debounces a pressed button.
+            await pilot.click("#dbt-toggle")
+            assert app.editor.text == jinja
+            await pilot.pause(0.25)
+            await pilot.click("#dbt-toggle")
+            assert app.editor.text == sql
+
+    asyncio.run(scenario())
+
+
 def test_missing_or_ambiguous_mapping_never_guesses(tmp_path):
     root = project(tmp_path)
     manifest(root, {"one": node("one"), "two": node("two")})
@@ -304,8 +392,8 @@ def test_multiple_model_metadata_entries_refused(tmp_path):
         DbtProject(root).export_model("select 2", "current", overwrite=True)
 
 
-def test_modal_import_is_manual_undoable_and_cancel_preserves_editor(tmp_path, parquet_source):
-    from textual.widgets import Button, Input, Select
+def test_modal_saves_project_home_without_editing_query(tmp_path, parquet_source):
+    from textual.widgets import Button, Input
     from d8r.tui.app import D8RApp
     from d8r.tui.dbt import DBTScreen
     from d8r.tui.session import Session
@@ -321,31 +409,20 @@ def test_modal_import_is_manual_undoable_and_cancel_preserves_editor(tmp_path, p
             screen.query_one("#dbt-project-dir", Input).value = str(root)
             screen.query_one("#dbt-open", Button).press()
             await pilot.pause()
-            screen.query_one("#dbt-model", Select).value = "models/simple.sql"
-            screen.query_one("#dbt-load", Button).press()
+            screen.action_cancel()
             await pilot.pause()
             assert app.editor.text == "select 1"
-            screen.query_one("#dbt-apply", Button).press()
-            await pilot.pause()
-            assert app.editor.text == "select 42 AS answer"
-            app.editor.action_undo()
-            assert app.editor.text == "select 1"
-            cancel = DBTScreen(app)
-            app.push_screen(cancel)
-            await pilot.pause()
-            cancel.action_cancel()
-            await pilot.pause()
-            assert app.editor.text == "select 1"
+        restored = Session({parquet_source.id: parquet_source}, data_dir=tmp_path / "state")
+        assert restored.dbt_project_dir == str(root.resolve())
     asyncio.run(scenario())
 
 
-def test_modal_refuses_changed_editor(tmp_path, parquet_source):
-    from textual.widgets import Button, Input, Select
+def test_modal_refuses_export_after_editor_changes(tmp_path, parquet_source):
+    from textual.widgets import Button, Input
     from d8r.tui.app import D8RApp
     from d8r.tui.dbt import DBTScreen
     from d8r.tui.session import Session
     root = project(tmp_path)
-    put(root, "models/simple.sql", "select 42")
     async def scenario():
         app = D8RApp(Session({parquet_source.id: parquet_source}, data_dir=tmp_path / "state"))
         async with app.run_test(size=(140, 55)) as pilot:
@@ -356,14 +433,12 @@ def test_modal_refuses_changed_editor(tmp_path, parquet_source):
             screen.query_one("#dbt-project-dir", Input).value = str(root)
             screen.query_one("#dbt-open", Button).press()
             await pilot.pause()
-            screen.query_one("#dbt-model", Select).value = "models/simple.sql"
-            screen.query_one("#dbt-load", Button).press()
-            await pilot.pause()
+            screen.query_one("#dbt-name", Input).value = "stale"
             app.editor.load_text("select 9")
-            screen.query_one("#dbt-apply", Button).press()
+            screen.query_one("#dbt-export", Button).press()
             await pilot.pause()
             assert app.editor.text == "select 9"
-            assert app.screen is screen
+            assert not (root / "models" / "stale.sql").exists()
     asyncio.run(scenario())
 
 

@@ -23,6 +23,7 @@ from uuid import UUID, uuid4
 from d8r.ai.client import AIConfig
 from d8r.completion.context import analyze
 from d8r.credentials import CredentialError
+from d8r.dbt import DbtError, DbtProject, has_query_jinja
 
 from d8r.engine import (
     DataSource, EngineError, add_d1_source, add_parquet_source, add_postgres_source,
@@ -357,6 +358,11 @@ class Session:
         return self._settings.document["entry_screen"]
 
     @property
+    def completion_keys(self) -> dict[str, str]:
+        """The effective IntelliSense shortcuts, independent of the workspace."""
+        return dict(self._settings.document["completion_keys"])
+
+    @property
     def theme(self) -> str:
         """The saved application palette, independent of the current workspace."""
         return self._settings.document["theme"]
@@ -434,6 +440,7 @@ class Session:
 
     def update_settings(
         self, *, intellisense: bool | None = None,
+        completion_keys: dict[str, str] | None = None,
         panes: dict[str, bool] | None = None, source: str | None = None,
         dialect: str | None = None, ai: AIConfig | None = None,
         default_rows: int | None = None, ai_auto_accept: bool | None = None,
@@ -457,6 +464,8 @@ class Session:
         document = deepcopy(self._settings.document)
         if intellisense is not None:
             document["intellisense"] = intellisense
+        if completion_keys is not None:
+            document["completion_keys"] = completion_keys
         if entry_screen is not None:
             document["entry_screen"] = entry_screen
         if theme is not None:
@@ -519,17 +528,18 @@ class Session:
         if default_rows is not None:
             self.default_rows = default_rows
 
-    def save_workspace(self, **changes) -> None:
+    def save_workspace(self, *, dbt_views: dict[str, str] | None = None, **changes) -> None:
         """Merge owned fields under one lock; failures preserve the live draft."""
         with self._workspace_lock:
             document = {**self.workspace, **deepcopy(changes)}
             if document["document"] is not None:
                 page = next((page for page in document["pages"]
                              if page["id"] == document["document_id"]), None)
-                snapshot = {"id": document["document_id"], "title": page["title"] if page else "",
-                            "description": page.get("description", "") if page else "",
+                snapshot = {"title": "", "description": "", **(page or {}), "id": document["document_id"],
                             **{key: deepcopy(document[key]) for key in
                                ("document", "cursor", "source", "dialect")}}
+                if dbt_views is not None:
+                    snapshot["dbt_views"] = dict(dbt_views)
                 document["pages"] = [snapshot if item["id"] == snapshot["id"] else item
                                      for item in document["pages"]]
                 if page is None:
@@ -1163,9 +1173,10 @@ class Session:
 
     def run_all(self, doc: str, record: bool = True, *, paged_read: bool | None = None,
                 cancel_event: Event | None = None) -> list[RunOutcome]:
-        """Execute native statements in order, stopping at the first server error.
+        """Execute statements in order, stopping at the first server error.
 
-        Lexical/expansion errors prevent all execution. Native SQL transaction
+        PostgreSQL dbt Jinja is rendered offline before parsing. Conversion,
+        lexical and expansion errors prevent execution. Native SQL transaction
         boundaries are exactly those authored; successful earlier statements are
         not silently rolled back when a later statement fails.
 
@@ -1174,7 +1185,20 @@ class Session:
         A per-submission event stops queued statements; native interruption of
         the in-flight statement is separate and does not release ownership.
         """
-        document = self.parse(doc)
+        source = self.source
+        is_dbt = source.dialect == "postgres" and has_query_jinja(doc)
+        native = doc
+        if is_dbt:
+            try:
+                directory = self.dbt_project_dir
+                if not directory:
+                    raise DbtError("Set a project home in Settings → DBT before running dbt Jinja.")
+                target = source.postgres or self.saved_source_profile(source.id) or {}
+                native = DbtProject(directory).render_query(doc, database=target.get("database", ""))
+            except (DbtError, OSError) as exc:
+                message = str(exc)
+                return [RunOutcome(status=f"not executed · {message}", error=message, doc=doc)]
+        document = self.parse(native)
         if document.errors:
             first = document.errors[0]
             message = f"line {first.line}: {first.message}"
@@ -1188,9 +1212,9 @@ class Session:
         if not self.source_connected():
             message = "The saved target is disconnected. Reconnect it or explicitly select another source before running."
             return [RunOutcome(status=message, error=message, doc=doc)]
-        authored = split_statements(doc, dialect=self.source.dialect)
+        # A rendered dbt query is one statement. History keeps its authored form.
+        authored = (doc,) if is_dbt else split_statements(doc, dialect=source.dialect)
         outcomes = []
-        source = self.source
         for sql, text in zip(document.statements, authored):
             if cancel_event is not None and cancel_event.is_set():
                 message = "Run cancelled; remaining statements were not executed"

@@ -166,7 +166,7 @@ class QueryTextArea(DraftTextArea):
 
     def on_key(self, event: events.Key) -> None:
         # Restoration, caret movement and provider publication never count as typing.
-        if event.is_printable or event.key in {"backspace", "delete", "ctrl+v", "ctrl+x"}:
+        if event.is_printable or event.key in {"enter", "backspace", "delete", "ctrl+v", "ctrl+x"}:
             self.user_edit_serial += 1
 
     def on_paste(self, event: events.Paste) -> None:

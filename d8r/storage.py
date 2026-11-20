@@ -18,6 +18,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from d8r.ai.client import AIConfig
 from d8r.credentials import CredentialError, CredentialVault
+from d8r.keybindings import completion_keymap
 from d8r.themes import DEFAULT_THEME, THEMES
 
 # How long a lock or temp file may exist before it is assumed to belong to a
@@ -143,6 +144,7 @@ def _settings(value: object) -> dict:
     """Validate editable settings and fill omitted keys without retaining aliases."""
     defaults = {
         "version": 3, "intellisense": True,
+        "completion_keys": {},
         "entry_screen": False,
         "theme": DEFAULT_THEME,
         "panes": {"results": True, "sql": True, "history": True, "schema": True, "ai": False},
@@ -167,6 +169,7 @@ def _settings(value: object) -> dict:
         raise ValueError("unsupported settings version (expected 3)")
     if type(document["intellisense"]) is not bool:
         raise ValueError("intellisense must be a boolean")
+    document["completion_keys"] = completion_keymap(document["completion_keys"])
     if type(document["entry_screen"]) is not bool:
         raise ValueError("entry_screen must be a boolean")
     if not isinstance(document["theme"], str) or document["theme"] not in THEMES:
@@ -759,7 +762,13 @@ def _workspace_document(value: object) -> dict:
     for page in document["pages"]:
         if isinstance(page, dict):
             page.setdefault("description", "")
-        _record(page, {"id", "title", "description", "document", "cursor", "source", "dialect"}, "query page")
+        fields = {"id", "title", "description", "document", "cursor", "source", "dialect"}
+        if isinstance(page, dict) and "dbt_views" in page:
+            fields.add("dbt_views")
+            views = _record(page["dbt_views"], {"project_dir", "sql", "jinja"}, "query page dbt views")
+            for name, text in views.items():
+                _text(text, f"query page dbt {name}", nonempty=name == "project_dir")
+        _record(page, fields, "query page")
         for name in ("id", "title", "description", "document", "source", "dialect"):
             _text(page[name], f"query page {name}", nonempty=name == "id")
         if page["id"] in page_ids:

@@ -6,7 +6,7 @@ from dataclasses import replace
 from functools import wraps
 
 import pytest
-from textual.widgets import Input, Static, Tree
+from textual.widgets import Input, OptionList, Static, Tree
 
 from d8r.ai import sql_completion
 from d8r.ai.client import AIConfig
@@ -166,6 +166,53 @@ async def test_escape_mutes_history_and_queued_sync_together(parquet_source):
         assert any(entry.replace_document for entry in app.palette.view.entries)
 
 
+@pytest.mark.parametrize("action,delta", [("completion_accept", 0), ("completion_previous", -1), ("completion_next", 1)])
+@async_test
+async def test_space_binding_only_handles_visible_suggestions(parquet_source, action, delta):
+    from d8r.tui.settings import SettingsScreen
+
+    app = D8RApp(configured(parquet_source))
+    async with app.run_test(size=(140, 45)) as pilot:
+        await pilot.press("ctrl+comma", "end", "right")
+        settings = app.screen
+        assert isinstance(settings, SettingsScreen) and settings.menu == "keys"
+        menu = settings.query_one("#settings-menu", OptionList)
+        menu.highlighted = next(i for i, row in enumerate(settings.rows) if row.value == action)
+        await pilot.press("enter", "space", "enter")
+        assert app.screen is settings  # Saved, rather than rejecting the recorded Space.
+        await pilot.press("escape", "escape")
+
+        await load_editor(app, pilot, "-- ordinary text", (0, len("-- ordinary text")))
+        assert not app.palette.is_open
+        await pilot.press("space")
+        assert app.editor.text == "-- ordinary text "
+
+        first_line = "SELECT c FROM data c"
+        document = first_line + "\n" + "\n".join("-- remaining document" for _ in range(50))
+        caret = (0, len("SELECT c"))
+        await load_editor(app, pilot, document, caret)
+        await pilot.press("ctrl+space")
+        palette = app.palette
+        assert palette.suggestions_visible and palette.option_count > 1
+        if not delta:
+            palette.highlighted = next(i for i, entry in enumerate(palette.view.entries) if entry.insert == "c.label")
+        highlighted = palette.highlighted
+        await pilot.press("space")
+        if delta:
+            assert palette.highlighted == (highlighted + delta) % palette.option_count
+            assert app.editor.text == document and app.editor.cursor_location == caret
+        else:
+            assert app.editor.text == document.replace(first_line, "SELECT c.label FROM data c", 1)
+
+        await load_editor(app, pilot, document, caret)
+        await pilot.press("ctrl+space")
+        app.editor.scroll_to(y=30, animate=False)
+        await pilot.pause()
+        assert palette.is_open and not palette.suggestions_visible
+        await pilot.press("space")
+        assert app.editor.text == document[:caret[1]] + " " + document[caret[1]:]
+
+
 @pytest.mark.parametrize("source_fixture,table", [("parquet_source", "data"), ("d1_source", "records")])
 @async_test
 async def test_quality_function_table_then_column_completion(request, source_fixture, table):
@@ -289,8 +336,9 @@ async def test_automatic_ai_only_after_real_typing_idle(parquet_source, monkeypa
         assert len(requests) == 2
 
 
-@pytest.mark.parametrize("change", ["escape", "escape-roundtrip", "text", "caret", "source", "schema", "functions",
-                                    "provider", "provider-roundtrip", "headers", "page", "mode", "off", "automatic-off", "blur"])
+@pytest.mark.parametrize("change", ["escape", "escape-roundtrip", "escape-after-rebind", "text", "caret",
+                                    "source", "schema", "functions", "provider", "provider-roundtrip", "headers",
+                                    "page", "mode", "off", "automatic-off", "blur"])
 @async_test
 async def test_late_ai_response_is_never_published(parquet_source, monkeypatch, change):
     started, release, completed = asyncio.Event(), asyncio.Event(), asyncio.Event()
@@ -306,13 +354,14 @@ async def test_late_ai_response_is_never_published(parquet_source, monkeypatch, 
         return (AICompletion("label", "obsolete provider response"),)
 
     monkeypatch.setattr(sql_completion, "complete_sql", provider)
-    session = configured(parquet_source, ai_completion=change == "automatic-off")
+    keys = {"completion_toggle": "f2"} if change == "escape-after-rebind" else {}
+    session = configured(parquet_source, ai_completion=change == "automatic-off", completion_keys=keys)
     app = D8RApp(session)
     async with app.run_test(size=(140, 45)) as pilot:
         await load_editor(app, pilot, "SELECT la FROM data", (0, 9))
         await pilot.press("ctrl+shift+space")
         await asyncio.wait_for(started.wait(), 2)
-        if change in {"escape", "escape-roundtrip"}:
+        if change in {"escape", "escape-roundtrip", "escape-after-rebind"}:
             await pilot.press("escape")
             if change == "escape-roundtrip":
                 await pilot.press("escape")
@@ -353,6 +402,9 @@ async def test_late_ai_response_is_never_published(parquet_source, monkeypatch, 
         assert app.palette.view is None or app.palette.view.phase != "ai"
         assert "obsolete provider response" not in app.palette._detail_content().plain
         assert not session.history
+        if change == "escape-after-rebind":
+            await pilot.press("ctrl+space")
+            assert app.palette.is_open  # Cancelling an AI request no longer mutes SQL suggestions.
 
 
 @async_test

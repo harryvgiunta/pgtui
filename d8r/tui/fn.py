@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 
 NEW = "＋ New function…"
 
-HINT = "select a function · ctrl+r preview · F8 cancel · ctrl+f find · ctrl+d delete · ctrl+space complete · F4 AI complete · escape / ctrl+q back"
+HINT = "select a function · ctrl+r preview · F8 cancel · ctrl+f find · ctrl+d delete · ctrl+space complete · F4 AI complete · ctrl+q back"
 
 PARAMETER_GUIDE = """1. Declare ordered parameters
 min_id, source:relation, field:identifier
@@ -254,7 +254,8 @@ class FunctionPicker(ModalScreen[FnDef | None]):
 class FnEditor(Vertical):
     """A persistent function draft in the workspace's middle editor slot."""
 
-    BINDINGS = [Binding("escape", "back", "Back to query", show=False, priority=True)]
+    # In the SQL body, completion has priority over the form's Back action.
+    BINDINGS = [Binding("escape", "back", "Back to query", show=False)]
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if action == "back" and self.query_one(QueryFoldView).has_focus_within:
