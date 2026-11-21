@@ -1,4 +1,4 @@
-"""Offline dbt conversion and file exchange; never invokes a dbt runtime.
+"""Offline dbt SQL conversion; never invokes a dbt runtime.
 
 Only literal ref/source/config calls are interpreted. Relation names come from
 manifest artifacts or literal source YAML, never profiles or schema guesses.
@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
-from copy import deepcopy
 import json
+import ntpath
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -66,7 +66,7 @@ _UniqueLoader.add_constructor("tag:yaml.org,2002:map", _mapping)
 def _yaml(text: str, path: Path) -> dict:
     try:
         value = yaml.load(text, Loader=_UniqueLoader)
-    except yaml.YAMLError as exc:
+    except (yaml.YAMLError, RecursionError) as exc:
         raise DbtError(f"Invalid YAML in {path.name}: {exc}") from exc
     if not isinstance(value, dict):
         raise DbtError(f"{path.name} must contain a YAML mapping.")
@@ -86,7 +86,10 @@ def _linked(path: Path) -> bool:
 def _safe_root(value: str | Path) -> Path:
     if not str(value).strip():
         raise DbtError("Choose a local project directory containing dbt_project.yml.")
-    original = Path(value).expanduser()
+    try:
+        original = Path(value).expanduser()
+    except RuntimeError as exc:
+        raise DbtError("Choose an existing local project directory.") from exc
     if ".." in original.parts:
         raise DbtError("Project paths cannot contain '..' traversal.")
     root = original.absolute()
@@ -94,7 +97,7 @@ def _safe_root(value: str | Path) -> Path:
         raise DbtError("Symlink/junction project paths are refused; choose the real directory.")
     if not root.is_dir():
         raise DbtError(f"Project directory does not exist: {root}")
-    return root
+    return root.resolve()
 
 
 def _relative(value: str) -> Path:
@@ -103,6 +106,8 @@ def _relative(value: str) -> Path:
     path = PurePosixPath(value)
     if path.is_absolute() or ".." in path.parts:
         raise DbtError(f"Absolute paths and '..' traversal are refused: {value}")
+    if any(ntpath.isreserved(part) for part in path.parts):
+        raise DbtError("Project paths cannot contain reserved names or control characters.")
     if any(part.lower() in {"profiles.yml", "profiles.yaml"} for part in path.parts):
         raise DbtError("Credential profiles are outside dbt exchange and are never accessed.")
     return Path(*path.parts)
@@ -116,13 +121,6 @@ class ImportedModel:
     description: str
     config: dict[str, Any]
     used_compiled: bool = False
-
-
-@dataclass(frozen=True)
-class ExportedModel:
-    sql_path: Path
-    yaml_path: Path
-    sql: str
 
 
 @dataclass(frozen=True)
@@ -404,16 +402,20 @@ class DbtProject:
         return sql
 
     def query_views(self, document: str, *, database: str, schema: str = "") -> tuple[str, str]:
-        """Return (native SQL, dbt Jinja) for pasted text without reading model SQL files."""
+        """Render to SQL first, then normalize every convertible relation for dbt."""
         if _JINJA_OPEN.search(document):
             if not has_query_jinja(document, dialect=self.dialect):
                 raise DbtError("Jinja markers only inside SQL comments or quoted text are ambiguous; escape literal markers before toggling.")
-            return self.render_query(document, database=database), document
-        jinja = self.to_dbt(document, database=database, schema=schema)
-        if jinja != document:
-            # A unique mapping by physical name may still emit a call shared by two relations.
-            self._simple_import(jinja, {}, database=database)
-        return document, jinja
+            templates = []
+            sql = self._simple_import(document, {}, database=database, templates=templates)
+            jinja = self._convert_to_dbt(sql, database, schema, templates)
+        else:
+            sql = document
+            jinja = self.to_dbt(sql, database=database, schema=schema)
+        if jinja != sql:
+            # A unique physical mapping may still emit a call shared by two relations.
+            self.render_query(jinja, database=database)
+        return sql, jinja
 
     def _query_tokens(self, sql: str) -> tuple[Token, ...]:
         try:
@@ -427,12 +429,17 @@ class DbtProject:
         return tokens
 
     def to_dbt(self, sql: str, *, database: str = "", schema: str = "") -> str:
+        return self._convert_to_dbt(sql, database, schema, [])
+
+    def _convert_to_dbt(self, sql: str, database: str, schema: str,
+                        templates: list[tuple[int, int, str]]) -> str:
         tokens = self._query_tokens(sql)
         if _JINJA_OPEN.search(sql):
-            raise DbtError("Export expects native SQL, not existing Jinja. Import the model first.")
+            raise DbtError("Cannot normalize template markers inside native SQL. Use literal dbt calls or remove the markers.")
         ctes = _cte_ranges(tokens, self.dialect)
         replacements = []
         sites = set(_relation_sites(tokens))
+        authored = {(start, end): template for start, end, template in templates if start != end}
         # PostgreSQL/DuckDB TABLE query shorthand has no FROM keyword.
         for index, token in enumerate(tokens[:-1]):
             if token.kind == "word" and token.text.upper() == "TABLE" and (
@@ -454,6 +461,8 @@ class DbtProject:
             parts = relation_parts(raw, dialect=self.dialect)
             if parts is None:
                 continue
+            if (tokens[start].start, tokens[end - 1].end) in authored:
+                continue  # Keep the user's exact package/version and call spelling.
             if len(parts) == 1 and any(name == parts[0] and low <= start < high for name, low, high in ctes):
                 continue
             if self.dialect == "postgres" and len(parts) == 1 and schema:
@@ -471,9 +480,46 @@ class DbtProject:
             comments = [token.text for token in lex_sql(raw, dialect=self.dialect) if token.kind == "comment"]
             suffix = "".join(" " + comment + ("\n" if comment.startswith("--") else " ") for comment in comments)
             replacements.append((tokens[start].start, tokens[end - 1].end, expressions.pop() + suffix))
-        for start, end, replacement in reversed(replacements):
+        if any(low < end and start < high for start, end, _ in replacements for low, high, _ in templates):
+            raise DbtError("A template overlaps a native relation name; separate them before converting.")
+        if templates:
+            # Several config() calls can share one SQL offset. Keep their authored order.
+            calls: dict[int, list[str]] = {}
+            for start, end, template in templates:
+                if start == end:
+                    calls.setdefault(start, []).append(template)
+                else:
+                    replacements.append((start, end, template))
+            replacements.extend((start, start, "".join(group)) for start, group in calls.items())
+        for start, end, replacement in sorted(replacements, reverse=True):
             sql = sql[:start] + replacement + sql[end:]
         return sql
+
+    def config_calls(self, jinja: str, *, database: str = "") -> tuple[str, ...]:
+        templates = []
+        self._simple_import(jinja, {}, database=database, templates=templates)
+        return tuple(template for start, end, template in templates if start == end)
+
+    def relation_call_at(self, sql: str, offset: int, *, database: str = "", schema: str = "") -> str | None:
+        """Map a native relation click using the same scope and authority as conversion."""
+        tokens = self._query_tokens(sql)
+        ctes = _cte_ranges(tokens, self.dialect)
+        sites = set(_relation_sites(tokens))
+        if tokens[0].text.upper() == "TABLE" and len(tokens) > 1:
+            sites.add(1)
+        for start in sites:
+            end = _relation_end(tokens, start)
+            if not tokens[start].start <= offset < tokens[end - 1].end:
+                continue
+            if end < len(tokens) and tokens[end].text == "(":
+                return None
+            relation = sql[tokens[start].start:tokens[end - 1].end]
+            parts = relation_parts(relation, dialect=self.dialect)
+            if parts and len(parts) == 1 and any(name == parts[0] and low <= start < high for name, low, high in ctes):
+                return None
+            call = self.to_dbt("SELECT * FROM " + relation, database=database, schema=schema).removeprefix("SELECT * FROM ")
+            return call if call.startswith("{{") else None
+        return None
 
     def _resolve(self, kind: str, args: list, kwargs: dict, *, database: str = "") -> str:
         if kind == "source":
@@ -563,9 +609,11 @@ class DbtProject:
                              str(metadata.get("description", node.get("description", "") if node else "")),
                              config, used_compiled)
 
-    def _simple_import(self, raw: str, config: dict, *, database: str = "") -> str:
+    def _simple_import(self, raw: str, config: dict, *, database: str = "",
+                       templates: list[tuple[int, int, str]] | None = None) -> str:
         result = []
         offset = 0
+        rendered_size = 0
         while match := _JINJA_OPEN.search(raw, offset):
             start = match.end()
             if match[0] != "{{" or raw.startswith("-", start):
@@ -585,91 +633,12 @@ class DbtProject:
                 replacement = ""
             else:
                 replacement = self._resolve(kind, args, kwargs, database=database)
+            rendered_size += match.start() - offset
+            if templates is not None:
+                templates.append((rendered_size, rendered_size + len(replacement), raw[match.start():end + 2]))
+            rendered_size += len(replacement)
             result.extend((raw[offset:match.start()], replacement))
             offset = end + 2
         result.append(raw[offset:])
         return "".join(result)
 
-    def export_model(self, sql: str, name: str, materialized: str = "view", description: str = "", *,
-                     overwrite: bool = False, config: dict[str, Any] | None = None) -> ExportedModel:
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
-            raise DbtError("Model name must be one identifier: letters, digits and underscores; no paths.")
-        if materialized not in {"view", "table", "incremental", "ephemeral"}:
-            raise DbtError("Choose view, table, incremental or ephemeral materialization.")
-        matches = [path for path in self.models if Path(path).stem == name]
-        if len(matches) > 1:
-            raise DbtError("Multiple SQL models have this name; choose a unique name.")
-        sql_path = self._path(matches[0]) if matches else self.model_paths[0] / f"{name}.sql"
-        sql_path = self._path(sql_path.relative_to(self.root).as_posix())
-        yaml_path, existing = self._model_metadata(name)
-        if yaml_path is None:
-            yaml_path = sql_path.with_suffix(".yml")
-        yaml_path = self._path(yaml_path.relative_to(self.root).as_posix())
-        if not overwrite and (sql_path.exists() or yaml_path.exists() or existing):
-            raise DbtError("Files or model metadata already exist. Review them and explicitly enable overwrite consent.")
-        data = _yaml(self._read(yaml_path.relative_to(self.root).as_posix()), yaml_path) if yaml_path.exists() else {"version": 2, "models": []}
-        entries = list(self._entries(data, "models"))
-        index = next((index for index, item in enumerate(entries) if item.get("name") == name), None)
-        # Detach YAML aliases so updating this model cannot alter other models.
-        entry = deepcopy(entries[index]) if index is not None else {"name": name}
-        if index is None:
-            entries.append(entry)
-        else:
-            entries[index] = entry
-        entry["description"] = description
-        entry_config = entry.setdefault("config", {})
-        if not isinstance(entry_config, dict):
-            raise DbtError("Existing model config must be a mapping; no files were changed.")
-        if config is not None:
-            if not isinstance(config, dict) or any(not isinstance(key, str) for key in config):
-                raise DbtError("Imported config must be a mapping with string keys.")
-            entry_config.update(deepcopy(config))
-        entry_config["materialized"] = materialized
-        data["models"] = entries
-        converted = self.to_dbt(sql)
-        output = "{{ config(materialized=" + repr(materialized) + ") }}\n" + converted
-        yaml_output = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
-        self._write_pair(sql_path, output, yaml_path, yaml_output, overwrite=overwrite)
-        return ExportedModel(sql_path, yaml_path, output)
-
-    def _write_pair(self, sql_path: Path, sql: str, yaml_path: Path, yaml_text: str, *, overwrite: bool) -> None:
-        """Reserve both destinations before writing; restore originals on I/O failure."""
-        handles = []
-        originals = []
-        try:
-            for path in (sql_path, yaml_path):
-                self._path(path.relative_to(self.root).as_posix())
-                path.parent.mkdir(parents=True, exist_ok=True)
-                exists = path.exists()
-                if exists and not overwrite:
-                    raise DbtError("A destination appeared after preview; explicit overwrite consent is required.")
-                original = path.read_bytes() if exists else None
-                # Exclusive creation closes the normal no-clobber race.
-                handle = path.open("r+b" if exists else "x+b")
-                handles.append((path, handle))
-                originals.append(original)
-            for (_, handle), text in zip(handles, (sql, yaml_text)):
-                handle.seek(0)
-                handle.write(text.encode("utf-8"))
-                handle.truncate()
-                handle.flush()
-        except (OSError, DbtError) as exc:
-            restore_errors = []
-            for (path, handle), original in zip(handles, originals):
-                try:
-                    if original is not None:
-                        handle.seek(0)
-                        handle.write(original)
-                        handle.truncate()
-                        handle.flush()
-                    handle.close()
-                    if original is None:
-                        path.unlink(missing_ok=True)
-                except OSError as restore_error:
-                    restore_errors.append(f"{path.name}: {restore_error}")
-            detail = (" Restoration also failed; inspect files: " + "; ".join(restore_errors)
-                      if restore_errors else " Original file contents retained.")
-            raise DbtError(f"Could not export model: {exc}.{detail}") from exc
-        finally:
-            for _, handle in handles:
-                handle.close()

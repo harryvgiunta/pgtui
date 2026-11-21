@@ -754,7 +754,7 @@ def _workspace_document(value: object) -> dict:
         _text(document[name], f"workspace {name}")
     if document["dialect"] and document["dialect"] not in {"postgres", "duckdb", "sqlite"}:
         raise ValueError("unsupported workspace dialect")
-    if document["explorer_tab"] not in ("schema", "pages", "functions", "agents"):
+    if document["explorer_tab"] not in ("schema", "pages", "functions", "agents", "dbt"):
         raise ValueError("invalid explorer tab")
     if not isinstance(document["pages"], list):
         raise ValueError("invalid query pages")
@@ -768,6 +768,13 @@ def _workspace_document(value: object) -> dict:
             views = _record(page["dbt_views"], {"project_dir", "sql", "jinja"}, "query page dbt views")
             for name, text in views.items():
                 _text(text, f"query page dbt {name}", nonempty=name == "project_dir")
+        if isinstance(page, dict) and "dbt_file" in page:
+            fields.add("dbt_file")
+            link = _record(page["dbt_file"], {"project_dir", "path", "revision"}, "dbt file page")
+            for field, text in link.items():
+                _text(text, f"dbt file {field}", nonempty=field != "revision")
+            if link["revision"] and not re.fullmatch(r"[0-9a-f]{64}", link["revision"]):
+                raise ValueError("invalid dbt file baseline")
         _record(page, fields, "query page")
         for name in ("id", "title", "description", "document", "source", "dialect"):
             _text(page[name], f"query page {name}", nonempty=name == "id")

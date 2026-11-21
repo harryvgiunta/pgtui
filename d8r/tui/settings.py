@@ -182,8 +182,7 @@ class SettingsScreen(ModalScreen[None]):
                       "Completion uses cached metadata only and never queries while typing. "
                       "Values never go to disk and are cleared at exit. Changing these settings clears cached values.",
             "sources": "Connect PostgreSQL, Cloudflare D1 or a local Parquet file. SQL dialect and engine version follow the selected source.",
-            "dbt": "Set the dbt project home for this source. Toggle pasted SQL or dbt Jinja in the query editor. "
-                   "Model file export is optional.",
+            "dbt": "Open the directory that contains dbt_project.yml. Its files, history and skills live in the dbt explorer.",
             "ai": "Provider forms require Save & use to activate changes. Permission toggles save immediately. Schema refreshes control AI metadata lookups, not IDE indexing. "
                   "Test AI Queries checks final drafts and tries up to two SQL repairs. By default the database plans without running. Failed drafts require manual Apply anyway. "
                   "Run read-only test queries opts into bounded execution instead; reads can still be expensive. "
@@ -264,7 +263,7 @@ class SettingsScreen(ModalScreen[None]):
                 for label, source_id in self.session.source_options()
             ]
         if self.menu == "dbt":
-            return [Row("Project home / export", self.session.dbt_project_dir or "not configured", "dbt")]
+            return [Row("Open & Save Project Home", self.session.dbt_project_dir or "not configured", "dbt")]
         if self.menu == "ai":
             config = self.session.ai_config
             return [
@@ -374,7 +373,12 @@ class SettingsScreen(ModalScreen[None]):
             self.app.push_screen(CompletionKeyScreen(self.ide, binding), key_saved)
             return
         elif row.action == "dbt":
-            self.app.push_screen(DBTScreen(self.ide), lambda _: self._draw(event.option_index))
+            def project_opened(path) -> None:
+                self._draw(event.option_index)
+                if path:
+                    self.ide.show_dbt_explorer()
+
+            self.app.push_screen(DBTScreen(self.ide), project_opened)
             return
         elif row.action == "ai":
             self.app.push_screen(

@@ -11,6 +11,7 @@ from time import monotonic
 from collections.abc import Callable
 from copy import deepcopy
 from threading import Event
+from pathlib import Path
 from typing import TypeVar
 from uuid import uuid4
 
@@ -33,20 +34,25 @@ from textual.widgets import (
     TabbedContent,
     TabPane,
     Tabs,
+    Switch,
     TextArea,
     Tree,
 )
 from textual.widgets.option_list import Option
 
 from d8r.ai.context import AIProposal
+from d8r.ai.dbt import DbtAIContext
 from d8r.completion.engine import function_insertion
-from d8r.dbt import DbtError, DbtProject
+from d8r.dbt import DbtError, DbtProject, has_query_jinja
+from d8r.dbt_edits import DbtDraft, add_description
+from d8r.dbt_files import DbtFile, DbtFiles, file_revision, reference_at
 from d8r.engine import POSTGRES_VERSION, DataSource, EngineError
 from d8r.sql import ColumnDef, format_parameters
 from d8r.themes import COZY_PASTEL
 
 from .add_source import AddSourceModal
 from .connection import ConnectionProgress, build_saved_source, saved_source_label
+from .dbt import DbtExplorer, DbtModelScreen, DbtTestScreen
 from .editor_tools import FindBar, format_editor
 from .ai import AIChats, AIPanel, AITarget, ConversationTabs, DeleteOptionList
 from .palette import CommandPalette, EditorPane
@@ -91,6 +97,8 @@ class IdeScreen(Screen):
         """The function form has fields; the query workspace never walks panes."""
         if self.app.function_mode:
             self.focus_next()
+        elif self.focused is self.app.editor and self.app.editor.file_format == "yaml":
+            raise SkipAction()
 
     def action_previous_field(self) -> None:
         if self.app.function_mode:
@@ -235,6 +243,7 @@ class D8RApp(App):
         Binding("ctrl+n", "new_query", "New query", priority=True),
         # The way back into Settings when the Intellisense switch has the
         # palette shut — `\settings` itself needs the popup.
+        Binding("f12", "dbt_definition", "Open dbt definition", show=False),
         Binding("ctrl+comma", "settings", "Settings", priority=True),
     ]
 
@@ -249,6 +258,9 @@ class D8RApp(App):
         self._workspace_key = self.session.source_key()
         document = self.session.workspace.get("document")
         self._initial_document = document or ""
+        self._dbt_file: dict[str, str] | None = None
+        # A loaded page or conversion preview is not itself an edit to a project file.
+        self._dbt_autosave_text = ""
         self._workspace_editor: TextArea | None = None
         self._workspace_timer = None
         self._workspace_edited = 0.0
@@ -312,6 +324,8 @@ class D8RApp(App):
                         yield Static("↑/↓ select · Enter open · Delete remove", id="pages-hint", markup=False)
                     with TabPane("Functions", id="tab-functions"):
                         yield FnExplorer(id="fn-list-pane")
+                    with TabPane("dbt", id="tab-dbt"):
+                        yield DbtExplorer(self, id="dbt-explorer")
             yield PaneSplitter("#explorer-slot", "width", "explorer", min_size=16,
                                min_remaining=30, id="explorer-splitter")
             with Vertical(id="work-bench"):
@@ -333,6 +347,7 @@ class D8RApp(App):
                             yield Button("Show Page Details", id="page-details-toggle", compact=True)
                             yield Button("Reconnect", id="reconnect-source", compact=True)
                         yield PageDetails(self, id="page-details")
+                        yield Static("", id="dbt-file-path", markup=False)
                     with Horizontal(id="editor-tools"):
                         yield Button("Cancel query", id="cancel-query", variant="warning", compact=True,
                                      tooltip=binding_tooltip(self.BINDINGS, "cancel_operation"))
@@ -342,8 +357,12 @@ class D8RApp(App):
                                      tooltip=binding_tooltip(self.BINDINGS, "find_sql"))
                         yield Button("Fold/Expand All", id="query-sections", compact=True,
                                      tooltip=binding_tooltip(self.BINDINGS, "query_sections"))
-                        yield Button("SQL ↔ dbt", id="dbt-toggle", compact=True,
-                                     tooltip="Convert this page between PostgreSQL SQL and dbt Jinja without running it")
+                    with Horizontal(id="dbt-editor-tools"):
+                        yield Button("Git Diff", id="dbt-file-diff", compact=True)
+                        with Horizontal(id="dbt-view-controls"):
+                            yield Static("SQL", classes="dbt-switch-label")
+                            yield Switch(id="dbt-toggle", animate=False, tooltip="Convert the draft without running SQL")
+                            yield Static("dbt", classes="dbt-switch-label")
                     yield FindBar(id="sql-find")
                     with EditorPane(id="editor-pane"):
                         yield QueryTextArea(self._initial_document, dialect=self.session.source.dialect,
@@ -419,6 +438,11 @@ class D8RApp(App):
         self._refresh_history()
         self._workspace_editor = self.editor
         self._workspace_status = self.query_one("#status", Static)
+        page = next((item for item in self.session.workspace["pages"] if item["id"] == self._document_identity), None)
+        if page is not None and "dbt_file" in page:
+            self._load_page_text(page)
+        self.query_one(DbtExplorer).refresh_project()
+        self._sync_dbt_controls()
         self.editor.move_cursor(tuple(self.session.workspace.get("cursor", [0, 0])))
         self._workspace_ready = True
         self.ai_panel.target_changed()
@@ -501,6 +525,7 @@ class D8RApp(App):
                 "cursor": list(self._workspace_editor.cursor_location),
                 "source": self._workspace_key,
                 "dialect": self.session.dialect,
+                "dbt_file": self._dbt_file,
             }
 
     def _queue_workspace_save(self) -> None:
@@ -525,6 +550,9 @@ class D8RApp(App):
             self._workspace_timer.stop()
             self._workspace_timer = None
         self._capture_workspace()
+        if self._dbt_file and self._workspace_snapshot["document"] != self._dbt_autosave_text:
+            self._save_active_dbt_file(self._workspace_snapshot["document"])
+            self._capture_workspace()
         if self._workspace_snapshot:
             pages = self.session.workspace["pages"]
             try:
@@ -563,9 +591,7 @@ class D8RApp(App):
         if page is None:
             page = {"id": str(uuid4()), "document": "", "cursor": [0, 0],
                     "dialect": self.session.dialect}
-        self._document_identity = page["id"]
-        self.editor.load_text(page["document"])
-        self.editor.move_cursor(tuple(page["cursor"]))
+        self._load_page_text(page)
         draft = state.get("function_draft")
         self._function_started = draft is not None
         self.function_editor.restore_workspace(draft)
@@ -574,6 +600,7 @@ class D8RApp(App):
         self._sync_source_select()
         self._refresh_header()
         self._refresh_tree()
+        self.query_one(DbtExplorer).refresh_project()
         self._refresh_history()
         outcome, sql, result_closed = self._workspace_outputs.pop(self._workspace_key, (None, "", False))
         self._render_results(outcome)
@@ -609,10 +636,10 @@ class D8RApp(App):
         search = self.query_one("#page-search", Input).value.casefold().strip()
         pages = [page for page in self.session.workspace["pages"]
                  if page["source"] == self._workspace_key and
-                 (not search or any(search in page.get(field, "").casefold()
-                                    for field in ("title", "description", "document")))]
+                 (not search or any(search in text.casefold() for text in (
+                     page["title"], page.get("description", ""), page["document"], page.get("dbt_file", {}).get("path", ""))))]
         rows = tuple((page["id"], page["title"], page.get("description", ""),
-                      page["document"], page["source"]) for page in pages)
+                      page["document"], page["source"], page.get("dbt_file")) for page in pages)
         # Options wrap by default, so a long title silently becomes a 4-line
         # row; the label is cut to the listing's own content width instead.
         # A hidden tab has no layout of its own: build with a floor and rebuild
@@ -629,10 +656,12 @@ class D8RApp(App):
                           if highlighted is not None and listing.option_count else None)
         listing.clear_options()
         for page in pages:
-            title = page["title"] or next((line.strip() for line in page["document"].splitlines()
-                                            if line.strip()), "Untitled query")
+            link = page.get("dbt_file")
+            title = link["path"] if link else page["title"] or next(
+                (line.strip() for line in page["document"].splitlines() if line.strip()), "Untitled query")
             marker = "• " if page["id"] == self._document_identity else ""
-            listing.add_option(Option(self._page_label(title, page["source"], marker, width), id=page["id"]))
+            label = f"dbt · {Path(link['project_dir']).name}" if link else page["source"]
+            listing.add_option(Option(self._page_label(title, label, marker, width), id=page["id"]))
         if active_changed and any(page["id"] == self._document_identity for page in pages):
             listing.highlighted = listing.get_option_index(self._document_identity)
         elif highlighted_id is not None and any(page["id"] == highlighted_id for page in pages):
@@ -651,6 +680,9 @@ class D8RApp(App):
 
     @on(Button.Pressed, "#page-details-toggle")
     def _toggle_page_details(self) -> None:
+        if self._dbt_file:
+            self._open_dbt_properties()
+            return
         details = self.query_one("#page-details", PageDetails)
         details.display = not details.display
         self.query_one("#page-details-toggle", Button).label = (
@@ -671,6 +703,8 @@ class D8RApp(App):
 
     @on(Button.Pressed, "#page-duplicate")
     def _duplicate_page(self) -> None:
+        if self.editor.file_format != "sql":
+            return
         if self.refuse_busy("Duplicate query page"):
             return
         self._flush_workspace()
@@ -727,7 +761,7 @@ class D8RApp(App):
         )
         self._refresh_pages()
         if saved:
-            self._set_status("Query page deleted · nothing executed")
+            self._set_status("Page removed from Pages · no project files deleted")
         else:
             self._set_status("Query page removed from this session, but deletion was not saved. " + self._autosave_error)
 
@@ -749,7 +783,7 @@ class D8RApp(App):
         self.editor.focus()
         self._flush_workspace()
         if not self._autosave_error:
-            self._set_status("Query page restored · nothing executed")
+            self._set_status("dbt file restored from Pages" if self._dbt_file else "Query page restored · nothing executed")
 
     def _restore_page(self, page: dict) -> None:
         """Swap the stable draft and its offline target without running or connecting."""
@@ -764,9 +798,7 @@ class D8RApp(App):
         if changed_source:
             self._load_source_workspace(page)
         else:
-            self._document_identity = page["id"]
-            self.editor.load_text(page["document"])
-            self.editor.move_cursor(tuple(page["cursor"]))
+            self._load_page_text(page)
         with self.prevent(Select.Changed):
             self.query_one("#source-select", Select).set_options(self._source_options())
         self._sync_source_select()
@@ -774,6 +806,22 @@ class D8RApp(App):
         self._refresh_tree()
         self.palette.close()
         self.ai_panel.target_changed()
+
+    def _load_page_text(self, page: dict) -> None:
+        self._document_identity = page["id"]
+        self._dbt_file = dict(page["dbt_file"]) if "dbt_file" in page else None
+        document = page["document"]
+        if self._dbt_file and self._dbt_file["revision"] == file_revision(document):
+            try:
+                actual = self._read_dbt_page(self._dbt_file)
+            except (DbtError, OSError):
+                pass  # Keep the saved draft when the actual file disappeared or is unavailable.
+            else:
+                document = actual.text
+                self._dbt_file["revision"] = actual.revision
+        self.editor.load_text(document)
+        self._dbt_autosave_text = self.editor.text if self._dbt_file else ""
+        self.editor.move_cursor(tuple(page["cursor"]))
 
     @on(TabbedContent.TabActivated, "#explorer-tabs")
     def _explorer_tab_changed(self, event: TabbedContent.TabActivated) -> None:
@@ -784,6 +832,8 @@ class D8RApp(App):
             if event.pane.id == "tab-pages":
                 # Labels built while the tab was hidden used the floor width.
                 self.call_after_refresh(self._refresh_pages)
+            elif event.pane.id == "tab-dbt":
+                self.query_one(DbtExplorer).refresh_project()
 
     def action_toggle_pages(self) -> None:
         """Reveal Pages from another tab; toggle the explorer if already selected."""
@@ -843,6 +893,11 @@ class D8RApp(App):
     @on(Button.Pressed, "#format-query")
     def action_format_sql(self) -> None:
         editor = self.active_sql_editor()
+        if editor.file_format != "sql":
+            return
+        if self._dbt_home and has_query_jinja(editor.text, dialect=editor.dialect):
+            self._set_status("Switch to SQL before using the SQL formatter on a dbt template")
+            return
         self.query_one(FindBar).close(restore_focus=False)
         editor.parent.query_one(CommandPalette).close()
         try:
@@ -864,15 +919,18 @@ class D8RApp(App):
     def _ai_target(self) -> AITarget:
         if self.function_mode:
             return self.function_editor._ai_target()
+        link = (self._dbt_file["project_dir"], self._dbt_file["path"], self._dbt_file["revision"]) if self._dbt_file else None
         return AITarget(
             (self.session.source_key(), self._document_identity),
-            self.session.active_id, self.editor.text,
+            self.session.active_id, self.editor.text, dbt_file=link,
         )
 
-    def _apply_ai_document(self, proposal: AIProposal) -> None:
+    def _apply_ai_document(self, proposal: AIProposal) -> str | None:
         if self.function_mode:
             self.function_editor._apply_ai_draft(proposal)
-            return
+            return None
+        if proposal.dbt_drafts:
+            return self._apply_dbt_drafts(proposal.dbt_drafts)
         if proposal.function is not None:
             fn = proposal.function
             self.session.save_fn(fn.name, format_parameters(fn), proposal.body, fn.doc)
@@ -920,6 +978,7 @@ class D8RApp(App):
     @on(TextArea.Changed, "#editor")
     def _ai_document_changed(self) -> None:
         if self._workspace_ready and self.is_running and not self._closing:
+            self._sync_dbt_controls()
             self.ai_panel.target_changed()
             self._queue_workspace_save()
 
@@ -940,7 +999,7 @@ class D8RApp(App):
         self.query_one("#refresh-schema", Button).disabled = running
         self.query_one("#reconnect-source", Button).display = not self.session.source_connected()
         source = self.session.source
-        self.query_one("#dbt-toggle", Button).display = source.dialect == "postgres"
+        self._sync_dbt_controls()
         self.editor.dialect = source.dialect
         label = "Cloudflare D1 · SQLite" if source.dialect == "sqlite" else (
             "PostgreSQL" if source.dialect == "postgres" else "DuckDB")
@@ -1185,8 +1244,11 @@ class D8RApp(App):
             self.exit()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        if self.screen_stack and isinstance(self.screen, CompletionKeyScreen):
-            return False  # Record keypresses without invoking application commands.
+        if self.screen_stack and isinstance(self.screen, (CompletionKeyScreen, DbtTestScreen)):
+            return False  # Keep workspace shortcuts out of the modal editor.
+        if action == "dbt_definition":
+            return (self._workspace_ready and not self.function_mode and not self._modal_open()
+                    and self.screen.focused is self.editor and self.editor.dbt_navigation)
         if action == "cancel_operation":
             return (self._connection_progress is not None or self._cancel_run is not None) and not self._modal_open()
         if action in {"find_sql", "format_sql", "query_sections"}:
@@ -1262,9 +1324,13 @@ class D8RApp(App):
             if paged_read is None:
                 self.function_editor.action_preview()
             return
+        if self.editor.file_format != "sql":
+            return
+        dbt_home = self._dbt_home
         document = self.editor.selected_text or self.editor.text
         self.submit_sql(self.session.source, "Query",
-                        lambda source, stop: self.session.run_all(document, paged_read=paged_read, cancel_event=stop),
+                        lambda source, stop: self.session.run_all(document, paged_read=paged_read, cancel_event=stop,
+                                                                  dbt_home=dbt_home),
                         self._publish_run)
 
     def submit_sql(self, source: DataSource, label: str, work: Callable[[DataSource, Event], T],
@@ -1406,6 +1472,8 @@ class D8RApp(App):
         """Expand local functions only; native SQL grammar is checked on Run."""
         if self.function_mode or self._modal_open() or self.ai_panel.has_focus_within:
             return
+        if self.editor.file_format != "sql":
+            return
         if self.refuse_busy("SQL preview"):
             return
         self.palette.close()
@@ -1535,53 +1603,115 @@ class D8RApp(App):
         explorer.show_functions(self.session.functions_for(source_id))
         self.call_after_refresh(explorer.focus_search)
 
-    @on(Button.Pressed, "#dbt-toggle")
-    def action_dbt(self) -> None:
-        """Alternate the current page's text, never run it or write model files."""
-        if not self._workspace_ready or self._modal_open():
-            return
-        if self.function_mode or self.session.dialect != "postgres":
-            self._set_status("SQL ↔ dbt is available on PostgreSQL query pages")
-            return
-        directory = self.session.dbt_project_dir
-        if not directory:
-            self._set_status("Set a project home in Settings → DBT first")
+    @property
+    def _dbt_home(self) -> str:
+        return self._dbt_file["project_dir"] if self._dbt_file else self.session.dbt_project_dir
+
+    def _sync_dbt_controls(self) -> None:
+        link = self._dbt_file
+        suffix = Path(link["path"]).suffix.lower() if link else ".sql"
+        sql = suffix == ".sql"
+        editor = self.editor
+        editor.file_format = "sql" if sql else "yaml" if suffix in {".yaml", ".yml"} else "text"
+        editor.dbt_navigation = bool(self._dbt_home)
+        templated = sql and has_query_jinja(editor.text, dialect=self.session.dialect)
+        dbt_template = editor.dbt_navigation and templated
+        if dbt_template and not editor.dbt_template:
+            self.palette.close()
+        editor.dbt_template = dbt_template
+        file_path = self.query_one("#dbt-file-path", Static)
+        file_path.display = bool(link)
+        if link:
+            modified = file_revision(editor.text) != link["revision"]
+            file_path.update(link["path"] + (" · draft" if modified else " · saved"))
+            file_path.tooltip = str(Path(link["project_dir"]) / link["path"])
+            details = self.query_one("#page-details", PageDetails)
+            details.display = False
+            self.query_one("#page-details-toggle", Button).label = "Show Page Details"
+        for selector in ("#run-query", "#format-query", "#query-sections", "#page-details-toggle"):
+            self.query_one(selector, Button).display = sql
+        self.query_one("#dbt-file-diff", Button).display = bool(link)
+        convert = sql and (bool(self._dbt_home) or self.session.dialect == "postgres")
+        self.query_one("#dbt-view-controls").display = convert
+        self.query_one("#dbt-editor-tools").display = bool(link) or convert
+        switch = self.query_one("#dbt-toggle", Switch)
+        with switch.prevent(Switch.Changed):
+            switch.value = templated
+
+    def _dbt_conversion_target(self) -> dict[str, str]:
+        source = self.session.source
+        target = source.postgres or self.session.saved_source_profile(source.id) or {}
+        return {"database": target.get("database", ""), "schema": source.default_schema or target.get("schema", "")}
+
+    @on(Switch.Changed, "#dbt-toggle")
+    def _dbt_switch_changed(self, event: Switch.Changed) -> None:
+        self.action_dbt(event.value)
+
+    def action_dbt(self, to_dbt: bool | None = None) -> None:
+        """Convert explicitly to SQL or normalized dbt without running or saving it."""
+        if not self._workspace_ready or self._modal_open() or self.function_mode or self.editor.file_format != "sql":
             return
         editor = self.editor
         document = editor.text
-        if not document.strip():
-            self._set_status("Paste a SQL query or a dbt model into the page first")
+        directory = self._dbt_home
+        dialect = self.session.dialect
+        templated = has_query_jinja(document, dialect=dialect)
+        if to_dbt is None:
+            to_dbt = not templated
+        try:
+            if not directory:
+                raise DbtError("Set a project home in Settings → DBT first")
+            if not document.strip():
+                raise DbtError("Open a model or enter a SQL query first")
+            project = DbtProject(directory, dialect=dialect)
+            target = self._dbt_conversion_target()
+            views = self._active_page().get("dbt_views", {})
+            if views.get("project_dir") != directory:
+                views = {}
+            if to_dbt:
+                authored = views["jinja"] if document == views.get("sql") else document
+                sql, jinja = project.query_views(authored, **target)
+                if not templated:
+                    sql = document
+                    if authored == document and views:
+                        configs = project.config_calls(views["jinja"], database=target["database"])
+                        if configs:
+                            jinja = "\n".join((*configs, jinja))
+            else:
+                jinja = document
+                sql = views["sql"] if document == views.get("jinja") else project.render_query(document, database=target["database"])
+            next_view = "jinja" if to_dbt else "sql"
+            replacement = jinja if to_dbt else sql
+            if document == replacement:
+                raise DbtError("No dbt references to convert in this query")
+        except (DbtError, OSError) as exc:
+            self._set_status(str(exc))
+            self._sync_dbt_controls()
             editor.focus()
             return
-        page = next((item for item in self.session.workspace["pages"]
-                     if item["id"] == self._document_identity), {})
-        views = page.get("dbt_views")
-        if views is None or views["project_dir"] != directory or document not in (views["sql"], views["jinja"]):
-            source = self.session.source
-            target = source.postgres or self.session.saved_source_profile(source.id) or {}
+        # Persist prior edits, not the representation change itself. Edits made
+        # in a native preview become writable once they are converted back.
+        edited_sql_view = False
+        if self._dbt_file and to_dbt and not templated and views and document != views["sql"]:
             try:
-                sql, jinja = DbtProject(directory).query_views(
-                    document, database=target.get("database", ""),
-                    schema=source.default_schema or target.get("schema", ""),
-                )
-            except (DbtError, OSError) as exc:
-                self._set_status(str(exc))
-                editor.focus()
-                return
-            if sql == jinja:
-                self._set_status("No dbt references to convert in this query")
-                editor.focus()
-                return
-            views = {"project_dir": directory, "sql": sql, "jinja": jinja}
-        to_sql = document == views["jinja"]
-        next_view = "sql" if to_sql else "jinja"
+                disk = DbtFiles(directory).read(self._dbt_file["path"], missing=True)
+                edited_sql_view = has_query_jinja(disk.text, dialect=dialect) or not disk.revision
+            except (DbtError, OSError):
+                edited_sql_view = True  # Keep the edits; autosave will report the disk error.
+        if not edited_sql_view:
+            self._flush_workspace()
         self.query_one(FindBar).close(restore_focus=False)
-        self._replace_dbt_draft(editor, views[next_view])
+        self._replace_dbt_draft(editor, replacement)
+        if self._dbt_file:
+            self._dbt_autosave_text = document if edited_sql_view else editor.text
+            if edited_sql_view:
+                self._queue_workspace_save()
         editor.focus()
+        self._sync_dbt_controls()
         self._capture_workspace()
-        # TextArea uses the document's newline style for inserted text.
-        if self.save_workspace(dbt_views={**views, next_view: editor.text}, **self._workspace_snapshot):
-            self._set_status("PostgreSQL SQL · nothing executed" if to_sql else "dbt Jinja · Run SQL renders this view")
+        views = {"project_dir": directory, "sql": sql, "jinja": jinja, next_view: editor.text}
+        if self.save_workspace(dbt_views=views, **self._workspace_snapshot):
+            self._set_status("dbt Jinja · nothing executed" if to_dbt else "Native SQL · nothing executed")
 
     def set_dbt_project_dir(self, path: str) -> bool:
         workspaces = deepcopy(self.session.workspace["source_workspaces"])
@@ -1590,6 +1720,284 @@ class D8RApp(App):
         })
         state["dbt_project_dir"] = path
         return self.save_workspace(source_workspaces=workspaces)
+
+    def show_dbt_explorer(self) -> None:
+        if not self.pane_visible("schema") and not self.update_settings(panes={"schema": True}):
+            return
+        self.set_pane("schema", True)
+        self.query_one("#explorer-tabs", TabbedContent).active = "tab-dbt"
+        self.query_one(DbtExplorer).refresh_project()
+        self._sync_dbt_controls()
+        self.save_workspace(explorer_tab="dbt")
+
+    def _active_page(self) -> dict:
+        return next((item for item in self.session.workspace["pages"] if item["id"] == self._document_identity), {})
+
+    def _dbt_page(self, home: str, path: str) -> dict | None:
+        return next((item for item in self.session.workspace["pages"] if item["source"] == self._workspace_key
+                     and (link := item.get("dbt_file")) and link["project_dir"] == home and link["path"] == path), None)
+
+    def _dbt_file_page(self, home: str, path: str, contents: DbtFile, *, text: str | None = None) -> dict:
+        return {"id": str(uuid4()), "title": "", "description": "", "cursor": [0, 0], "source": self._workspace_key,
+                "document": contents.text if text is None else text, "dialect": self.session.dialect,
+                "dbt_file": {"project_dir": home, "path": path, "revision": contents.revision}}
+
+    @staticmethod
+    def _read_dbt_page(link: dict[str, str]) -> DbtFile:
+        return DbtFiles(link["project_dir"]).read(link["path"])
+
+    def _dbt_draft_base(self, project: DbtFiles, path: str) -> DbtFile:
+        page = self._dbt_page(str(project.root), path)
+        disk = project.read(path, missing=True)
+        if page is None:
+            return disk
+        current = page["id"] == self._document_identity
+        link = self._dbt_file if current else page["dbt_file"]
+        document = self.editor.text if current else page["document"]
+        if file_revision(document) == link["revision"]:
+            return disk
+        if disk.revision != link["revision"]:
+            raise DbtError(f"{path} changed on disk. Review Git Diff or reload before applying.")
+        return DbtFile(document, link["revision"], disk.bom)
+
+    def dbt_ai_context(self, target: AITarget, *, ask_user) -> DbtAIContext:
+        home, path, revision = target.dbt_file
+        project = DbtFiles(home)
+        model = project.model(path, self._dbt_yaml_drafts(home))
+        properties = self._dbt_draft_base(project, model.properties) if model else None
+        saved = project.read(path, missing=True)
+        if saved.revision != revision:
+            raise DbtError(f"{path} changed on disk. Reload it before starting an AI request.")
+        current = DbtFile(target.document, revision, saved.bom)
+        return DbtAIContext(self.session, target.source_id, path, project, current, model, properties, ask_user=ask_user)
+
+    def _apply_dbt_drafts(self, drafts: tuple[DbtDraft, ...]) -> str:
+        if self._dbt_file is None:
+            raise DbtError("The dbt file target changed; send a new request.")
+        home = self._dbt_home
+        project = DbtFiles(home)
+        self._flush_workspace()
+        pages = self.session.workspace["pages"]
+        updates = {}
+        for draft in drafts:
+            existing = self._dbt_page(home, draft.path)
+            if self._dbt_draft_base(project, draft.path) != draft.before:
+                raise DbtError(f"{draft.path} changed since the request started; no drafts were applied.")
+            page = existing or self._dbt_file_page(home, draft.path, draft.before)
+            updates[page["id"]] = {**page, "document": draft.text,
+                                    "dbt_file": {**page["dbt_file"], "revision": draft.before.revision}}
+        if self._document_identity in updates:
+            current = updates[self._document_identity]
+            self._replace_dbt_draft(self.editor, current["document"])
+            current["document"] = self.editor.text  # TextArea preserves the active file's newline style.
+            self._dbt_autosave_text = self.editor.text
+        saved, errors = 0, []
+        refresh_tree = False
+        for page in updates.values():
+            link = page["dbt_file"]
+            try:
+                result = self._persist_dbt_file(page, project)
+            except (DbtError, OSError) as exc:
+                errors.append(str(exc))
+            else:
+                saved += 1
+                refresh_tree |= not link["revision"]
+                link["revision"] = result.revision
+        if current := updates.get(self._document_identity):
+            self._dbt_file = current["dbt_file"]
+        pages = [updates.pop(page["id"], page) for page in pages] + list(updates.values())
+        self._capture_workspace()
+        stored = self.save_workspace(pages=pages, **self._workspace_snapshot)
+        if not self.pane_visible("schema"):
+            self.update_settings(panes={"schema": True})
+            self.set_pane("schema", True)
+        self.query_one("#explorer-tabs", TabbedContent).active = "tab-pages"
+        self._sync_dbt_controls()
+        if refresh_tree:
+            self.query_one(DbtExplorer).refresh_project(force=True)
+        status = f"Autosaved {saved} dbt file(s) · nothing executed"
+        if errors:
+            status = f"Autosaved {saved} of {len(drafts)} dbt files; unsaved edits kept in Pages. {errors[0]}"
+        if stored:
+            self._set_status(status)
+        else:
+            status += " Workspace history could not be saved."
+        return status
+
+    def open_dbt_file(self, home: str, path: str, *, row: int | None = None,
+                      draft: DbtDraft | None = None, autosave: bool = False) -> None:
+        if self.refuse_busy("Open dbt file"):
+            return
+        self.ai_panel._flush_chat()
+        self._flush_workspace()
+        page = self._dbt_page(home, path)
+        if page is None:
+            try:
+                contents = DbtFiles(home).read(path) if draft is None else draft.before
+            except (DbtError, OSError) as exc:
+                self._set_status(str(exc))
+                return
+            page = self._dbt_file_page(home, path, contents, text=draft.text if draft else None)
+        elif draft is not None:
+            self._set_status(f"A draft for {path} already exists in Pages")
+            return
+        if self.function_mode:
+            self.action_workspace()
+        if self._document_identity != page["id"]:
+            self._restore_page(page)
+        if draft is not None and autosave:
+            self._dbt_autosave_text = draft.before.text
+        if row is not None:
+            self.editor.move_cursor((min(row, self.editor.document.line_count - 1), 0))
+        self.editor.focus()
+        self._flush_workspace()
+        if not self._autosave_error and not autosave:
+            self._set_status(f"dbt · {path}")
+
+    def _dbt_yaml_drafts(self, home: str) -> dict[str, str]:
+        drafts = {}
+        for item in self.session.workspace["pages"]:
+            link = item.get("dbt_file")
+            if (item["source"] == self._workspace_key and link and link["project_dir"] == home
+                    and Path(link["path"]).suffix.lower() in {".yml", ".yaml"}):
+                text = self.editor.text if item["id"] == self._document_identity else item["document"]
+                if file_revision(text) != link["revision"]:
+                    drafts[link["path"]] = text
+        return drafts
+
+    def _open_dbt_properties(self) -> None:
+        link = self._dbt_file
+        if link is None:
+            return
+        home, path = link["project_dir"], link["path"]
+        try:
+            project = DbtFiles(home)
+            drafts = self._dbt_yaml_drafts(home)
+            model = project.model(path, drafts)
+            if model is None:
+                entry = project.resource_properties(path, self.editor.text, drafts)
+                if entry is None:
+                    raise DbtError("No YAML properties entry describes this SQL file")
+                self.open_dbt_file(home, entry[0], row=entry[1])
+            elif self._dbt_page(home, model.properties) or project.read(model.properties, missing=True).revision:
+                self.open_dbt_file(home, model.properties, row=model.row)
+            else:
+                before = DbtFile("", "")
+                self.open_dbt_file(home, model.properties,
+                                   draft=DbtDraft(model.properties, before, add_description(model, before, "")))
+        except (DbtError, OSError) as exc:
+            self._set_status(str(exc))
+
+    def action_create_dbt_test(self) -> None:
+        self._flush_workspace()
+        home = self._dbt_home
+        try:
+            if not home:
+                raise DbtError("Open a dbt project home first")
+            project = DbtFiles(home)
+            active = self._dbt_file["path"] if self._dbt_file and not self.function_mode else None
+            model = project.model(active, self._dbt_yaml_drafts(home)) if active else None
+            if model is None:
+                paths = project.models()
+                if not paths:
+                    raise DbtError("No dbt models found under model-paths")
+                workspace = self._workspace_key
+
+                def selected(path: str | None) -> None:
+                    if path and workspace == self._workspace_key and home == self._dbt_home:
+                        self.open_dbt_file(home, path)
+                        if self._dbt_file and self._dbt_file["path"] == path:
+                            self.action_create_dbt_test()
+
+                self.push_screen(DbtModelScreen(paths), selected)
+            else:
+                workspace = self._workspace_key
+
+                def open_test(draft: DbtDraft | None) -> None:
+                    if draft is not None and workspace == self._workspace_key and home == self._dbt_home:
+                        self.open_dbt_file(home, draft.path, draft=draft, autosave=True)
+
+                self.push_screen(DbtTestScreen(self.session, project, model), open_test)
+        except (DbtError, OSError) as exc:
+            self._set_status(str(exc))
+
+    def action_dbt_definition(self, offset: int | None = None) -> None:
+        if self._modal_open() or self.function_mode or not self._dbt_home or self.editor.file_format != "sql":
+            return
+        if offset is None:
+            offset = self.editor.document.get_index_from_location(self.editor.cursor_location)
+        document = self.editor.text
+        home = self._dbt_home
+        try:
+            call = reference_at(document, offset)
+            if call is None and not has_query_jinja(document, dialect=self.session.dialect):
+                project = DbtProject(home, dialect=self.session.dialect)
+                expression = project.relation_call_at(document, offset, **self._dbt_conversion_target())
+                call = reference_at(expression, 0) if expression else None
+            if call is not None:
+                path, row = DbtFiles(home).definition(*call, drafts=self._dbt_yaml_drafts(home))
+                self.open_dbt_file(home, path, row=row)
+        except (DbtError, OSError) as exc:
+            self._set_status(str(exc))
+
+    @on(QueryTextArea.DefinitionRequested)
+    def _dbt_definition_clicked(self, event: QueryTextArea.DefinitionRequested) -> None:
+        self.action_dbt_definition(event.offset)
+
+    def _persist_dbt_file(self, page: dict, project: DbtFiles) -> DbtFile:
+        link, text = page["dbt_file"], page["document"]
+        before = project.read(link["path"], missing=True)
+        if (page.get("dbt_views") and not has_query_jinja(text, dialect=self.session.dialect)
+                and has_query_jinja(before.text or page["dbt_views"]["jinja"], dialect=self.session.dialect)):
+            raise DbtError(f"Switch {link['path']} back to dbt to autosave without losing its template.")
+        return project.save(link["path"], text, link["revision"])
+
+    def _save_active_dbt_file(self, text: str) -> None:
+        link = self._dbt_file
+        # Observe each edit once. A conflict leaves the draft in Pages, and
+        # cursor moves must not keep retrying the same failed write.
+        self._dbt_autosave_text = text
+        if file_revision(text) == link["revision"]:
+            return
+        try:
+            project = DbtFiles(link["project_dir"])
+            page = {**self._active_page(), "dbt_file": link, "document": text}
+            saved = self._persist_dbt_file(page, project)
+        except (DbtError, OSError) as exc:
+            if not self._closing:
+                self._set_status(f"dbt file not saved · {exc}")
+            return
+        new = not link["revision"]
+        self._dbt_file = {**link, "revision": saved.revision}
+        if not self._closing:
+            self._sync_dbt_controls()
+            self.ai_panel.target_changed()
+            if new or link["path"] == "dbt_project.yml":
+                self.query_one(DbtExplorer).refresh_project(force=True)
+            self._set_status(f"Autosaved {link['path']} · nothing executed")
+
+    def reload_dbt_file(self) -> None:
+        if self._dbt_file is None or self.function_mode:
+            return
+        try:
+            disk = self._read_dbt_page(self._dbt_file)
+        except (DbtError, OSError) as exc:
+            self._set_status(str(exc))
+            return
+        self._replace_dbt_draft(self.editor, disk.text)
+        self._dbt_file["revision"] = disk.revision
+        self._dbt_autosave_text = self.editor.text
+        self._sync_dbt_controls()
+        self._flush_workspace()
+        self._set_status(f"Reloaded {self._dbt_file['path']} · undo to restore the draft")
+
+    @on(Button.Pressed, "#dbt-file-diff")
+    def action_dbt_diff(self) -> None:
+        if self._dbt_file is None or self.function_mode:
+            return
+        explorer = self.query_one(DbtExplorer)
+        explorer.run_worker(explorer.show_diff(self._dbt_home, self._dbt_file["path"], self.editor.text,
+                                               self._document_identity), group="dbt-diff", exclusive=True, exit_on_error=False)
 
     def _replace_dbt_draft(self, editor: TextArea, text: str) -> None:
         editor.history.checkpoint()
@@ -1603,6 +2011,8 @@ class D8RApp(App):
 
     def action_query_to_fn(self) -> None:
         """Open a new function draft without saving or rewriting the document."""
+        if self.editor.file_format != "sql":
+            return
         self._open_fn(new_body=self.editor.text, restore_draft=False)
 
     @on(Button.Pressed, "#query-to-fn")
@@ -2242,7 +2652,10 @@ class D8RApp(App):
     def _load_document(self, document: str) -> None:
         self.query_one(FindBar).close(restore_focus=False)
         self._document_identity = str(uuid4())
+        self._dbt_file = None
+        self._dbt_autosave_text = ""
         self.editor.load_text(document)
+        self._sync_dbt_controls()
         self.palette.close()
         self.editor.focus()
         self.ai_panel.target_changed()

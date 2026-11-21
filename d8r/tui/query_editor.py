@@ -132,6 +132,14 @@ class QueryTextArea(DraftTextArea):
     class FoldsChanged(Message):
         """Visual positions changed without an edit to SQL."""
 
+    class DefinitionRequested(Message):
+        def __init__(self, offset: int) -> None:
+            super().__init__()
+            self.offset = offset
+
+    file_format = reactive("sql")
+    dbt_navigation = False
+    dbt_template = False
     dialect = reactive("postgres")
 
     def __init__(self, *args, dialect: str = "postgres", **kwargs) -> None:
@@ -157,7 +165,7 @@ class QueryTextArea(DraftTextArea):
 
     def _sections(self) -> dict[int, LineFold]:
         if self._fold_regions is None:
-            self._fold_regions = line_folds(self.text, self.dialect)
+            self._fold_regions = line_folds(self.text, self.dialect) if self.file_format == "sql" else {}
         return self._fold_regions
 
     def _keep_endpoints(self, rows: set[int], selection: Selection) -> set[int]:
@@ -229,6 +237,14 @@ class QueryTextArea(DraftTextArea):
         self._line_cache.clear()
         self.refresh()
 
+    def watch_file_format(self) -> None:
+        self._set_collapsed(set())
+        self._fold_regions = None
+        self._line_cache.clear()
+        self.tab_behavior = "indent" if self.file_format == "yaml" else "focus"
+        self.indent_width = 2 if self.file_format == "yaml" else 4
+        self.refresh()
+
     def _watch_selection(self, previous_selection, selection) -> None:
         if previous_selection != selection:
             self.selection_revision += 1
@@ -268,6 +284,13 @@ class QueryTextArea(DraftTextArea):
         return Strip.join((strip.crop(0, column), Strip([Segment(mark, style)], 1), strip.crop(column + 1)))
 
     def _on_mouse_down(self, event: events.MouseDown) -> None:
+        if self.dbt_navigation and self.file_format == "sql" and event.button == 1 and event.ctrl:
+            if event.x - self.gutter.left >= self.gutter_width:
+                location = self.get_target_document_location(event)
+                self.post_message(self.DefinitionRequested(self.document.get_index_from_location(location)))
+                event.prevent_default()
+                event.stop()
+                return
         if not self.show_line_numbers or event.button != 1 or event.x - self.gutter.left != self.gutter_width - 2:
             return  # Textual's normal mouse-selection handler still runs.
         y = event.y - self.gutter.top + self.scroll_offset.y
@@ -360,6 +383,8 @@ class QueryTextArea(DraftTextArea):
 
     def get_line(self, line_index: int) -> Text:
         line = super().get_line(line_index)
+        if self.file_format != "sql":
+            return line
         syntax_key = (self._syntax_revision, self.dialect)
         if getattr(self, "_syntax_key", None) != syntax_key:
             text = self.text

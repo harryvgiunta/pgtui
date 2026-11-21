@@ -236,46 +236,60 @@ They are not a Soda contract runner or anomaly-detection service. Computation st
 inside PostgreSQL, D1 SQLite or the local DuckDB engine; no full dataset is fetched
 into Python, and no server-installed routines or Soda dependency are required.
 
-## SQL ↔ dbt
+## dbt workspace
 
-Set up the project once per PostgreSQL source: open Settings → DBT →
-Project home / export, enter the directory containing `dbt_project.yml`,
-and choose **Open & save project home**. Close Settings and paste into a query page.
+In the **dbt** explorer tab, choose **Project Home**, select the directory containing
+`dbt_project.yml`, and choose **Open & Save Project Home**. This is also the only
+option under **Settings → DBT**. The workspace remembers the path per data source.
 
-- **dbt → SQL:** paste a query with literal `ref()`, `source()`, or `config()` calls.
-  Click **SQL ↔ dbt** (or use `\dbt`) to see the resolved SQL without `config()`.
-- **SQL → dbt:** paste a PostgreSQL query and click the same button. Mapped relations
-  become `source()` or `ref()` calls. The resolver uses manifest relation names or
-  literal source YAML. Unqualified names use the source's configured schema; qualify
-  them explicitly if your query uses a different search path.
+- Edits to project files, including SQL models, data tests, and YAML, autosave to
+  disk after a short pause or when you switch pages. **Pages** remembers opened files
+  and any unsaved drafts. Removing a page never deletes its project file.
+- On a SQL model, **Show Page Details** opens its properties YAML at the model's
+  entry. If no properties file exists, it opens a new YAML draft alongside the model.
+- **Ctrl+click** a literal `source()` or `ref()` in the editor to open the local
+  source YAML or model. **F12** follows the reference at the caret when a terminal
+  does not forward modified clicks.
+- The file editor's **Git Diff** shows staged, working-tree, and unsaved changes.
+  If a file changed externally, autosave keeps your draft without overwriting
+  the file. **Actions → Reload File from Disk** loads the new baseline and leaves
+  the previous editor text available via Undo.
 
-**Run SQL** and **Ctrl+Enter** work from either view. If you select text, only the
-selection runs. PGTUI resolves a single supported dbt query offline and sends the
-native SQL to PostgreSQL. The draft, selection, and saved view pair stay unchanged.
-History keeps the submitted Jinja.
+### SQL ↔ dbt switch
 
-Toggling never runs SQL. Each toggle is one undoable edit. Flip an unchanged draft
-back to recover its exact prior text, including comments, formatting, and literal
-`config()`. The pair is saved with the query page. If a template cannot be resolved,
-nothing is executed. Compile macros, blocks, or ephemeral dependencies outside
-PGTUI and run the compiled SQL. Jinja markers found only inside SQL strings or
-comments are refused as ambiguous when toggling, but left untouched when running.
+Turn the editor switch to **SQL** to resolve literal `ref()`, `source()`, and `config()`
+calls, or to **dbt** to normalize a mixed draft: resolve it to SQL first, then turn
+mapped relations into dbt calls. `\dbt` flips the switch via the command palette.
+Switching views is undoable and does not itself run or save the file. Model
+mappings use the project's manifest; literal sources also work directly from YAML.
+Dynamic Jinja and unmapped relations report an error instead of guessing. Edits to
+a templated model in the native SQL preview autosave after switching back to dbt.
 
-### Optional file export
+### Assistant skills
 
-In Settings → DBT, review the SQL (**Use expanded editor SQL** expands local
-functions), set the model name, materialization, and description, then click
-**Export model files**. This writes model SQL and YAML under configured model
-paths. Replacing existing files requires the overwrite checkbox. Unrelated YAML
-values are preserved, but formatting and comments can change.
+With your AI provider configured, open a model and choose **Ask AI**. The assistant
+uses three bundled skills: [Edit Model](d8r/ai/skills/dbt-edit-model/SKILL.md),
+[Create Data Test](d8r/ai/skills/dbt-create-data-test/SKILL.md), and
+[Add Documentation](d8r/ai/skills/dbt-add-documentation/SKILL.md). For example, ask
+“Make me 10 tests for this model.” Review the diff and **Apply dbt drafts** to save
+the changes to the project. The assistant does not run models, tests, or dbt.
 
-Model paths, target paths and file destinations stay inside the selected project;
-symlink escapes and traversal are refused. No dbt runtime, adapters, subprocesses,
-network calls or `profiles.yml` credential access are added. The slim IDE workflow
-follows [Power User's documented SQL conversion](https://github.com/AltimateAI/vscode-dbt-power-user/blob/master/documentation/docs/develop/genmodelSQL.md)
-and dbt's [manifest](https://docs.getdbt.com/reference/artifacts/manifest-json),
-[ref](https://docs.getdbt.com/reference/dbt-jinja-functions/ref) and
-[source](https://docs.getdbt.com/reference/dbt-jinja-functions/source) contracts.
+### Explorer actions
+
+**Create Data Test** opens a manual editor with local SQL and model-column
+IntelliSense (**Ctrl+Space**), without a database connection. Manual and AI-created
+tests are saved as `.sql` files under the project's `test-paths` (`tests/` by default).
+Expand **tests** below the model folders in the dbt explorer and open a file to
+see the SQL that returns failing rows. Tests declared in properties YAML remain
+in those YAML files.
+
+**Generate & Serve Documentation** takes a port and uses bundled dbt Core
+to build the documentation from saved files and serve it at `http://127.0.0.1:<port>/`.
+This uses an offline PostgreSQL profile: lineage, descriptions, and tests are
+included, but there is no warehouse catalog or query execution. Projects with dbt
+package dependencies need their packages already installed. **Stop Documentation
+Server** or exiting PGTUI stops the server. Only the documentation artifacts and
+configured docs assets are served, not profiles, logs, or the project directory.
 
 
 ## IntelliSense

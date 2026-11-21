@@ -528,7 +528,8 @@ class Session:
         if default_rows is not None:
             self.default_rows = default_rows
 
-    def save_workspace(self, *, dbt_views: dict[str, str] | None = None, **changes) -> None:
+    def save_workspace(self, *, dbt_views: dict[str, str] | None = None,
+                       dbt_file: dict[str, str] | None = None, **changes) -> None:
         """Merge owned fields under one lock; failures preserve the live draft."""
         with self._workspace_lock:
             document = {**self.workspace, **deepcopy(changes)}
@@ -540,6 +541,8 @@ class Session:
                                ("document", "cursor", "source", "dialect")}}
                 if dbt_views is not None:
                     snapshot["dbt_views"] = dict(dbt_views)
+                if dbt_file is not None:
+                    snapshot["dbt_file"] = dict(dbt_file)
                 document["pages"] = [snapshot if item["id"] == snapshot["id"] else item
                                      for item in document["pages"]]
                 if page is None:
@@ -1172,7 +1175,7 @@ class Session:
         return self.run_all(doc, record=record)[0]
 
     def run_all(self, doc: str, record: bool = True, *, paged_read: bool | None = None,
-                cancel_event: Event | None = None) -> list[RunOutcome]:
+                cancel_event: Event | None = None, dbt_home: str = "") -> list[RunOutcome]:
         """Execute statements in order, stopping at the first server error.
 
         PostgreSQL dbt Jinja is rendered offline before parsing. Conversion,
@@ -1186,15 +1189,15 @@ class Session:
         the in-flight statement is separate and does not release ownership.
         """
         source = self.source
-        is_dbt = source.dialect == "postgres" and has_query_jinja(doc)
+        is_dbt = (source.dialect == "postgres" or bool(dbt_home)) and has_query_jinja(doc, dialect=source.dialect)
         native = doc
         if is_dbt:
             try:
-                directory = self.dbt_project_dir
+                directory = dbt_home or self.dbt_project_dir
                 if not directory:
                     raise DbtError("Set a project home in Settings → DBT before running dbt Jinja.")
                 target = source.postgres or self.saved_source_profile(source.id) or {}
-                native = DbtProject(directory).render_query(doc, database=target.get("database", ""))
+                native = DbtProject(directory, dialect=source.dialect).render_query(doc, database=target.get("database", ""))
             except (DbtError, OSError) as exc:
                 message = str(exc)
                 return [RunOutcome(status=f"not executed · {message}", error=message, doc=doc)]

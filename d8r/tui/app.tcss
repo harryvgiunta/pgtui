@@ -326,10 +326,16 @@ Tabs Tab:disabled {
     background: $surface;
 }
 
-#explorer-tabs, #explorer-tabs ContentSwitcher, #tab-schema, #tab-pages, #tab-functions {
+#explorer-tabs, #explorer-tabs ContentSwitcher, #tab-schema, #tab-pages, #tab-functions, #tab-dbt {
     height: 1fr;
     padding: 0;
 }
+
+DbtExplorer { height: 1fr; }
+.dbt-explorer-actions { height: 1; }
+.dbt-explorer-actions Button { min-width: 0; margin-right: 1; }
+#dbt-tree { height: 1fr; background: $surface; }
+#dbt-explorer-status { max-height: 4; height: auto; color: $text-muted; }
 
 #page-actions {
     height: 1;
@@ -401,17 +407,22 @@ Tabs Tab:disabled {
     layers: base overlay;
 }
 
-#editor-tools {
+#editor-tools, #dbt-editor-tools {
     height: 1;
     background: $panel;
 }
 
-#editor-tools Button {
+#editor-tools Button, #dbt-editor-tools Button {
     width: auto;
     min-width: 0;
     margin-right: 1;
     padding: 0 1;
 }
+
+#dbt-view-controls { width: auto; height: 1; }
+.dbt-switch-label { width: auto; margin: 0 1; }
+#dbt-toggle { height: 1; padding: 0; border: none; }
+#dbt-file-path { height: 1; color: $text-accent; text-overflow: ellipsis; text-wrap: nowrap; }
 
 #refresh-schema {
     width: 1fr;

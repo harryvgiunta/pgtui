@@ -25,7 +25,7 @@ def project(tmp_path: Path, *, model_path: str = "models", extra: dict | None = 
 def put(root: Path, path: str, text: str) -> Path:
     file = root / path
     file.parent.mkdir(parents=True, exist_ok=True)
-    file.write_text(text, encoding="utf-8")
+    file.write_text(text, encoding="utf-8", newline="")
     return file
 
 
@@ -58,11 +58,12 @@ WITH orders AS (
 )
 SELECT orders.id, 'from raw.orders' FROM orders
 """
-    exported = DbtProject(root).export_model(original, "daily", "table", "Daily orders")
-    assert exported.sql_path == root / "transformations/core/daily.sql"
-    assert exported.sql.count("{{ source('landing', 'orders') }}") == 1
-    assert "-- raw.orders must not change here" in exported.sql
-    assert "FROM orders" in exported.sql
+    converted = DbtProject(root).to_dbt(original)
+    put(root, "transformations/core/daily.sql", "{{ config(materialized='table') }}\n" + converted)
+    put(root, "transformations/core/models.yml", "models: [{name: daily, description: Daily orders}]\n")
+    assert converted.count("{{ source('landing', 'orders') }}") == 1
+    assert "-- raw.orders must not change here" in converted
+    assert "FROM orders" in converted
     imported = DbtProject(root).import_model("transformations/core/daily.sql")
     assert imported.sql == "\n" + original
     assert imported.name == "daily"
@@ -75,8 +76,9 @@ def test_manifest_alias_package_and_version_are_authoritative(tmp_path):
     root = project(tmp_path)
     manifest(root, {"model.pkg.actual.v2": node("actual", '"warehouse"."custom"."alias"',
              package_name="pkg", version=2, latest_version=2)})
-    exported = DbtProject(root).export_model('SELECT * FROM "warehouse"."custom"."alias"', "consumer")
-    assert "ref('pkg', 'actual', version=2)" in exported.sql
+    converted = DbtProject(root).to_dbt('SELECT * FROM "warehouse"."custom"."alias"')
+    assert "ref('pkg', 'actual', version=2)" in converted
+    put(root, "models/consumer.sql", converted)
     assert DbtProject(root).import_model("models/consumer.sql").sql.endswith('FROM "warehouse"."custom"."alias"')
     with pytest.raises(DbtError, match="No authoritative"):
         DbtProject(root).to_dbt("SELECT * FROM custom.alias")
@@ -174,8 +176,7 @@ def test_missing_or_ambiguous_mapping_never_guesses(tmp_path):
     root = project(tmp_path)
     manifest(root, {"one": node("one"), "two": node("two")})
     with pytest.raises(DbtError, match="Ambiguous"):
-        DbtProject(root).export_model("select * from analytics.orders", "out")
-    assert not (root / "models/out.sql").exists()
+        DbtProject(root).to_dbt("select * from analytics.orders")
     with pytest.raises(DbtError, match="No authoritative"):
         DbtProject(root).to_dbt("select * from orders")
 
@@ -289,7 +290,7 @@ def test_dynamic_calls_are_never_evaluated(tmp_path):
     assert not marker.exists()
 
 
-def test_literal_config_precedence_and_roundtrip(tmp_path):
+def test_literal_config_precedence(tmp_path):
     root = project(tmp_path, extra={"models": {"+materialized": "view", "demo": {"+tags": ["project"], "current": {"+materialized": "table"}}}})
     put(root, "models/schema.yml", "models:\n  - name: current\n    description: Original\n    config: {tags: [yaml], materialized: table}\n")
     put(root, "models/current.sql", "{{ config(materialized='incremental', unique_key='id', enabled=true, meta={'team': 'data'}) }}\nselect 1 id")
@@ -297,47 +298,8 @@ def test_literal_config_precedence_and_roundtrip(tmp_path):
     assert model.materialized == "incremental"
     assert model.config["tags"] == ["yaml"]
     assert model.config["enabled"] is True
-    DbtProject(root).export_model(model.sql, "copy", model.materialized, model.description, config=model.config)
-    restored = DbtProject(root).import_model("models/copy.sql")
-    assert restored.config["unique_key"] == "id"
-    assert restored.config["meta"] == {"team": "data"}
-
-
-def test_no_clobber_and_unrelated_yaml_semantics(tmp_path):
-    root = project(tmp_path)
-    put(root, "models/current.sql", "select 1")
-    data = {"version": 2, "models": [
-        {"name": "current", "description": "old", "columns": [{"name": "id", "data_tests": ["unique"]}], "config": {"tags": ["keep"]}},
-        {"name": "other", "description": "untouched", "meta": {"nested": [1, 2]}},
-    ], "sources": [{"name": "external", "tables": [{"name": "data"}]}]}
-    path = put(root, "models/schema.yml", yaml.safe_dump(data))
-    original = path.read_bytes()
-    with pytest.raises(DbtError, match="overwrite"):
-        DbtProject(root).export_model("select 2", "current", "table", "new")
-    assert path.read_bytes() == original
-    assert (root / "models/current.sql").read_text() == "select 1"
-    DbtProject(root).export_model("select 2", "current", "table", "new", overwrite=True)
-    after = yaml.safe_load(path.read_text())
-    assert after["sources"] == data["sources"]
-    assert after["models"][1] == data["models"][1]
-    assert after["models"][0]["columns"] == data["models"][0]["columns"]
-    assert after["models"][0]["config"] == {"tags": ["keep"], "materialized": "table"}
-
-
-def test_yaml_alias_updates_do_not_mutate_other_models(tmp_path):
-    root = project(tmp_path)
-    put(root, "models/current.sql", "select 1")
-    path = put(root, "models/schema.yml", """version: 2
-models:
-  - name: current
-    config: &shared {materialized: view, tags: [keep]}
-  - name: other
-    config: *shared
-""")
-    DbtProject(root).export_model("select 2", "current", "table", overwrite=True)
-    models = yaml.safe_load(path.read_text())["models"]
-    assert models[0]["config"]["materialized"] == "table"
-    assert models[1]["config"]["materialized"] == "view"
+    assert model.config["unique_key"] == "id"
+    assert model.config["meta"] == {"team": "data"}
 
 
 @pytest.mark.parametrize("bad_path", ["../outside", "/outside", "C:/outside", "models/../../outside", "models\\outside"])
@@ -362,7 +324,7 @@ def test_profiles_are_never_opened(tmp_path, monkeypatch):
         DbtProject(root)
 
 
-def test_symlink_models_and_export_destinations_refused(tmp_path):
+def test_symlink_models_refused(tmp_path):
     root = project(tmp_path)
     outside = put(tmp_path, "outside.sql", "select 99")
     try:
@@ -389,7 +351,7 @@ def test_multiple_model_metadata_entries_refused(tmp_path):
     put(root, "models/a.yml", "models: [{name: current}]\n")
     put(root, "models/b.yml", "models: [{name: current}]\n")
     with pytest.raises(DbtError, match="multiple YAML"):
-        DbtProject(root).export_model("select 2", "current", overwrite=True)
+        DbtProject(root).import_model("models/current.sql")
 
 
 def test_modal_saves_project_home_without_editing_query(tmp_path, parquet_source):
@@ -409,62 +371,9 @@ def test_modal_saves_project_home_without_editing_query(tmp_path, parquet_source
             screen.query_one("#dbt-project-dir", Input).value = str(root)
             screen.query_one("#dbt-open", Button).press()
             await pilot.pause()
-            screen.action_cancel()
-            await pilot.pause()
             assert app.editor.text == "select 1"
         restored = Session({parquet_source.id: parquet_source}, data_dir=tmp_path / "state")
         assert restored.dbt_project_dir == str(root.resolve())
     asyncio.run(scenario())
 
 
-def test_modal_refuses_export_after_editor_changes(tmp_path, parquet_source):
-    from textual.widgets import Button, Input
-    from d8r.tui.app import D8RApp
-    from d8r.tui.dbt import DBTScreen
-    from d8r.tui.session import Session
-    root = project(tmp_path)
-    async def scenario():
-        app = D8RApp(Session({parquet_source.id: parquet_source}, data_dir=tmp_path / "state"))
-        async with app.run_test(size=(140, 55)) as pilot:
-            app.editor.load_text("select 1")
-            screen = DBTScreen(app)
-            app.push_screen(screen)
-            await pilot.pause()
-            screen.query_one("#dbt-project-dir", Input).value = str(root)
-            screen.query_one("#dbt-open", Button).press()
-            await pilot.pause()
-            screen.query_one("#dbt-name", Input).value = "stale"
-            app.editor.load_text("select 9")
-            screen.query_one("#dbt-export", Button).press()
-            await pilot.pause()
-            assert app.editor.text == "select 9"
-            assert not (root / "models" / "stale.sql").exists()
-    asyncio.run(scenario())
-
-
-def test_modal_exports_reviewed_sql_without_applying(tmp_path, parquet_source):
-    from textual.widgets import Button, Input, TextArea
-    from d8r.tui.app import D8RApp
-    from d8r.tui.dbt import DBTScreen
-    from d8r.tui.session import Session
-    root = project(tmp_path)
-    async def scenario():
-        app = D8RApp(Session({parquet_source.id: parquet_source}, data_dir=tmp_path / "state"))
-        async with app.run_test(size=(140, 55)) as pilot:
-            app.editor.load_text("select 1")
-            screen = DBTScreen(app)
-            app.push_screen(screen)
-            await pilot.pause()
-            screen.query_one("#dbt-project-dir", Input).value = str(root)
-            screen.query_one("#dbt-open", Button).press()
-            await pilot.pause()
-            screen.query_one("#dbt-name", Input).value = "reviewed"
-            screen.query_one("#dbt-description", TextArea).load_text("Reviewed model")
-            screen.query_one("#dbt-sql", TextArea).load_text("select 7 AS reviewed")
-            screen.query_one("#dbt-export", Button).press()
-            await pilot.pause()
-            assert app.editor.text == "select 1"
-            imported = DbtProject(root).import_model("models/reviewed.sql")
-            assert imported.sql.strip() == "select 7 AS reviewed"
-            assert imported.description == "Reviewed model"
-    asyncio.run(scenario())

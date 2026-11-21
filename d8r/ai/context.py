@@ -15,6 +15,7 @@ from d8r.engine import EngineError, execute_sql, explain_sql, prepare_sql, sampl
 from d8r.sql import FnDef, SqlError, format_parameters, is_identifier, parse_parameters, parse_sql, validate_function
 
 if TYPE_CHECKING:
+    from d8r.dbt_edits import DbtDraft
     from d8r.tui.session import Session
 
 LANGUAGE_GUIDE = """You are the PGTUI assistant inside a native SQL editor.
@@ -149,9 +150,12 @@ class AIProposal:
     arguments: str = ""
     original_name: str | None = None
     queries: tuple[AIQuery, ...] = ()
+    dbt_drafts: tuple[DbtDraft, ...] = ()
 
     @property
     def kind(self) -> str:
+        if self.dbt_drafts:
+            return "dbt"
         if self.queries:
             return "queries"
         if self.function is None:

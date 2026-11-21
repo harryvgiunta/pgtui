@@ -21,7 +21,7 @@ from textual.widgets.option_list import Option
 
 from d8r.completion.engine import complete
 from d8r.completion.context import analyze, command_span
-from d8r.completion.models import Field, Signature
+from d8r.completion.models import Completion, Field, Signature
 from d8r.keybindings import DEFAULT_COMPLETION_KEYS, is_typing_key, key_label
 from .query_editor import QueryTextArea
 from .session import Session
@@ -31,7 +31,7 @@ ACTIONS: tuple[tuple[str, str, str], ...] = (
     ("SQL preview", "ctrl+k · expand functions without executing", "compile"),
     ("Data source…", "ctrl+o · PostgreSQL, Cloudflare D1 or local Parquet", "add-source"),
     ("Functions…", "open the SQL function library", "fn"),
-    ("dbt", "toggle this query page between PostgreSQL SQL and dbt Jinja", "dbt"),
+    ("dbt", "switch this draft between native SQL and dbt Jinja", "dbt"),
     ("Query to function", "create a function draft from this document", "query-to-fn"),
     ("Export results", "save selected rows, the buffer or the full query result as CSV", "export-results"),
     ("AI", "chat and review an AI-proposed replacement", "ai"),
@@ -95,6 +95,12 @@ def _location(document: str, offset: int) -> tuple[int, int]:
     return document.count("\n", 0, offset), offset - document.rfind("\n", 0, offset) - 1
 
 
+def _completion_entries(result: Completion) -> list[Entry]:
+    return [Entry(item.label, item.insert, item.detail, cursor_back=item.cursor_back,
+                  kind=item.kind, documentation=item.documentation,
+                  start=item.start, end=item.end, table=item.table) for item in result.items]
+
+
 def view_for(session: Session, doc: str, line: str, column: int, *,
              parameters: Iterable[str] = (), row: int = 0,
              query_history: bool = True, manual: bool = False, commands_only: bool = False) -> View | None:
@@ -115,9 +121,7 @@ def view_for(session: Session, doc: str, line: str, column: int, *,
                       manual=manual)
     context = result.context
     value_field = context.value_field if not context.blocked else None
-    entries = [Entry(item.label, item.insert, item.detail, cursor_back=item.cursor_back,
-                     kind=item.kind, documentation=item.documentation,
-                     start=item.start, end=item.end, table=item.table) for item in result.items]
+    entries = _completion_entries(result)
     if query_history and not context.blocked and (context.token or not doc.strip()):
         seen: set[str] = set()
         for item in session.history:
@@ -182,12 +186,16 @@ class CommandPalette(OptionList):
 
     def __init__(self, session: Session, *, source_id: str | None = None,
                  workspace_actions: bool = True,
-                 parameters: Callable[[], Iterable[str]] | None = None, **kwargs) -> None:
+                 parameters: Callable[[], Iterable[str]] | None = None,
+                 local_completion: Callable[[str, int, bool], Completion] | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self.session = session
         self.source_id = source_id
         self.workspace_actions = workspace_actions
         self.parameters = parameters
+        # A supplied completion provider is editor-local: no workspace actions,
+        # history, schema/value requests, or AI. Its editor dialect is already pinned.
+        self.local_completion = local_completion
         self.editor = None
         self.details: CompletionDetails | None = None
         self._view: View | None = None
@@ -226,6 +234,8 @@ class CommandPalette(OptionList):
         self.editor = editor
         self._last_document = editor.text
         self._edit_serial = getattr(editor, "user_edit_serial", 0)
+        if self.local_completion is not None:
+            return
         with self.session.target_source(self.source_id):
             editor.dialect = self.session.source.dialect
         self.set_interval(0.1, self._guard_ai)
@@ -260,10 +270,13 @@ class CommandPalette(OptionList):
         editor = self.editor
         return bool(editor is not None and editor.is_mounted and editor.is_on_screen
                     and self.app.focused is editor and not editor.read_only
+                    and getattr(editor, "file_format", "sql") == "sql"
                     and editor.selection.start == editor.selection.end
                     and self.session.intellisense
                     and (not self._sql_muted or allow_commands)
-                    and (not ai or not self.session.busy) and not getattr(self.app, "_closing", False))
+                    and (allow_commands or self.local_completion is not None or not getattr(editor, "dbt_template", False))
+                    and (not ai or self.local_completion is None and not self.session.busy)
+                    and not getattr(self.app, "_closing", False))
 
     def cancel_ai(self) -> None:
         self._generation += 1
@@ -300,7 +313,8 @@ class CommandPalette(OptionList):
                  and serial > getattr(editor, "programmatic_edit_serial", 0))
         self._edit_serial = serial
         self.cancel_ai()
-        self._values_snapshot = self._snapshot() if typed and not self._accepting and self._eligible() else None
+        self._values_snapshot = (self._snapshot() if self.local_completion is None
+                                 and typed and not self._accepting and self._eligible() else None)
         self.queue_sync()
         if typed and not self._accepting and self.session.ai_completion and self._eligible(ai=True):
             self.request_ai(automatic=True)
@@ -338,12 +352,24 @@ class CommandPalette(OptionList):
         if self._view is not None and self._view.phase == "ai":
             return
         row, column = editor.cursor_location
+        if self.local_completion is not None:
+            if self._sql_muted:
+                self._hide()
+                return
+            result = self.local_completion(editor.text, _offset(editor.text, (row, column)), manual)
+            context = result.context
+            if result.items or result.signature or result.hint:
+                self._show(View(context.start, context.token, _completion_entries(result),
+                                end=context.end, signature=result.signature, hint=result.hint))
+            else:
+                self._hide()
+            return
         line = editor.document[row]
         with self.session.target_source(self.source_id):
             editor.dialect = self.session.source.dialect
             view = view_for(self.session, editor.text, line, column, parameters=self._parameters(),
                             row=row, query_history=self.workspace_actions, manual=manual,
-                            commands_only=self._sql_muted)
+                            commands_only=self._sql_muted or getattr(editor, "dbt_template", False))
             if (view is not None and view.phase == "argument" and view.value_field is not None
                     and not self.session.busy and self.session.value_cache_enabled
                     and (manual or values_snapshot is not None and values_snapshot == self._snapshot())):
@@ -365,7 +391,10 @@ class CommandPalette(OptionList):
     def accept_table(self, table: str) -> bool:
         """Accept a registered explorer table by identity, never display spelling."""
         editor = self.editor
-        if (editor is None or editor.read_only or self._sql_muted or not self.session.intellisense
+        if (editor is None or self.local_completion is not None or editor.read_only
+                or getattr(editor, "file_format", "sql") != "sql"
+                or getattr(editor, "dbt_template", False)
+                or self._sql_muted or not self.session.intellisense
                 or editor.selection.start != editor.selection.end):
             return False
         row, column = editor.cursor_location
@@ -384,11 +413,11 @@ class CommandPalette(OptionList):
 
     def values_current(self, snapshot: tuple) -> bool:
         """Guard asynchronous cached-value publication without initiating a read."""
-        return self._eligible() and self._snapshot() == snapshot
+        return self.local_completion is None and self._eligible() and self._snapshot() == snapshot
 
     def values_ready(self, snapshot: tuple, source, table: str, column: str) -> bool:
         """Publish a finished cache read after typing, but never after retarget/dismissal."""
-        if not self._eligible():
+        if self.local_completion is not None or not self._eligible():
             return False
         current = self._snapshot()
         # Only document, caret, user-edit serial and selection revision may advance.
@@ -802,10 +831,18 @@ class EditorPane(Vertical):
             raise SkipAction()
 
     def action_completion_toggle(self) -> None:
+        if self.palette.local_completion is not None and self.palette.session.completion_keys["completion_toggle"] == "escape":
+            if not self.palette.is_open:
+                raise SkipAction()  # Allow the modal to close when no suggestions are open.
+            self.palette.close()
+            return
         self.palette.escape()
 
     def action_palette_tab(self) -> bool:
-        return self.palette.accept_highlighted()
+        accepted = self.palette.accept_highlighted()
+        if not accepted and self.palette.local_completion is not None:
+            raise SkipAction()  # Normal Tab focus traversal in the modal.
+        return accepted
 
     def action_complete_local(self) -> None:
         self.palette.manual_local()
@@ -816,6 +853,10 @@ class EditorPane(Vertical):
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         # Completion shortcuts target the SQL editor, not another focused control.
         if self.is_mounted and self.app.focused is not self.editor:
+            return False
+        if getattr(self.editor, "file_format", "sql") != "sql":
+            return False
+        if action == "complete_ai" and self.palette.local_completion is not None:
             return False
         if action == "scroll_details":
             details = self.palette.details

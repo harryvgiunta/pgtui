@@ -28,6 +28,7 @@ from d8r.ai import client
 from d8r.ai.context import AIContext, AIProposal, AIQuestion
 from d8r.ai.diagnostics import AIDiagnostics
 from d8r.credentials import CredentialError
+from d8r.dbt import DbtError
 from d8r.sql import FnDef
 from .editing import DraftTextArea
 
@@ -195,10 +196,12 @@ class AITarget:
     parameters: tuple[str, ...] | None = None
     details: str = ""
     function_name: str = ""
+    dbt_file: tuple[str, str, str] | None = None
 
     @property
     def key(self) -> str:
-        return json.dumps(["function" if self.parameters is not None else "workspace", *self.identity])
+        mode = "dbt" if self.dbt_file else "function" if self.parameters is not None else "workspace"
+        return json.dumps([mode, *self.identity])
 
 
 @dataclass
@@ -280,7 +283,7 @@ class AIChat:
             mode, _, identity = json.loads(self.target_key)
         except (ValueError, TypeError):
             return None
-        return identity if mode == "workspace" else None
+        return identity if mode in {"workspace", "dbt"} else None
 
 
 class AIChats:
@@ -444,18 +447,25 @@ class AIChats:
             self.changed(chat)
             return False
         chat.diagnostics.protect(list(client.parse_headers(config.headers).values()))
-        if not self.session.source_connected(target.source_id):
+        if target.dbt_file is None and not self.session.source_connected(target.source_id):
             chat.status_text = "This source is disconnected. Reconnect it before sending an AI request."
             self.changed(chat)
             return False
         generation = chat.generation + 1
         try:
-            context = AIContext(
-                self.session, target.source_id, target.document, target.parameters, target.function_name,
-                save_guard=lambda: self._mutation_guard(chat, generation),
-                ask_user=lambda question: self._ask_user(chat, generation, question),
-            )
+            ask_user = lambda question: self._ask_user(chat, generation, question)
+            if target.dbt_file:
+                context = self.app.dbt_ai_context(target, ask_user=ask_user)
+            else:
+                context = AIContext(
+                    self.session, target.source_id, target.document, target.parameters, target.function_name,
+                    save_guard=lambda: self._mutation_guard(chat, generation), ask_user=ask_user,
+                )
             system = context.system_prompt()
+        except DbtError as exc:
+            chat.status_text = str(exc)
+            self.changed(chat)
+            return False
         except Exception:
             chat.status_text = "Unable to prepare AI context for this target."
             self.changed(chat)
@@ -769,6 +779,10 @@ class AIChats:
     async def _review_proposal(self, chat, context, proposal, generation) -> bool:
         """Publish a reviewed draft. Only correctable query errors invite another answer."""
         error = context.validate_replacement(proposal)
+        if proposal.dbt_drafts:
+            chat.proposal, chat.validation_error = proposal, error
+            chat.status_text = error or "Review the dbt diff, then Apply to save the project files. Nothing will run."
+            return False
         chat.diagnostics.record("Proposal validation (offline lexical/template-only)",
                                 error or "Lexical/template checks passed; not server validation.")
         query = proposal.function is None and context.parameters is None
@@ -924,7 +938,7 @@ class AIChats:
             chat.status_text = "AI provider changed. Send a fresh request before applying a proposal."
             self.changed(chat)
             return False
-        if automatic and (chat.saves_function or chat.query_warning):
+        if automatic and (chat.saves_function or chat.query_warning or chat.proposal.dbt_drafts):
             return False
         if panel.snapshot() != chat.target:
             chat.status_text = "Target changed. History is preserved, but this proposal cannot be applied."
@@ -946,9 +960,15 @@ class AIChats:
             self.changed(chat)
             return False
         saves_function = chat.saves_function
+        dbt_drafts = bool(chat.proposal.dbt_drafts)
         try:
-            panel.apply_document(chat.proposal)
+            result = panel.apply_document(chat.proposal)
             chat.target = panel.snapshot()
+        except DbtError as exc:
+            chat.status = "error"
+            chat.status_text = str(exc)
+            self.changed(chat)
+            return False
         except Exception as exc:
             chat.status = "error"
             chat.status_text = ("Save function failed" if saves_function else "Apply failed") + (
@@ -963,8 +983,10 @@ class AIChats:
         chat.status = "idle"
         chat.diagnostics.record("Saved function" if saves_function else "Auto-applied" if automatic else "Applied",
                                 "Function definition saved; saving does not execute it." if saves_function else
+                                result if dbt_drafts and result else
                                 "Drafts updated; applying does not execute queries or save functions.")
         chat.status_text = ("Function saved. Saving does not execute it." if saves_function else
+                            (result or "dbt changes applied; nothing executed.") if dbt_drafts else
                             "Applied despite the failed check. Query not executed." if chat.query_warning else
                             "Query drafts applied. Applying does not execute them.")
         chat.query_warning = None
@@ -1263,7 +1285,7 @@ class AIPanel(Vertical):
     ]
 
     def __init__(self, session, snapshot: Callable[[], AITarget],
-                 apply: Callable[[AIProposal], None], return_focus: Callable[[], None], *,
+                 apply: Callable[[AIProposal], str | None], return_focus: Callable[[], None], *,
                  reveal: Callable[[], None] | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self.session = session
@@ -1528,6 +1550,7 @@ class AIPanel(Vertical):
         apply = self.query_one("#ai-apply", Button)
         apply.label = ("Apply anyway" if chat.proposal is not None and chat.query_warning else
                        "Save function" if chat.saves_function else
+                       "Apply dbt drafts" if chat.proposal is not None and chat.proposal.dbt_drafts else
                        "Apply queries" if chat.proposal is not None and chat.proposal.queries else "Apply")
         apply.disabled = (self.busy or chat.proposal is None or stale or not matching
                           or chat.validation_error is not None or guard_error is not None)
@@ -1739,7 +1762,12 @@ class AIPanel(Vertical):
             return
         if self.chat is None:
             return
-        if self.manager.start(self.chat, self.snapshot(), prompt):
+        target = self.snapshot()
+        if target.dbt_file:
+            # Pin the request to the revision autosave will leave on disk.
+            self.app._flush_workspace()
+            target = self.snapshot()
+        if self.manager.start(self.chat, target, prompt):
             self._set_input("")
 
     def action_apply(self) -> None:

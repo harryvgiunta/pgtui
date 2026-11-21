@@ -19,6 +19,9 @@ dependencies = [
     "textual==8.2.7",
     "keyring==25.7.0",
     "PyYAML==6.0.3",
+    "dbt-core==1.12.7",
+    "dbt-postgres==1.11.0",
+    "ruamel.yaml==0.19.1",
 ]
 
 [project.urls]
