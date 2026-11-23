@@ -16,7 +16,7 @@ from textual.binding import Binding
 from textual.content import Content
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Checkbox, Input, OptionList, Select, Static, TextArea
+from textual.widgets import Button, Checkbox, Input, OptionList, Select, Static, Switch, TextArea
 from textual.widgets.option_list import Option
 
 from d8r.ai import client as ai_client
@@ -41,7 +41,7 @@ MENUS: dict[str, str] = {
     "theme": "Theme",
     "values": "Value cache",
     "sources": "Data source",
-    "dbt": "DBT",
+    "workspace": "Workspace Settings",
     "ai": "AI providers",
     "keys": "Keybindings",
 }
@@ -144,6 +144,10 @@ class SettingsScreen(ModalScreen[None]):
                 with Vertical(id="settings-content"):
                     yield Static("", id="settings-heading")
                     yield Static("", id="settings-description", markup=False)
+                    with Horizontal(id="workspace-dbt-setting"):
+                        yield Static("Enable dbt", id="workspace-dbt-label")
+                        yield Switch(self.session.dbt_enabled, animate=False, id="workspace-dbt-enabled",
+                                     tooltip="Enable dbt for this source workspace")
                     yield OptionList(id="settings-menu")
             yield Static("", id="settings-hint")
 
@@ -165,7 +169,12 @@ class SettingsScreen(ModalScreen[None]):
         the visual a widget paints, and a screen has to leave it alone.
         """
         self.rows = self._row_source()
+        self.query_one("#workspace-dbt-setting").display = self.menu == "workspace"
+        switch = self.query_one("#workspace-dbt-enabled", Switch)
+        with switch.prevent(Switch.Changed):
+            switch.value = self.session.dbt_enabled
         menu = self.query_one("#settings-menu", OptionList)
+        menu.display = bool(self.rows)
         menu.clear_options()
         menu.add_options(
             [Option(self._row_prompt(row), id=f"row-{index}") for index, row in enumerate(self.rows)]
@@ -182,7 +191,7 @@ class SettingsScreen(ModalScreen[None]):
                       "Completion uses cached metadata only and never queries while typing. "
                       "Values never go to disk and are cleared at exit. Changing these settings clears cached values.",
             "sources": "Connect PostgreSQL, Cloudflare D1 or a local Parquet file. SQL dialect and engine version follow the selected source.",
-            "dbt": "Open the directory that contains dbt_project.yml. Its files, history and skills live in the dbt explorer.",
+            "workspace": "Create a dbt project with the setup assistant, or enable dbt for this data source to open an existing project. Disabling dbt suspends project files and tooling without deleting drafts or settings.",
             "ai": "Provider forms require Save & use to activate changes. Permission toggles save immediately. Schema refreshes control AI metadata lookups, not IDE indexing. "
                   "Test AI Queries checks final drafts and tries up to two SQL repairs. By default the database plans without running. Failed drafts require manual Apply anyway. "
                   "Run read-only test queries opts into bounded execution instead; reads can still be expensive. "
@@ -206,7 +215,7 @@ class SettingsScreen(ModalScreen[None]):
             "theme": "enter / click apply and save theme",
             "values": "enter / click toggle, edit or clear",
             "sources": "enter / click select or add",
-            "dbt": "enter / click open dbt settings",
+            "workspace": "space toggle dbt · ↓ project actions · enter open or create",
             "ai": "enter / click toggle or edit",
             "keys": "enter / click edit IntelliSense shortcuts",
         }[self.menu]
@@ -262,8 +271,10 @@ class SettingsScreen(ModalScreen[None]):
                 )
                 for label, source_id in self.session.source_options()
             ]
-        if self.menu == "dbt":
-            return [Row("Open & Save Project Home", self.session.dbt_project_dir or "not configured", "dbt")]
+        if self.menu == "workspace":
+            existing = ([Row("Open & Save Project Home", self.session.dbt_project_dir or "not configured", "dbt")]
+                        if self.session.dbt_enabled else [])
+            return [*existing, Row("New dbt Project with AI", "interview, preview and link a new project", "dbt-setup")]
         if self.menu == "ai":
             config = self.session.ai_config
             return [
@@ -315,7 +326,21 @@ class SettingsScreen(ModalScreen[None]):
         self.query_one("#settings-sidebar", OptionList).focus()
 
     def action_details(self) -> None:
+        if self.menu == "workspace":
+            self.query_one("#workspace-dbt-enabled", Switch).focus()
+            return
         self.query_one("#settings-menu", OptionList).focus()
+
+    @on(Switch.Changed, "#workspace-dbt-enabled")
+    def _workspace_dbt_changed(self, event: Switch.Changed) -> None:
+        self.ide.set_dbt_enabled(event.value)
+        self._draw()
+
+    def on_key(self, event: events.Key) -> None:
+        if (self.menu == "workspace" and event.key == "down"
+                and self.focused is self.query_one("#workspace-dbt-enabled", Switch)):
+            event.stop()
+            self.query_one("#settings-menu", OptionList).focus()
 
     @on(OptionList.OptionSelected, "#settings-menu")
     def _selected(self, event: OptionList.OptionSelected) -> None:
@@ -371,6 +396,11 @@ class SettingsScreen(ModalScreen[None]):
                 self.action_details()
 
             self.app.push_screen(CompletionKeyScreen(self.ide, binding), key_saved)
+            return
+        elif row.action == "dbt-setup":
+            self.dismiss(None)
+            # Run on the app's message pump, not the closing Settings screen's.
+            self.ide.call_later(self.ide.action_new_dbt_project)
             return
         elif row.action == "dbt":
             def project_opened(path) -> None:

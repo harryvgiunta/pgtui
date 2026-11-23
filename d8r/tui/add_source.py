@@ -25,10 +25,11 @@ class AddSourceModal(ModalScreen):
     BINDINGS = [Binding("escape,f8", "cancel", "Cancel connection")]
     CONNECTION_TIMEOUT = CONNECTION_TIMEOUT
 
-    def __init__(self, session, *, profile: dict | None = None, **kwargs) -> None:
+    def __init__(self, session, *, profile: dict | None = None, backend: str | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self.session = session
         self._initial_profile = dict(profile) if profile else None
+        self._backend = backend
         self._postgres_profiles = list(session.postgres_profiles)
         self._d1_profiles = list(session.d1_profiles)
         self._built: tuple[tuple[str, ...], DataSource] | None = None
@@ -50,11 +51,11 @@ class AddSourceModal(ModalScreen):
                          "in your system keyring; uncheck it for this session only. Test and Cancel save nothing. "
                          "Workspace query text is local plaintext.", id="add-source-note", markup=False)
             yield Label("Source type", classes="field-label")
-            backend = {"parquet": "parquet", "d1-live": "d1"}.get(
+            backend = self._backend or {"parquet": "parquet", "d1-live": "d1"}.get(
                 (self._initial_profile or {}).get("kind"), "postgres")
             yield Select([("PostgreSQL", "postgres"), ("Local Parquet · DuckDB", "parquet"),
                           ("Cloudflare D1", "d1")], value=backend,
-                         allow_blank=False, id="source-backend")
+                         allow_blank=False, disabled=self._backend is not None, id="source-backend")
             with Vertical(id="parquet-fields"):
                 yield Static("Open one existing local .parquet or .pq file without copying or changing it. "
                              "Add remembers its path and display name. Query it with SELECT * FROM data LIMIT 50.", markup=False)

@@ -46,13 +46,16 @@ from d8r.completion.engine import function_insertion
 from d8r.dbt import DbtError, DbtProject, has_query_jinja
 from d8r.dbt_edits import DbtDraft, add_description
 from d8r.dbt_files import DbtFile, DbtFiles, file_revision, reference_at
+from d8r.dbt_rename import DbtRenamePlan
 from d8r.engine import POSTGRES_VERSION, DataSource, EngineError
 from d8r.sql import ColumnDef, format_parameters
 from d8r.themes import COZY_PASTEL
 
 from .add_source import AddSourceModal
 from .connection import ConnectionProgress, build_saved_source, saved_source_label
-from .dbt import DbtExplorer, DbtModelScreen, DbtTestScreen
+from .dbt import DbtExplorer, DbtModelScreen, DbtRenameScreen, DbtTestScreen
+from .dbt_authoring import DbtAuthoring
+from .dbt_setup import DbtSetupScreen
 from .editor_tools import FindBar, format_editor
 from .ai import AIChats, AIPanel, AITarget, ConversationTabs, DeleteOptionList
 from .palette import CommandPalette, EditorPane
@@ -244,6 +247,11 @@ class D8RApp(App):
         # The way back into Settings when the Intellisense switch has the
         # palette shut — `\settings` itself needs the popup.
         Binding("f12", "dbt_definition", "Open dbt definition", show=False),
+        Binding("shift+f12", "dbt_references", "Find dbt references", show=False),
+        Binding("f2", "dbt_rename", "Rename dbt model", show=False),
+        Binding("shift+f2", "dbt_rename_column", "Rename dbt output column", show=False),
+        Binding("f9", "dbt_inspect", "Inspect dbt schema", show=False),
+        Binding("shift+f9", "dbt_expand_star", "Expand dbt SELECT *", show=False),
         Binding("ctrl+comma", "settings", "Settings", priority=True),
     ]
 
@@ -261,6 +269,7 @@ class D8RApp(App):
         self._dbt_file: dict[str, str] | None = None
         # A loaded page or conversion preview is not itself an edit to a project file.
         self._dbt_autosave_text = ""
+        self.dbt_authoring = DbtAuthoring(self)
         self._workspace_editor: TextArea | None = None
         self._workspace_timer = None
         self._workspace_edited = 0.0
@@ -304,7 +313,7 @@ class D8RApp(App):
                                                                        context="Explorer focused")
                                  + " · reopen with \\schema or \\pages")
                 initial_tab = self.session.workspace["explorer_tab"]
-                if initial_tab == "agents":
+                if initial_tab == "agents" or (initial_tab == "dbt" and not self.session.dbt_enabled):
                     initial_tab = "schema"
                 with ExplorerTabs(initial="tab-" + initial_tab, id="explorer-tabs"):
                     with TabPane("Schema", id="tab-schema"):
@@ -359,6 +368,11 @@ class D8RApp(App):
                                      tooltip=binding_tooltip(self.BINDINGS, "query_sections"))
                     with Horizontal(id="dbt-editor-tools"):
                         yield Button("Git Diff", id="dbt-file-diff", compact=True)
+                        yield Button("Rename Model", id="dbt-rename-model", compact=True,
+                                     tooltip=binding_tooltip(self.BINDINGS, "dbt_rename"))
+                        yield Button("Inspect", id="dbt-inspect", compact=True,
+                                     tooltip=binding_tooltip(self.BINDINGS, "dbt_inspect"))
+                        yield Button("Problems", id="dbt-problems-button", compact=True)
                         with Horizontal(id="dbt-view-controls"):
                             yield Static("SQL", classes="dbt-switch-label")
                             yield Switch(id="dbt-toggle", animate=False, tooltip="Convert the draft without running SQL")
@@ -367,7 +381,8 @@ class D8RApp(App):
                     with EditorPane(id="editor-pane"):
                         yield QueryTextArea(self._initial_document, dialect=self.session.source.dialect,
                                             show_line_numbers=True, id="editor")
-                        yield CommandPalette(self.session, id="palette", markup=False)
+                        yield CommandPalette(self.session, id="palette", markup=False,
+                                             template_completion=self.dbt_authoring.complete)
                     yield FnEditor(self, id="function-editor")
                 with PaneSplitter("#editor-slot", "height", "editor", min_size=8,
                                   min_remaining=5, id="editor-splitter"):
@@ -441,10 +456,10 @@ class D8RApp(App):
         page = next((item for item in self.session.workspace["pages"] if item["id"] == self._document_identity), None)
         if page is not None and "dbt_file" in page:
             self._load_page_text(page)
-        self.query_one(DbtExplorer).refresh_project()
-        self._sync_dbt_controls()
+        self._sync_dbt_availability()
         self.editor.move_cursor(tuple(self.session.workspace.get("cursor", [0, 0])))
         self._workspace_ready = True
+        self.dbt_authoring.request()
         self.ai_panel.target_changed()
         self._set_status(f"ready · {self.session.active_id} · {self.session.dialect}")
         if self.session.memory_error:
@@ -550,7 +565,8 @@ class D8RApp(App):
             self._workspace_timer.stop()
             self._workspace_timer = None
         self._capture_workspace()
-        if self._dbt_file and self._workspace_snapshot["document"] != self._dbt_autosave_text:
+        if (self.session.dbt_enabled and self._dbt_file
+                and self._workspace_snapshot["document"] != self._dbt_autosave_text):
             self._save_active_dbt_file(self._workspace_snapshot["document"])
             self._capture_workspace()
         if self._workspace_snapshot:
@@ -600,7 +616,7 @@ class D8RApp(App):
         self._sync_source_select()
         self._refresh_header()
         self._refresh_tree()
-        self.query_one(DbtExplorer).refresh_project()
+        self._sync_dbt_availability()
         self._refresh_history()
         outcome, sql, result_closed = self._workspace_outputs.pop(self._workspace_key, (None, "", False))
         self._render_results(outcome)
@@ -660,7 +676,7 @@ class D8RApp(App):
             title = link["path"] if link else page["title"] or next(
                 (line.strip() for line in page["document"].splitlines() if line.strip()), "Untitled query")
             marker = "• " if page["id"] == self._document_identity else ""
-            label = f"dbt · {Path(link['project_dir']).name}" if link else page["source"]
+            label = (f"dbt · {Path(link['project_dir']).name}" if self.session.dbt_enabled else "saved file draft") if link else page["source"]
             listing.add_option(Option(self._page_label(title, label, marker, width), id=page["id"]))
         if active_changed and any(page["id"] == self._document_identity for page in pages):
             listing.highlighted = listing.get_option_index(self._document_identity)
@@ -680,7 +696,7 @@ class D8RApp(App):
 
     @on(Button.Pressed, "#page-details-toggle")
     def _toggle_page_details(self) -> None:
-        if self._dbt_file:
+        if self.session.dbt_enabled and self._dbt_file:
             self._open_dbt_properties()
             return
         details = self.query_one("#page-details", PageDetails)
@@ -783,7 +799,10 @@ class D8RApp(App):
         self.editor.focus()
         self._flush_workspace()
         if not self._autosave_error:
-            self._set_status("dbt file restored from Pages" if self._dbt_file else "Query page restored · nothing executed")
+            if self.editor.read_only:
+                self._set_status("Saved file draft · read-only while dbt is disabled")
+            else:
+                self._set_status("dbt file restored from Pages" if self._dbt_file else "Query page restored · nothing executed")
 
     def _restore_page(self, page: dict) -> None:
         """Swap the stable draft and its offline target without running or connecting."""
@@ -811,7 +830,7 @@ class D8RApp(App):
         self._document_identity = page["id"]
         self._dbt_file = dict(page["dbt_file"]) if "dbt_file" in page else None
         document = page["document"]
-        if self._dbt_file and self._dbt_file["revision"] == file_revision(document):
+        if self.session.dbt_enabled and self._dbt_file and self._dbt_file["revision"] == file_revision(document):
             try:
                 actual = self._read_dbt_page(self._dbt_file)
             except (DbtError, OSError):
@@ -819,12 +838,17 @@ class D8RApp(App):
             else:
                 document = actual.text
                 self._dbt_file["revision"] = actual.revision
+                self.dbt_authoring.opened(self._dbt_file["project_dir"], self._dbt_file["path"], document)
         self.editor.load_text(document)
         self._dbt_autosave_text = self.editor.text if self._dbt_file else ""
         self.editor.move_cursor(tuple(page["cursor"]))
+        self._sync_dbt_controls()
 
     @on(TabbedContent.TabActivated, "#explorer-tabs")
     def _explorer_tab_changed(self, event: TabbedContent.TabActivated) -> None:
+        if event.pane.id == "tab-dbt" and not self.session.dbt_enabled:
+            self.query_one(ExplorerTabs).active = "tab-schema"
+            return
         if event.pane.id != "tab-functions":
             self._last_explorer_tab = event.pane.id
         if self._workspace_ready:
@@ -834,6 +858,7 @@ class D8RApp(App):
                 self.call_after_refresh(self._refresh_pages)
             elif event.pane.id == "tab-dbt":
                 self.query_one(DbtExplorer).refresh_project()
+            self.dbt_authoring.request()
 
     def action_toggle_pages(self) -> None:
         """Reveal Pages from another tab; toggle the explorer if already selected."""
@@ -893,7 +918,7 @@ class D8RApp(App):
     @on(Button.Pressed, "#format-query")
     def action_format_sql(self) -> None:
         editor = self.active_sql_editor()
-        if editor.file_format != "sql":
+        if editor.file_format != "sql" or editor.read_only:
             return
         if self._dbt_home and has_query_jinja(editor.text, dialect=editor.dialect):
             self._set_status("Switch to SQL before using the SQL formatter on a dbt template")
@@ -919,16 +944,19 @@ class D8RApp(App):
     def _ai_target(self) -> AITarget:
         if self.function_mode:
             return self.function_editor._ai_target()
-        link = (self._dbt_file["project_dir"], self._dbt_file["path"], self._dbt_file["revision"]) if self._dbt_file else None
+        link = self._dbt_file if self.session.dbt_enabled else None
+        target_file = (link["project_dir"], link["path"], link["revision"]) if link else None
         return AITarget(
             (self.session.source_key(), self._document_identity),
-            self.session.active_id, self.editor.text, dbt_file=link,
+            self.session.active_id, "" if self.editor.read_only else self.editor.text, dbt_file=target_file,
         )
 
     def _apply_ai_document(self, proposal: AIProposal) -> str | None:
         if self.function_mode:
             self.function_editor._apply_ai_draft(proposal)
             return None
+        if self.editor.read_only:
+            raise DbtError("This file draft is read-only while dbt is disabled for the workspace.")
         if proposal.dbt_drafts:
             return self._apply_dbt_drafts(proposal.dbt_drafts)
         if proposal.function is not None:
@@ -999,8 +1027,8 @@ class D8RApp(App):
         self.query_one("#refresh-schema", Button).disabled = running
         self.query_one("#reconnect-source", Button).display = not self.session.source_connected()
         source = self.session.source
-        self._sync_dbt_controls()
         self.editor.dialect = source.dialect
+        self._sync_dbt_controls()
         label = "Cloudflare D1 · SQLite" if source.dialect == "sqlite" else (
             "PostgreSQL" if source.dialect == "postgres" else "DuckDB")
         version = source.server_version or (f"target {POSTGRES_VERSION}" if source.dialect == "postgres" else "")
@@ -1202,6 +1230,8 @@ class D8RApp(App):
         self.query_one("#editor-splitter").display = output
         if not output:
             self.query_one("#editor-slot").styles.height = "1fr"
+        if self._workspace_ready:
+            self.dbt_authoring.request()
         self.call_after_refresh(self._refresh_splitters)
 
     def _refresh_splitters(self) -> None:
@@ -1244,11 +1274,17 @@ class D8RApp(App):
             self.exit()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        if self.screen_stack and isinstance(self.screen, (CompletionKeyScreen, DbtTestScreen)):
+        if self.screen_stack and isinstance(self.screen, (CompletionKeyScreen, DbtTestScreen, DbtRenameScreen)):
             return False  # Keep workspace shortcuts out of the modal editor.
         if action == "dbt_definition":
             return (self._workspace_ready and not self.function_mode and not self._modal_open()
                     and self.screen.focused is self.editor and self.editor.dbt_navigation)
+        if action == "dbt_references":
+            return (self._workspace_ready and self.session.dbt_enabled and bool(self._dbt_home)
+                    and not self.function_mode and not self._modal_open() and self.screen.focused is self.editor)
+        if action in {"dbt_rename", "dbt_rename_column", "dbt_inspect", "dbt_expand_star"}:
+            return (self._workspace_ready and self.session.dbt_enabled and bool(self._dbt_file)
+                    and not self.function_mode and not self._modal_open() and self.screen.focused is self.editor)
         if action == "cancel_operation":
             return (self._connection_progress is not None or self._cancel_run is not None) and not self._modal_open()
         if action in {"find_sql", "format_sql", "query_sections"}:
@@ -1324,7 +1360,7 @@ class D8RApp(App):
             if paged_read is None:
                 self.function_editor.action_preview()
             return
-        if self.editor.file_format != "sql":
+        if self.editor.file_format != "sql" or self.editor.read_only:
             return
         dbt_home = self._dbt_home
         document = self.editor.selected_text or self.editor.text
@@ -1472,7 +1508,7 @@ class D8RApp(App):
         """Expand local functions only; native SQL grammar is checked on Run."""
         if self.function_mode or self._modal_open() or self.ai_panel.has_focus_within:
             return
-        if self.editor.file_format != "sql":
+        if self.editor.file_format != "sql" or self.editor.read_only:
             return
         if self.refuse_busy("SQL preview"):
             return
@@ -1587,6 +1623,25 @@ class D8RApp(App):
         self.palette.close()
         self.push_screen(SettingsScreen(self))
 
+    def action_new_dbt_project(self) -> None:
+        if self._modal_open() or self.refuse_busy("Set up a dbt project"):
+            return
+        self.palette.close()
+        self.push_screen(DbtSetupScreen(self), self._dbt_setup_completed)
+
+    def _dbt_setup_completed(self, result: tuple[str, str] | None) -> None:
+        if result is None or self._closing:
+            return
+        source_id, home = result
+        if not self.select_source(source_id):
+            self.notify("Project linked. Select its source to open it; see the project README.md for verification.")
+            return
+        self._sync_dbt_availability()
+        self.dbt_authoring.invalidate()
+        self.show_dbt_explorer("dbt-panel-files")
+        self.open_dbt_file(home, "README.md")
+        self._set_status("dbt project created and linked · see README.md for external verification · nothing executed")
+
     def action_fn(self) -> None:
         """Open a searchable library without replacing the active editor."""
         if self._modal_open():
@@ -1605,17 +1660,34 @@ class D8RApp(App):
 
     @property
     def _dbt_home(self) -> str:
+        if not self.session.dbt_enabled:
+            return ""
         return self._dbt_file["project_dir"] if self._dbt_file else self.session.dbt_project_dir
 
+    def _sync_dbt_availability(self) -> None:
+        tabs = self.query_one(ExplorerTabs)
+        if self.session.dbt_enabled:
+            tabs.show_tab("tab-dbt")
+        else:
+            if tabs.active == "tab-dbt":
+                tabs.active = "tab-schema"
+            if self._last_explorer_tab == "tab-dbt":
+                self._last_explorer_tab = "tab-schema"
+            tabs.hide_tab("tab-dbt")
+        self.query_one(DbtExplorer).refresh_project()
+        self._sync_dbt_controls()
+
     def _sync_dbt_controls(self) -> None:
-        link = self._dbt_file
-        suffix = Path(link["path"]).suffix.lower() if link else ".sql"
+        enabled = self.session.dbt_enabled
+        link = self._dbt_file if enabled else None
+        suffix = Path(self._dbt_file["path"]).suffix.lower() if self._dbt_file else ".sql"
         sql = suffix == ".sql"
         editor = self.editor
+        editor.read_only = bool(self._dbt_file and not enabled)
         editor.file_format = "sql" if sql else "yaml" if suffix in {".yaml", ".yml"} else "text"
         editor.dbt_navigation = bool(self._dbt_home)
-        templated = sql and has_query_jinja(editor.text, dialect=self.session.dialect)
-        dbt_template = editor.dbt_navigation and templated
+        templated = enabled and sql and has_query_jinja(editor.text, dialect=self.session.dialect)
+        dbt_template = templated
         if dbt_template and not editor.dbt_template:
             self.palette.close()
         editor.dbt_template = dbt_template
@@ -1629,14 +1701,20 @@ class D8RApp(App):
             details.display = False
             self.query_one("#page-details-toggle", Button).label = "Show Page Details"
         for selector in ("#run-query", "#format-query", "#query-sections", "#page-details-toggle"):
-            self.query_one(selector, Button).display = sql
+            self.query_one(selector, Button).display = sql and not editor.read_only
+        self.query_one("#open-ai", Button).display = not editor.read_only
         self.query_one("#dbt-file-diff", Button).display = bool(link)
-        convert = sql and (bool(self._dbt_home) or self.session.dialect == "postgres")
+        self.query_one("#dbt-rename-model", Button).display = bool(link) and suffix in {".sql", ".py"}
+        self.query_one("#dbt-inspect", Button).display = bool(link) and sql
+        self.query_one("#dbt-problems-button", Button).display = bool(link) and suffix in {".sql", ".yml", ".yaml"}
+        convert = enabled and sql
         self.query_one("#dbt-view-controls").display = convert
         self.query_one("#dbt-editor-tools").display = bool(link) or convert
         switch = self.query_one("#dbt-toggle", Switch)
         with switch.prevent(Switch.Changed):
             switch.value = templated
+        if self._workspace_ready:
+            self.dbt_authoring.request()
 
     def _dbt_conversion_target(self) -> dict[str, str]:
         source = self.session.source
@@ -1649,7 +1727,8 @@ class D8RApp(App):
 
     def action_dbt(self, to_dbt: bool | None = None) -> None:
         """Convert explicitly to SQL or normalized dbt without running or saving it."""
-        if not self._workspace_ready or self._modal_open() or self.function_mode or self.editor.file_format != "sql":
+        if (not self._workspace_ready or not self.session.dbt_enabled or self._modal_open()
+                or self.function_mode or self.editor.file_format != "sql"):
             return
         editor = self.editor
         document = editor.text
@@ -1660,7 +1739,7 @@ class D8RApp(App):
             to_dbt = not templated
         try:
             if not directory:
-                raise DbtError("Set a project home in Settings → DBT first")
+                raise DbtError("Set a project home in Settings → Workspace Settings first")
             if not document.strip():
                 raise DbtError("Open a model or enter a SQL query first")
             project = DbtProject(directory, dialect=dialect)
@@ -1713,22 +1792,78 @@ class D8RApp(App):
         if self.save_workspace(dbt_views=views, **self._workspace_snapshot):
             self._set_status("dbt Jinja · nothing executed" if to_dbt else "Native SQL · nothing executed")
 
-    def set_dbt_project_dir(self, path: str) -> bool:
+    def _dbt_workspace_settings(self, *, source_key: str | None = None, **changes) -> bool:
         workspaces = deepcopy(self.session.workspace["source_workspaces"])
-        state = workspaces.setdefault(self.session.source_key(), {
-            "document_id": self._document_identity, "function_draft": None, "active_view": "workspace",
+        active_key = self.session.source_key()
+        source_key = active_key if source_key is None else source_key
+        state = workspaces.setdefault(source_key, {
+            "document_id": self._document_identity if source_key == active_key else "",
+            "function_draft": None, "active_view": "workspace",
         })
-        state["dbt_project_dir"] = path
-        return self.save_workspace(source_workspaces=workspaces)
+        state.update(changes)
+        return self.save_workspace(source_workspaces=workspaces, **self._workspace_snapshot)
 
-    def show_dbt_explorer(self) -> None:
+    def set_dbt_enabled(self, enabled: bool) -> bool:
+        if self.session.dbt_enabled == enabled:
+            return True
+        self.palette.close()
+        # Do not write project files as a side effect of toggling the switch.
+        # A pending edit remains in Pages, where it can be resumed later.
+        self._capture_workspace()
+        if self._dbt_file:
+            self._dbt_autosave_text = self.editor.text
+        saved = self._dbt_workspace_settings(dbt_enabled=enabled)
+        self._page_rows = ()
+        self._refresh_pages()
+        self._sync_dbt_availability()
+        self.dbt_authoring.invalidate()
+        self.ai_panel.target_changed()
+        if saved:
+            self._set_status(f"dbt {'enabled' if enabled else 'disabled'} for this workspace")
+        return saved
+
+    def set_dbt_project_dir(self, path: str) -> bool:
+        if not self.session.dbt_enabled:
+            return False
+        self._capture_workspace()
+        saved = self._dbt_workspace_settings(dbt_project_dir=path)
+        self._sync_dbt_availability()
+        return saved
+
+    def link_new_dbt_project(self, source_key: str, path: str) -> bool:
+        self._capture_workspace()
+        return self._dbt_workspace_settings(source_key=source_key, dbt_project_dir=path, dbt_enabled=True)
+
+    def show_dbt_explorer(self, panel: str | None = None) -> None:
+        if not self.session.dbt_enabled:
+            return
         if not self.pane_visible("schema") and not self.update_settings(panes={"schema": True}):
             return
         self.set_pane("schema", True)
         self.query_one("#explorer-tabs", TabbedContent).active = "tab-dbt"
         self.query_one(DbtExplorer).refresh_project()
+        if panel is not None:
+            self.query_one("#dbt-panels", TabbedContent).active = panel
         self._sync_dbt_controls()
         self.save_workspace(explorer_tab="dbt")
+        if panel == "dbt-panel-lineage":
+            self.query_one("#dbt-lineage-tree", Tree).focus()
+        elif panel == "dbt-panel-problems":
+            self.query_one("#dbt-problems-list", OptionList).focus()
+
+    @on(Button.Pressed, "#dbt-problems-button")
+    def action_dbt_problems(self) -> None:
+        self.show_dbt_explorer("dbt-panel-problems")
+
+    def action_dbt_lineage(self) -> None:
+        self.show_dbt_explorer("dbt-panel-lineage")
+
+    @on(Button.Pressed, "#dbt-inspect")
+    def action_dbt_inspect(self) -> None:
+        self.dbt_authoring.inspect()
+
+    def action_dbt_expand_star(self) -> None:
+        self.dbt_authoring.expand_star()
 
     def _active_page(self) -> dict:
         return next((item for item in self.session.workspace["pages"] if item["id"] == self._document_identity), {})
@@ -1761,6 +1896,8 @@ class D8RApp(App):
         return DbtFile(document, link["revision"], disk.bom)
 
     def dbt_ai_context(self, target: AITarget, *, ask_user) -> DbtAIContext:
+        if not self.session.dbt_enabled:
+            raise DbtError("dbt is disabled for this workspace.")
         home, path, revision = target.dbt_file
         project = DbtFiles(home)
         model = project.model(path, self._dbt_yaml_drafts(home))
@@ -1772,7 +1909,7 @@ class D8RApp(App):
         return DbtAIContext(self.session, target.source_id, path, project, current, model, properties, ask_user=ask_user)
 
     def _apply_dbt_drafts(self, drafts: tuple[DbtDraft, ...]) -> str:
-        if self._dbt_file is None:
+        if not self.session.dbt_enabled or self._dbt_file is None:
             raise DbtError("The dbt file target changed; send a new request.")
         home = self._dbt_home
         project = DbtFiles(home)
@@ -1813,6 +1950,7 @@ class D8RApp(App):
             self.set_pane("schema", True)
         self.query_one("#explorer-tabs", TabbedContent).active = "tab-pages"
         self._sync_dbt_controls()
+        self.dbt_authoring.invalidate()
         if refresh_tree:
             self.query_one(DbtExplorer).refresh_project(force=True)
         status = f"Autosaved {saved} dbt file(s) · nothing executed"
@@ -1826,7 +1964,7 @@ class D8RApp(App):
 
     def open_dbt_file(self, home: str, path: str, *, row: int | None = None,
                       draft: DbtDraft | None = None, autosave: bool = False) -> None:
-        if self.refuse_busy("Open dbt file"):
+        if not self.session.dbt_enabled or self.refuse_busy("Open dbt file"):
             return
         self.ai_panel._flush_chat()
         self._flush_workspace()
@@ -1854,6 +1992,92 @@ class D8RApp(App):
         if not self._autosave_error and not autosave:
             self._set_status(f"dbt · {path}")
 
+    def _linked_dbt_pages(self, home: str, *, all_sources: bool = False):
+        for page in self.session.workspace["pages"]:
+            if not all_sources and page["source"] != self._workspace_key:
+                continue
+            current = page["id"] == self._document_identity
+            link = self._dbt_file if current else page.get("dbt_file")
+            if link and link["project_dir"] == home:
+                yield page, link, self.editor.text if current else page["document"]
+
+    def _dbt_project_drafts(self, home: str) -> dict[str, str]:
+        drafts = {}
+        for page, link, text in self._linked_dbt_pages(home):
+            views = page.get("dbt_views", {})
+            if (views.get("project_dir") == home and views.get("sql") != views.get("jinja")
+                    and (text == views.get("sql") or not has_query_jinja(text, dialect=page["dialect"] or self.session.dialect))):
+                # Converted SQL previews are not the project authoring buffer.
+                continue
+            if file_revision(text) != link["revision"]:
+                drafts[link["path"]] = text
+        return drafts
+
+    def _dbt_rename_dirty(self, home: str) -> frozenset[str]:
+        dirty = set()
+        for page, link, text in self._linked_dbt_pages(home, all_sources=True):
+            views = page.get("dbt_views", {})
+            if text == views.get("sql") and views.get("project_dir") == home:
+                text = views["jinja"]  # Only a clean preview can be discarded on rename.
+            if file_revision(text) != link["revision"]:
+                dirty.add(link["path"])
+        return frozenset(dirty)
+
+    @on(Button.Pressed, "#dbt-rename-model")
+    def action_dbt_rename(self) -> None:
+        if (not self.session.dbt_enabled or self._modal_open() or self.function_mode
+                or not self._dbt_file or self.refuse_busy("Rename model")):
+            return
+        self._flush_workspace()
+        self.palette.close()
+        self.push_screen(DbtRenameScreen(self, self._dbt_home, self._dbt_file["path"]))
+
+    def action_dbt_rename_column(self) -> None:
+        if (not self.session.dbt_enabled or self._modal_open() or self.function_mode or not self._dbt_file
+                or self.editor.file_format != 'sql' or self.refuse_busy('Rename column')):
+            return
+        views = self._active_page().get('dbt_views', {})
+        if self.editor.text == views.get('sql') and views.get('sql') != views.get('jinja'):
+            self._set_status('Switch back to the dbt draft before renaming a column')
+            return
+        self._flush_workspace()
+        self.palette.close()
+        offset = self.editor.document.get_index_from_location(self.editor.cursor_location)
+        self.push_screen(DbtRenameScreen(self, self._dbt_home, self._dbt_file['path'], column_offset=offset))
+
+    def action_dbt_references(self) -> None:
+        if self.session.dbt_enabled and not self.function_mode and not self._modal_open():
+            self.palette.close()
+            self.dbt_authoring.references()
+
+    def finish_dbt_rename(self, home: str, plan: DbtRenamePlan, saved: dict[str, DbtFile]) -> None:
+        """Retarget open/saved pages before the next autosave can see an old filename."""
+        updated = {edit.path: edit.destination for edit in plan.edits}
+        pages = []
+        for item in self.session.workspace["pages"]:
+            page = dict(item)
+            link = page.get("dbt_file", {})
+            if link.get("project_dir") == home and (destination := updated.get(link["path"])):
+                content = saved[destination]
+                page.update(document=content.text, dbt_file={**link, "path": destination, "revision": content.revision})
+                if page["id"] == self._document_identity:
+                    caret = self.editor.cursor_location
+                    self._dbt_file = dict(page["dbt_file"])
+                    self.editor.load_text(content.text)
+                    self.editor.move_cursor(caret)
+                    self._dbt_autosave_text = self.editor.text
+            if page.get("dbt_views", {}).get("project_dir") == home:
+                page.pop("dbt_views")
+            pages.append(page)
+        self._capture_workspace()
+        stored = self.save_workspace(pages=pages, **self._workspace_snapshot)
+        self.ai_panel.target_changed()
+        self._sync_dbt_controls()
+        self.query_one(DbtExplorer).refresh_project(force=True)
+        self.dbt_authoring.invalidate()
+        if stored:
+            self._set_status(f"Renamed {plan.old_name} → {plan.new_name} · {len(saved)} file(s) · nothing executed")
+
     def _dbt_yaml_drafts(self, home: str) -> dict[str, str]:
         drafts = {}
         for item in self.session.workspace["pages"]:
@@ -1867,7 +2091,7 @@ class D8RApp(App):
 
     def _open_dbt_properties(self) -> None:
         link = self._dbt_file
-        if link is None:
+        if not self.session.dbt_enabled or link is None:
             return
         home, path = link["project_dir"], link["path"]
         try:
@@ -1889,6 +2113,8 @@ class D8RApp(App):
             self._set_status(str(exc))
 
     def action_create_dbt_test(self) -> None:
+        if not self.session.dbt_enabled:
+            return
         self._flush_workspace()
         home = self._dbt_home
         try:
@@ -1971,13 +2197,14 @@ class D8RApp(App):
         self._dbt_file = {**link, "revision": saved.revision}
         if not self._closing:
             self._sync_dbt_controls()
+            self.dbt_authoring.invalidate()
             self.ai_panel.target_changed()
             if new or link["path"] == "dbt_project.yml":
                 self.query_one(DbtExplorer).refresh_project(force=True)
             self._set_status(f"Autosaved {link['path']} · nothing executed")
 
     def reload_dbt_file(self) -> None:
-        if self._dbt_file is None or self.function_mode:
+        if not self.session.dbt_enabled or self._dbt_file is None or self.function_mode:
             return
         try:
             disk = self._read_dbt_page(self._dbt_file)
@@ -1988,12 +2215,13 @@ class D8RApp(App):
         self._dbt_file["revision"] = disk.revision
         self._dbt_autosave_text = self.editor.text
         self._sync_dbt_controls()
+        self.dbt_authoring.invalidate()
         self._flush_workspace()
         self._set_status(f"Reloaded {self._dbt_file['path']} · undo to restore the draft")
 
     @on(Button.Pressed, "#dbt-file-diff")
     def action_dbt_diff(self) -> None:
-        if self._dbt_file is None or self.function_mode:
+        if not self.session.dbt_enabled or self._dbt_file is None or self.function_mode:
             return
         explorer = self.query_one(DbtExplorer)
         explorer.run_worker(explorer.show_diff(self._dbt_home, self._dbt_file["path"], self.editor.text,
@@ -2011,7 +2239,7 @@ class D8RApp(App):
 
     def action_query_to_fn(self) -> None:
         """Open a new function draft without saving or rewriting the document."""
-        if self.editor.file_format != "sql":
+        if self.editor.file_format != "sql" or self.editor.read_only:
             return
         self._open_fn(new_body=self.editor.text, restore_draft=False)
 
@@ -2036,7 +2264,7 @@ class D8RApp(App):
     @on(Button.Pressed, "#open-ai")
     def action_ai(self) -> None:
         """Open the in-layout assistant without changing the document."""
-        if self._modal_open():
+        if self._modal_open() or (not self.function_mode and self.editor.read_only):
             return
         self.palette.close()
         self.ai_panel.open()
@@ -2619,7 +2847,7 @@ class D8RApp(App):
         if event.node.is_root:
             event.node.toggle()
             return
-        if data.get("kind") != "column":
+        if data.get("kind") != "column" or editor.read_only:
             return
         with self.session.target_source(palette.source_id):
             reference = self.session.column_reference(
@@ -2669,6 +2897,10 @@ class D8RApp(App):
             "run": self.action_run,
             "compile": self.action_compile,
             "dbt": self.action_dbt,
+            "dbt-lineage": self.action_dbt_lineage,
+            "dbt-problems": self.action_dbt_problems,
+            "dbt-references": self.action_dbt_references,
+            "dbt-rename-column": self.action_dbt_rename_column,
             "add-source": self.action_add_source,
             "history": self.action_toggle_history,
             "toggle-results": self.action_toggle_results,

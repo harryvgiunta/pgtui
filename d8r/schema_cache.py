@@ -74,6 +74,7 @@ def capture_schema(source: DataSource) -> SchemaSnapshot | None:
         routine.name, routine.parameters, routine.return_type, routine.doc,
         routine.kind, routine.variadic, routine.parameter_types,
         tuple(_catalog_column(column, enum_labels=False) for column in routine.columns),
+        min_args=routine.min_args,
     ) for routine in routines if not _temporary(routine.name, source.dialect))
     return SchemaSnapshot(source.dialect, source.server_version,
                           source.default_schema or source.postgres.get("schema"),
@@ -144,8 +145,10 @@ def _snapshot_record(value: object) -> None:
             if _temporary(key["target_table"], dialect):
                 raise ValueError("Temporary foreign key target")
     for value in _list(snapshot["routines"], "routines"):
-        routine = _record(value, {"name", "parameters", "return_type", "doc", "kind",
-                                  "variadic", "parameter_types", "columns"}, "catalog routine")
+        fields = {"name", "parameters", "return_type", "doc", "kind", "variadic", "parameter_types", "columns"}
+        if isinstance(value, dict) and "min_args" in value:
+            fields.add("min_args")
+        routine = _record(value, fields, "catalog routine")
         _text(routine["name"], "routine name", nonempty=True)
         if _temporary(routine["name"], dialect):
             raise ValueError("Temporary catalog routine")
@@ -158,6 +161,9 @@ def _snapshot_record(value: object) -> None:
             raise ValueError("Invalid native routine kind")
         if type(routine["variadic"]) is not bool:
             raise ValueError("Routine variadic flag must be boolean")
+        minimum = routine.get("min_args")
+        if minimum is not None and (type(minimum) is not int or not 0 <= minimum <= len(routine["parameters"])):
+            raise ValueError("Invalid minimum routine argument count")
         _columns(routine["columns"], dialect)
 
 
@@ -191,6 +197,7 @@ def _encode(snapshot: SchemaSnapshot) -> dict:
                       "return_type": routine.return_type, "doc": routine.doc,
                       "kind": routine.kind, "variadic": routine.variadic,
                       "parameter_types": list(routine.parameter_types),
+                      "min_args": routine.min_args,
                       "columns": [_encode_column(column) for column in routine.columns]}
                      for routine in snapshot.routines],
     }

@@ -805,8 +805,13 @@ def _workspace_document(value: object) -> dict:
         _text(key, "workspace source key", nonempty=True)
         if isinstance(workspace, dict):
             workspace.setdefault("dbt_project_dir", "")
-        _record(workspace, {"document_id", "function_draft", "active_view", "dbt_project_dir"}, "source workspace")
+            # Keep existing configured projects enabled on upgrade; new workspaces opt in.
+            workspace.setdefault("dbt_enabled", bool(workspace["dbt_project_dir"]))
+        _record(workspace, {"document_id", "function_draft", "active_view", "dbt_project_dir", "dbt_enabled"},
+                "source workspace")
         _text(workspace["dbt_project_dir"], "dbt project directory")
+        if type(workspace["dbt_enabled"]) is not bool:
+            raise ValueError("invalid workspace dbt setting")
         _text(workspace["document_id"], "source workspace document_id")
         if workspace["active_view"] not in ("workspace", "function"):
             raise ValueError("invalid source workspace view")

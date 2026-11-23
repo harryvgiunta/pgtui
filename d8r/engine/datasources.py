@@ -213,6 +213,7 @@ _PG_ROUTINES = """
 SELECT n.nspname, p.proname, p.prokind, p.proretset,
        pg_catalog.pg_get_function_result(p.oid),
        pg_catalog.obj_description(p.oid, 'pg_proc'), p.provariadic <> 0,
+       p.pronargdefaults,
        p.proargnames, p.proargmodes,
        ARRAY(SELECT pg_catalog.format_type(arg.type_oid, NULL)
              FROM pg_catalog.unnest(COALESCE(p.proallargtypes, p.proargtypes::oid[]))
@@ -241,7 +242,7 @@ def _postgres_routines(cursor) -> tuple[RoutineDef, ...]:
     cursor.execute(_PG_ROUTINES)
     routines = []
     for (namespace, name, native_kind, returns_set, result, doc, variadic,
-         names, modes, types, column_names, column_types) in cursor:
+         defaults, names, modes, types, column_names, column_types) in cursor:
         parameters, parameter_types, outputs = [], [], []
         for index, dtype in enumerate(types):
             mode = modes[index] if modes else "i"
@@ -264,6 +265,7 @@ def _postgres_routines(cursor) -> tuple[RoutineDef, ...]:
         routines.append(RoutineDef(
             relation_name(namespace, name), tuple(parameters), result or "", doc or "",
             kind, bool(variadic), tuple(parameter_types), columns if kind == "table" else (),
+            min_args=max(0, len(parameters) - defaults - int(variadic)),
         ))
     return tuple(routines)
 
@@ -292,7 +294,8 @@ def _duckdb_routines(con) -> tuple[RoutineDef, ...]:
         # duckdb_functions exposes arguments, not table output schemas. Never
         # bind or execute user routines to guess their result columns.
         routines.append(RoutineDef(relation_name(*parts), tuple(parameters), result or "",
-                                   doc or "", kind, bool(varargs), tuple(parameter_types)))
+                                   doc or "", kind, bool(varargs), tuple(parameter_types),
+                                   min_args=len(names) if native_kind in {"scalar", "aggregate", "window"} else None))
     return tuple(routines)
 
 

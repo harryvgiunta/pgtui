@@ -9,6 +9,7 @@ from textual.widgets import Button, DataTable, Input, OptionList, TextArea
 
 from d8r.tui.app import D8RApp
 from d8r.tui.fn import FnExplorer, FunctionPicker
+from d8r.tui.palette import CommandPalette
 from d8r.tui.session import Session
 from tests.test_native_engine import postgres_source
 
@@ -533,9 +534,14 @@ async def test_escape_returns_to_query_without_losing_function_or_chat_drafts(pa
         await pilot.pause()
         app.query_one(focus).focus()
         await pilot.pause()
+        if focus == "#fn-body":
+            await pilot.press("ctrl+space")
+            await pilot.pause()
+            assert app.function_editor.query_one(CommandPalette).suggestions_visible
         await pilot.press("escape")
         await pilot.pause()
         assert app.editor.has_focus and not app.function_mode
+        assert not app.function_editor.query_one(CommandPalette).is_open
         assert app.editor.text == "SELECT 99" and app._document_identity == page_id
         assert session.workspace["function_draft"]["body"] == draft
         assert session.fns == functions

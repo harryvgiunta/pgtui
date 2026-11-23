@@ -18,6 +18,7 @@ from uuid import uuid4
 from typing import TYPE_CHECKING
 
 from textual import on
+from textual.actions import SkipAction
 from textual.binding import Binding
 from textual.message import Message
 from textual.app import ComposeResult
@@ -79,6 +80,12 @@ class FnBodyPane(EditorPane):
         self.palette.close()
         self.screen.focus_next()
         return True
+
+    def action_completion_toggle(self) -> None:
+        if self.palette.session.completion_keys["completion_toggle"] == "escape":
+            # Back must work even when local suggestions appeared automatically.
+            raise SkipAction()
+        super().action_completion_toggle()
 
 
 class FnExplorer(Vertical):
@@ -253,7 +260,6 @@ class FunctionPicker(ModalScreen[FnDef | None]):
 class FnEditor(Vertical):
     """A persistent function draft in the workspace's middle editor slot."""
 
-    # In the SQL body, completion has priority over the form's Back action.
     BINDINGS = [Binding("escape", "back", "Back to query", show=False)]
 
 

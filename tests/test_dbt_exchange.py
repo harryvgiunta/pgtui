@@ -154,8 +154,10 @@ def test_editor_toggle_preserves_crlf_and_is_undoable(tmp_path):
     async def scenario():
         app = D8RApp(Session({target.id: target}, data_dir=tmp_path / "state"))
         async with app.run_test(size=(140, 50)) as pilot:
+            assert app.set_dbt_enabled(True)
             assert app.set_dbt_project_dir(str(root))
             app.editor.load_text(sql)
+            await pilot.pause()
             await pilot.click("#dbt-toggle")
             jinja = app.editor.text
             assert "{{ source('landing', 'orders') }} -- keep\r\n" in jinja
@@ -364,6 +366,7 @@ def test_modal_saves_project_home_without_editing_query(tmp_path, parquet_source
     async def scenario():
         app = D8RApp(Session({parquet_source.id: parquet_source}, data_dir=tmp_path / "state"))
         async with app.run_test(size=(140, 55)) as pilot:
+            assert app.set_dbt_enabled(True)
             app.editor.load_text("select 1")
             screen = DBTScreen(app)
             app.push_screen(screen)

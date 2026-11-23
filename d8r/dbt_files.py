@@ -6,6 +6,7 @@ import os
 import re
 import stat
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -87,7 +88,7 @@ class DbtFiles:
             raise DbtError(f"Not an editable dbt project file: {relative}")
         return path
 
-    def paths(self) -> tuple[str, ...]:
+    def paths(self, *, ignore_directory: Callable[[str], bool] | None = None) -> tuple[str, ...]:
         paths = []
         visited = 0
         try:
@@ -95,8 +96,10 @@ class DbtFiles:
                 visited += len(files) + len(folders)
                 if visited > _TREE_LIMIT:
                     raise DbtError(f"The project exceeds the explorer's {_TREE_LIMIT:,}-entry limit.")
-                folders[:] = sorted(name for name in folders if not name.startswith(".") and
-                                    not _linked(directory / name) and self._visible(directory / name / "_"))
+                folders[:] = sorted(name for name in folders if not name.startswith('.') and
+                                    not _linked(directory / name) and self._visible(directory / name / '_') and
+                                    not (ignore_directory and ignore_directory(
+                                        (directory / name).relative_to(self.root).as_posix() + '/')))
                 for name in files:
                     path = directory / name
                     relative = path.relative_to(self.root).as_posix()

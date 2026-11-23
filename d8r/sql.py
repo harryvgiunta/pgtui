@@ -48,6 +48,7 @@ class RoutineDef:
     variadic: bool = False
     parameter_types: tuple[str, ...] = ()
     columns: tuple[ColumnDef, ...] = ()
+    min_args: int | None = None  # None when the catalog does not expose defaults.
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "parameters", tuple(self.parameters))

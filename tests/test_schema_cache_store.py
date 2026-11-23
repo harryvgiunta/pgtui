@@ -26,7 +26,7 @@ def catalog_snapshot():
         ), (ForeignKey(("tenant", "id"), "public.customers", ("tenant_id", "id")),)),),
         (RoutineDef('public."Order output"', ('"tenant" integer', 'VARIADIC text[]'),
                     "TABLE(id bigint, state text)", "Native routine documentation", "table", True,
-                    ("integer", "text[]"), (ColumnDef("id", "bigint"), ColumnDef("state", "text"))),
+                    ("integer", "text[]"), (ColumnDef("id", "bigint"), ColumnDef("state", "text")), min_args=1),
          RoutineDef("pg_catalog.count", ("*",), "bigint", "Aggregate docs", "aggregate")),
         STAMP,
     )
@@ -50,6 +50,19 @@ def test_snapshot_roundtrip_preserves_native_metadata_and_engine_shape(tmp_path)
     assert restored.snapshots["postgres:catalog-target"] is restored.snapshots["postgres:catalog-target"]
     with pytest.raises(FrozenInstanceError):
         snapshot.dialect = "sqlite"
+
+
+def test_older_cache_without_argument_minimum_loads_without_guessing(tmp_path):
+    store = SchemaCacheStore(tmp_path)
+    store.save_snapshot("target", catalog_snapshot())
+    document = json.loads(store.path.read_text(encoding="utf-8"))
+    document["snapshots"]["target"]["routines"][0].pop("min_args")
+    store.path.write_text(json.dumps(document), encoding="utf-8")
+
+    restored = SchemaCacheStore(tmp_path)
+    assert restored.error == ""
+    routine = restored.snapshots["target"].routines[0]
+    assert routine.min_args is None and len(routine.parameters) == 2
 
 
 def test_snapshot_owns_immutable_collections():
@@ -201,6 +214,8 @@ def test_capture_retains_only_string_catalog_labels(d1_source):
     lambda doc: doc["snapshots"]["target"]["tables"][0]["columns"][2].update(values=[1]),
     lambda doc: doc["snapshots"]["target"]["tables"][0]["foreign_keys"][0].update(target_columns=[]),
     lambda doc: doc["snapshots"]["target"]["routines"][0].update(variadic="yes"),
+    lambda doc: doc["snapshots"]["target"]["routines"][0].update(min_args=3),
+    lambda doc: doc["snapshots"]["target"]["routines"][0].update(min_args=True),
     lambda doc: doc["snapshots"]["target"]["routines"][0].update(kind="template"),
     lambda doc: doc["snapshots"]["target"]["routines"][0].update(body="SELECT private"),
     lambda doc: doc["snapshots"]["target"]["routines"][0].update(name="pg_temp_2.bad"),

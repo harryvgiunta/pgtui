@@ -73,6 +73,28 @@ Default rows caps fetched preview rows, not an injected LIMIT. Buffer at most
 Normal PostgreSQL cursors may buffer additional driver data; do not claim scan or
 memory bounds stronger than the exercised behavior.
 
+## dbt authoring
+
+`dbt_enabled` and the project home are source-workspace settings. Disabled
+workspaces must not index project files, autosave linked drafts, convert Jinja,
+offer dbt completion/actions, or expose project files through AI tools. Existing
+drafts and native SQL tooling remain available without the integration.
+
+`dbt_index.py` indexes confined local sources and optional manifest metadata.
+Use the authored draft for local edges, not stale compiled SQL. Diagnostics,
+hover, completion and lineage are bounded, advisory and offline; never run dbt,
+render project Jinja or query a warehouse while typing. Publish feedback only
+to the captured workspace, path and text. Partial schemas can be shown but must
+not authorize replacing `SELECT *`.
+
+`dbt_rename.py` plans a model move and static reference/metadata rewrites without
+writing. Require explicit review, refuse ambiguous bindings and unsaved candidate
+buffers, and revalidate the input inventory (including additions) at Apply.
+Preserve unrelated text and encodings. Never overwrite an occupied destination.
+Report incomplete rollback; multiple file publications are not crash-atomic.
+After success retarget affected Pages and discard stale conversion views before
+resuming autosave.
+
 ## Functions
 
 Keep the local reusable function layer. Definitions are source-scoped FnDef

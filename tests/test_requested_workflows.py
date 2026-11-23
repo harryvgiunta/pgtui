@@ -230,18 +230,25 @@ async def test_project_home_is_source_scoped_and_restores(parquet_source, d1_sou
     session = Session(sources, data_dir=tmp_path / "state")
     app = D8RApp(session)
     async with app.run_test(size=(150, 48)) as pilot:
+        assert app.set_dbt_enabled(True)
         assert app.set_dbt_project_dir(str(tmp_path / "project-one"))
         app.select_source(d1_source.id)
         await pilot.pause()
+        assert not session.dbt_enabled
         assert session.dbt_project_dir == ""
+        assert app.set_dbt_enabled(True)
         assert app.set_dbt_project_dir(str(tmp_path / "project-two"))
+        assert app.set_dbt_enabled(False)
         app.select_source(parquet_source.id)
         await pilot.pause()
         assert session.dbt_project_dir == str(tmp_path / "project-one")
+        assert session.dbt_enabled
     restored = Session(sources, data_dir=tmp_path / "state")
+    assert restored.dbt_enabled
     assert restored.dbt_project_dir == str(tmp_path / "project-one")
     restored.set_active(d1_source.id)
     assert restored.dbt_project_dir == str(tmp_path / "project-two")
+    assert not restored.dbt_enabled
 
 
 @pytest.mark.parametrize("dismiss", [False, True])

@@ -8,6 +8,7 @@ from __future__ import annotations
 from bisect import bisect_right
 from collections import Counter
 import re
+from typing import TYPE_CHECKING
 
 from rich.segment import Segment
 from rich.style import Style
@@ -26,6 +27,9 @@ from d8r.sql import SqlError, Token, _relation_end, _relation_sites, cte_declara
 from d8r.completion.catalog import KEYWORDS
 from .editing import DraftTextArea
 from .query_folds import FoldedDocument, LineFold, hidden_lines, line_folds
+
+if TYPE_CHECKING:
+    from d8r.dbt_analysis import Diagnostic, Insight
 
 _TOKENS = re.compile(
     r"(?P<comment>--[^\n]*|/\*[\s\S]*?(?:\*/|\Z))"
@@ -150,6 +154,11 @@ class QueryTextArea(DraftTextArea):
         self._syntax_revision = 0
         self._fold_regions: dict[int, LineFold] | None = None
         self._collapsed: set[int] = set()
+        self._dbt_feedback_revision = -1
+        self._dbt_marks: dict[int, list[tuple[int, int, str]]] = {}
+        self._dbt_line_starts = [0]
+        self._dbt_diagnostics: tuple[Diagnostic, ...] = ()
+        self._dbt_insights: tuple[Insight, ...] = ()
         super().__init__(*args, **kwargs)
         self.dialect = dialect
 
@@ -245,6 +254,60 @@ class QueryTextArea(DraftTextArea):
         self.indent_width = 2 if self.file_format == "yaml" else 4
         self.refresh()
 
+    def set_dbt_feedback(self, diagnostics: tuple[Diagnostic, ...] = (),
+                         insights: tuple[Insight, ...] = ()) -> None:
+        self._dbt_feedback_revision = self._syntax_revision
+        self._dbt_diagnostics = diagnostics
+        self._dbt_insights = insights
+        self._dbt_marks.clear()
+        self._dbt_line_starts = [0]
+        if diagnostics:
+            lines, newline = self.document.lines, len(self.document.newline)
+            for row in range(len(lines) - 1):
+                self._dbt_line_starts.append(self._dbt_line_starts[-1] + len(lines[row]) + newline)
+            # Paint at least one cell when possible (e.g. an incomplete line at EOF).
+            for problem in diagnostics:
+                row, col = self.dbt_diagnostic_location(problem.start)
+                last, end = self.dbt_diagnostic_location(max(problem.start, problem.end))
+                for line in range(row, min(last, row + 2) + 1):
+                    length = len(self.document[line])
+                    start = min(col, max(0, length - 1)) if line == row else 0
+                    stop = max(start + 1, end) if line == last else length
+                    style = "warning" if problem.severity == "warning" else "error"
+                    self._dbt_marks.setdefault(line, []).append((start, min(stop, length), style))
+        if self.tooltip is not None:
+            self.tooltip = None
+        self._line_cache.clear()
+        self.refresh()
+
+    def dbt_diagnostic_location(self, offset: int) -> Location:
+        row = bisect_right(self._dbt_line_starts, offset) - 1
+        return row, offset - self._dbt_line_starts[row]
+
+    def dbt_detail(self, offset: int, *, at_caret: bool = False) -> str:
+        if self._dbt_feedback_revision != self._syntax_revision:
+            return ""
+        points = (offset, offset - 1) if at_caret else (offset,)
+        for point in points:
+            problem = next((item for item in self._dbt_diagnostics if item.start <= point < max(item.start + 1, item.end)), None)
+            if problem:
+                return f"{problem.source}: {problem.message}"
+            matches = (item for item in self._dbt_insights if item.start <= point < item.end)
+            detail = min(matches, key=lambda item: item.end - item.start, default=None)
+            if detail:
+                return detail.text
+        return ""
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        if not (self._dbt_diagnostics or self._dbt_insights):
+            return
+        detail = ""
+        if event.x - self.gutter.left >= self.gutter_width and not self._selecting:
+            location = self.get_target_document_location(event)
+            detail = self.dbt_detail(self.document.get_index_from_location(location))
+        if detail != (str(self.tooltip) if self.tooltip is not None else ""):
+            self.tooltip = Text(detail) if detail else None
+
     def _watch_selection(self, previous_selection, selection) -> None:
         if previous_selection != selection:
             self.selection_revision += 1
@@ -276,11 +339,21 @@ class QueryTextArea(DraftTextArea):
         if not self.show_line_numbers:
             return strip
         line = self.wrapped_document.visual_line(y + self.scroll_offset.y)
-        if line is None or line[1] or line[0] not in self._sections():
+        if line is None or line[1]:
+            return strip
+        row = line[0]
+        fold = row in self._sections()
+        diagnostic = self._dbt_marks.get(row) if self._dbt_feedback_revision == self._syntax_revision else None
+        if not fold and not diagnostic:
             return strip
         column = self.gutter_width - 2  # Reuse one gutter padding cell.
         style = next(iter(strip.crop(column, column + 1))).style
-        mark = "▸" if line[0] in self._collapsed else "▾"
+        if fold:
+            mark = "▸" if row in self._collapsed else "▾"
+        else:
+            mark = "!"
+            severity = "error" if any(kind == "error" for _, _, kind in diagnostic) else "warning"
+            style = self.get_component_rich_style(f"query--{severity}", partial=True)
         return Strip.join((strip.crop(0, column), Strip([Segment(mark, style)], 1), strip.crop(column + 1)))
 
     def _on_mouse_down(self, event: events.MouseDown) -> None:
@@ -335,7 +408,7 @@ class QueryTextArea(DraftTextArea):
     COMPONENT_CLASSES = {
         "query--keyword", "query--function", "query--string", "query--comment",
         "query--number", "query--parameter", "query--operator", "query--punctuation",
-        "query--table",
+        "query--table", "query--error", "query--warning",
     }
     DEFAULT_CSS = """
     QueryTextArea {
@@ -351,6 +424,8 @@ class QueryTextArea(DraftTextArea):
         & .query--parameter { color: $text-secondary; text-style: italic; }
         & .query--operator { color: $text-accent; }
         & .query--punctuation { color: $text-muted; }
+        & .query--error { color: $error; text-style: underline; }
+        & .query--warning { color: $warning; text-style: underline; }
     }
     """
 
@@ -383,8 +458,14 @@ class QueryTextArea(DraftTextArea):
 
     def get_line(self, line_index: int) -> Text:
         line = super().get_line(line_index)
-        if self.file_format != "sql":
-            return line
+        if self.file_format == "sql":
+            self._color_sql_line(line, line_index)
+        if self._dbt_feedback_revision == self._syntax_revision:
+            for start, end, severity in self._dbt_marks.get(line_index, ()):
+                line.stylize(self.get_component_rich_style(f"query--{severity}", partial=True), start, end)
+        return line
+
+    def _color_sql_line(self, line: Text, line_index: int) -> None:
         syntax_key = (self._syntax_revision, self.dialect)
         if getattr(self, "_syntax_key", None) != syntax_key:
             text = self.text
@@ -426,4 +507,3 @@ class QueryTextArea(DraftTextArea):
                     self._syntax_lines.setdefault(row, []).append((max(0, start - starts[row]), end - starts[row], kind))
         for start, end, kind in self._syntax_lines.get(line_index, ()):
             line.stylize(self.get_component_rich_style(f"query--{kind}", partial=True), start, min(end, len(line.plain)))
-        return line

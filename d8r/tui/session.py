@@ -275,6 +275,12 @@ class Session:
         return state.get("dbt_project_dir", "")
 
     @property
+    def dbt_enabled(self) -> bool:
+        """Whether this source workspace may use the dbt integration."""
+        state = self.workspace["source_workspaces"].get(self.source_key(), {})
+        return state.get("dbt_enabled", bool(state.get("dbt_project_dir")))
+
+    @property
     def history(self) -> list[HistoryEntry]:
         """Newest-first history for the active connection, including target scopes."""
         return self.history_for()
@@ -1189,13 +1195,16 @@ class Session:
         the in-flight statement is separate and does not release ownership.
         """
         source = self.source
-        is_dbt = (source.dialect == "postgres" or bool(dbt_home)) and has_query_jinja(doc, dialect=source.dialect)
+        is_dbt = has_query_jinja(doc, dialect=source.dialect)
         native = doc
         if is_dbt:
+            if not self.dbt_enabled:
+                message = "dbt is disabled in Settings → Workspace Settings. Nothing was executed."
+                return [RunOutcome(status=message, error=message, doc=doc)]
             try:
                 directory = dbt_home or self.dbt_project_dir
                 if not directory:
-                    raise DbtError("Set a project home in Settings → DBT before running dbt Jinja.")
+                    raise DbtError("Set a project home in Settings → Workspace Settings before running dbt Jinja.")
                 target = source.postgres or self.saved_source_profile(source.id) or {}
                 native = DbtProject(directory, dialect=source.dialect).render_query(doc, database=target.get("database", ""))
             except (DbtError, OSError) as exc:

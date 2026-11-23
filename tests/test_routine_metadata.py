@@ -53,6 +53,7 @@ def test_duckdb_native_overloads_types_and_descriptions(parquet_source):
         (tuple(types), result or "", doc or "") for types, result, doc in actual
     }
     assert all(routine.kind == "scalar" for routine in discovered)
+    assert all(routine.min_args == 1 for routine in discovered)
     assert all(routine.name == relation_name("main", "abs") for routine in discovered)
     assert any(routine.doc for routine in discovered)
     assert any(routine.kind == "aggregate" for routine in named(source, "sum"))
@@ -70,6 +71,7 @@ def test_duckdb_user_macros_are_discovered_without_evaluation(parquet_source):
     assert scalar.kind == "scalar"
     assert scalar.parameters[0].startswith("value")
     assert scalar.parameter_types == ("",)
+    assert scalar.min_args is None  # DuckDB's macro inventory doesn't mark defaults.
     assert table.kind == "table"
     # Native catalog does not expose macro/table result columns. Do not guess.
     assert table.columns == ()
@@ -167,6 +169,8 @@ def test_postgres_accessible_native_overloads_out_columns_and_docs(postgres_rout
         CREATE FUNCTION pg_temp.completion_overload(value TEXT) RETURNS TEXT
         LANGUAGE SQL AS $$ SELECT value || '!' $$;
         COMMENT ON FUNCTION pg_temp.completion_overload(INTEGER) IS 'Integer overload';
+        CREATE FUNCTION pg_temp.completion_default(value INTEGER, scale INTEGER DEFAULT 1)
+        RETURNS INTEGER LANGUAGE SQL AS $$ SELECT value * scale $$;
         CREATE FUNCTION pg_temp.completion_outputs(value INTEGER)
         RETURNS TABLE(answer INTEGER, label TEXT)
         LANGUAGE SQL AS $$ SELECT value, 'label'::TEXT $$;
@@ -185,6 +189,8 @@ def test_postgres_accessible_native_overloads_out_columns_and_docs(postgres_rout
     assert integer.parameters == ('"value" integer',)
     assert integer.return_type == "integer"
     assert integer.doc == "Integer overload"
+    optional, = named(source, "completion_default")
+    assert optional.min_args == 1 and len(optional.parameters) == 2
     outputs, = named(source, "completion_outputs")
     assert outputs.kind == "table"
     assert outputs.parameter_types == ("integer",)

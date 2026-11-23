@@ -1011,10 +1011,13 @@ dependencies = [
     { name = "dbt-postgres" },
     { name = "duckdb" },
     { name = "httpx" },
+    { name = "jinja2" },
     { name = "keyring" },
+    { name = "pathspec" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pyyaml" },
     { name = "ruamel-yaml" },
+    { name = "sqlglot" },
     { name = "textual" },
 ]
 
@@ -1029,10 +1032,13 @@ requires-dist = [
     { name = "dbt-postgres", specifier = "==1.11.0" },
     { name = "duckdb", specifier = "==1.5.5" },
     { name = "httpx", specifier = "==0.28.1" },
+    { name = "jinja2", specifier = "==3.1.6" },
     { name = "keyring", specifier = "==25.7.0" },
+    { name = "pathspec", specifier = "==1.0.4" },
     { name = "psycopg", extras = ["binary"], specifier = "==3.3.6" },
     { name = "pyyaml", specifier = "==6.0.3" },
     { name = "ruamel-yaml", specifier = "==0.19.1" },
+    { name = "sqlglot", specifier = "==30.33.0" },
     { name = "textual", specifier = "==8.2.7" },
 ]
 

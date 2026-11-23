@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from difflib import unified_diff
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -11,14 +12,18 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, OptionList, Static, TextArea, Tree
+from textual.widgets import Button, Input, OptionList, Static, TabbedContent, TabPane, TextArea, Tree
 from textual.widgets.option_list import Option
 
 from d8r.dbt import DbtError
+from d8r.dbt_column_rename import plan_column_rename
 from d8r.dbt_docs import DbtDocs
 from d8r.dbt_edits import DbtDraft, model_ref, singular_test
 from d8r.dbt_files import DbtFile, DbtFiles, DbtModel, file_revision
 from d8r.dbt_git import git_diff
+from d8r.dbt_references import DbtReferences
+from d8r.dbt_rename import DbtRenamePlan, apply_rename, plan_rename
+from .dbt_authoring import DbtLineage, DbtProblems
 from .dbt_completion import DbtTestCompletion, model_columns
 from .editing import DraftTextArea
 from .palette import CommandPalette, EditorPane
@@ -81,7 +86,7 @@ class DBTScreen(DbtDialog):
     @on(Input.Submitted, "#dbt-project-dir")
     def _open_project(self) -> None:
         try:
-            if self.ide.session.source_key() != self.source:
+            if not self.ide.session.dbt_enabled or self.ide.session.source_key() != self.source:
                 raise DbtError("The source changed. Reopen project setup.")
             project = DbtFiles(self.query_one("#dbt-project-dir", Input).value.strip())
             if not self.ide.set_dbt_project_dir(str(project.root)):
@@ -194,7 +199,7 @@ class DbtTestScreen(DbtDialog):
     @on(Button.Pressed, "#dbt-test-create")
     def _create(self) -> None:
         try:
-            if self.session.source is not self.source:
+            if not self.session.dbt_enabled or self.session.source is not self.source:
                 raise DbtError("The source changed. Reopen the data test dialog.")
             path = self.project.test_file(self.query_one("#dbt-test-name", Input).value.strip())
             text = self.query_one("#dbt-test-sql", TextArea).text
@@ -219,6 +224,131 @@ class DbtDiffScreen(DbtDialog):
             yield Button("Close", id="dbt-close")
 
 
+class DbtReferencesScreen(DbtDialog):
+    DEFAULT_CSS = """
+    DbtReferencesScreen #dbt-usage-list { height: auto; max-height: 24; }
+    """
+
+    def __init__(self, results: DbtReferences) -> None:
+        super().__init__()
+        self.results = results
+
+    def compose(self) -> ComposeResult:
+        results = self.results
+        suffix = ' · some uses could not be verified' if results.limited else ''
+        with Vertical(classes='dbt-dialog'):
+            yield Static(f'References · {results.label}', markup=False)
+            if results.locations:
+                yield OptionList(*(Option(Text(f'{item.path}:{item.row + 1}:{item.column + 1}'
+                                               + (f' · {item.detail}' if item.detail else '')))
+                                   for item in results.locations), id='dbt-usage-list', markup=False)
+                yield Static(f'Enter opens a reference{suffix}', markup=False)
+            else:
+                yield Static(f'No statically resolved references{suffix}', markup=False)
+            yield Button('Close', id='dbt-close')
+
+    @on(OptionList.OptionSelected, '#dbt-usage-list')
+    def _choose(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(self.results.locations[event.option_index])
+
+
+class DbtRenameScreen(DbtDialog):
+    """Review every rewrite (and any file move) together before writing."""
+
+    DEFAULT_CSS = """
+    DbtRenameScreen #dbt-rename-diff { height: 1fr; min-height: 8; margin-bottom: 1; }
+    """
+
+    def __init__(self, ide: D8RApp, home: str, path: str, *, column_offset: int | None = None) -> None:
+        super().__init__()
+        self.ide, self.home, self.path = ide, home, path
+        self.context = (ide._workspace_key, ide._document_identity, ide.editor.text)
+        self.column_offset = column_offset
+        self.dialect = ide.editor.dialect
+        self.dirty = ide._dbt_rename_dirty(home)
+        self.plan: DbtRenamePlan | None = None
+        self.working = False
+
+    def compose(self) -> ComposeResult:
+        symbol = 'column' if self.column_offset is not None else 'model'
+        with Vertical(classes="dbt-dialog"):
+            yield Static(f"Rename dbt {symbol} · {self.path}", markup=False)
+            yield Input(placeholder=f"New {symbol} name", id="dbt-rename-name")
+            review = DraftTextArea(read_only=True, soft_wrap=False, id="dbt-rename-diff")
+            review.display = False
+            yield review
+            yield Static("Preview the definition and reference edits before applying.", id="dbt-message", markup=False)
+            with Horizontal(classes="dbt-buttons"):
+                yield Button("Preview Rename", id="dbt-rename-submit", variant="primary")
+                yield Button("Cancel", id="dbt-rename-cancel")
+
+    @on(Button.Pressed, "#dbt-rename-cancel")
+    def action_cancel(self) -> None:
+        if not self.working:
+            self.dismiss(None)
+
+    def _current(self) -> bool:
+        ide = self.ide
+        return (ide.session.dbt_enabled and ide._dbt_home == self.home
+                and (ide._workspace_key, ide._document_identity, ide.editor.text) == self.context
+                and ide._dbt_rename_dirty(self.home) == self.dirty)
+
+    @on(Button.Pressed, "#dbt-rename-submit")
+    @on(Input.Submitted, "#dbt-rename-name")
+    def _submit(self) -> None:
+        if self.working or not self._current():
+            return
+        name = self.query_one(Input).value.strip()
+        self.working = True
+        for button in self.query(Button):
+            button.disabled = True
+        self.run_worker(self._review_or_apply(name), group="dbt-rename", exit_on_error=False)
+
+    async def _review_or_apply(self, name: str) -> None:
+        def preview():
+            project = DbtFiles(self.home)
+            if self.column_offset is None:
+                plan = plan_rename(project, self.path, name, dirty=self.dirty)
+            else:
+                plan = plan_column_rename(project, self.path, self.column_offset, name, dialect=self.dialect,
+                                          dirty=self.dirty, revision=file_revision(self.context[2]))
+            diff = []
+            for edit in plan.edits:
+                diff.append(f"\n{edit.path} → {edit.destination}\n" if edit.path != edit.destination else f"\n{edit.path}\n")
+                diff.extend(unified_diff(edit.before.text.splitlines(keepends=True), edit.text.splitlines(keepends=True),
+                                         fromfile=edit.path, tofile=edit.destination))
+            return plan, "".join(diff)
+
+        try:
+            if self.plan is None:
+                self._message("Checking project references…")
+                plan, diff = await asyncio.to_thread(preview)
+                if not self._current():
+                    self._message("The workspace or its drafts changed. Reopen rename.")
+                    return
+                self.plan = plan
+                self.query_one(Input).display = False
+                self.query_one(Vertical).add_class("diff")
+                review = self.query_one("#dbt-rename-diff", TextArea)
+                review.load_text(diff)
+                review.display = True
+                review.focus()
+                self.query_one("#dbt-rename-submit", Button).label = "Apply Rename"
+                self._message(f"Review {len(plan.edits)} file(s). Apply writes to disk; nothing runs.")
+            else:
+                self._message("Rechecking the reviewed files, then applying…")
+                plan = self.plan
+                saved = await asyncio.to_thread(lambda: apply_rename(DbtFiles(self.home), plan))
+                self.ide.finish_dbt_rename(self.home, plan, saved)
+                self.dismiss(None)
+        except (DbtError, OSError) as exc:
+            self._message(str(exc))
+        finally:
+            self.working = False
+            for button in self.query(Button):
+                button.disabled = False
+
+
 class DbtExplorer(Vertical):
     """Display project paths and explicit dbt actions in the shared explorer."""
 
@@ -228,36 +358,48 @@ class DbtExplorer(Vertical):
         super().__init__(**kwargs)
         self.ide = ide
         self.home: str | None = None
+        self.workspace: str | None = None
         self.docs = DbtDocs()
 
     def compose(self) -> ComposeResult:
-        with Horizontal(classes="dbt-explorer-actions"):
-            yield Button("Project Home", id="dbt-home", compact=True)
-            yield Button("Refresh", id="dbt-refresh", compact=True)
-        yield Tree("dbt", id="dbt-tree")
-        yield Static("", id="dbt-explorer-status", markup=False)
+        with TabbedContent(initial="dbt-panel-files", id="dbt-panels"):
+            with TabPane("Files", id="dbt-panel-files"):
+                with Horizontal(classes="dbt-explorer-actions"):
+                    yield Button("Project Home", id="dbt-home", compact=True)
+                    yield Button("Refresh", id="dbt-refresh", compact=True)
+                yield Tree("dbt", id="dbt-tree")
+                yield Static("", id="dbt-explorer-status", markup=False)
+            with TabPane("Lineage", id="dbt-panel-lineage"):
+                yield DbtLineage(self.ide)
+            with TabPane("Problems", id="dbt-panel-problems"):
+                yield DbtProblems(self.ide)
 
     def refresh_project(self, *, force: bool = False) -> None:
-        home = self.ide.session.dbt_project_dir
-        if home == self.home and not force:
+        home = self.ide.session.dbt_project_dir if self.ide.session.dbt_enabled else ""
+        workspace = self.ide.session.source_key()
+        same = (home, workspace) == (self.home, self.workspace)
+        if same and not force:
             return
-        tree = self.query_one(Tree)
-        folders = {node.data for node in self._expanded(tree.root) if isinstance(node.data, str)} if home == self.home else set()
+        if not same and self.home:
+            self.run_worker(self.docs.stop(), group="dbt-docs-stop", exit_on_error=False)
+        tree = self.query_one("#dbt-tree", Tree)
+        folders = {node.data for node in self._expanded(tree.root) if isinstance(node.data, str)} if same else set()
         tests_expanded = next((node.is_expanded or not node.children for node in tree.root.children
-                               if home == self.home and node.data == self._TESTS_NODE), True)
-        self.home = home
+                               if same and node.data == self._TESTS_NODE), True)
+        self.home, self.workspace = home, workspace
         tree.clear()
         tree.root.set_label(Text(Path(home).name if home else "No dbt project open"))
         actions = tree.root.add("Actions", data="actions", expand="actions" in folders)
         for key, label in (
             ("test", "Create Data Test"), ("reload", "Reload File from Disk"),
+            ("rename", "Rename Open Model"),
             ("docs", "Generate & Serve Documentation"), ("stop-docs", "Stop Documentation Server"),
         ):
             actions.add_leaf(label, data=("action", key))
         tree.root.expand()
         self.query_one("#dbt-explorer-status", Static).update("Loading files…" if home else "Open a project home to browse dbt files.")
         if home:
-            self.run_worker(self._populate(home, folders, tests_expanded), group="dbt-files",
+            self.run_worker(self._populate(home, workspace, folders, tests_expanded), group="dbt-files",
                             exclusive=True, exit_on_error=False)
 
     @staticmethod
@@ -267,7 +409,7 @@ class DbtExplorer(Vertical):
                 yield child
                 yield from DbtExplorer._expanded(child)
 
-    async def _populate(self, home: str, expanded: set[str], tests_expanded: bool) -> None:
+    async def _populate(self, home: str, workspace: str, expanded: set[str], tests_expanded: bool) -> None:
         def read_project():
             project = DbtFiles(home)
             roots = {}
@@ -284,12 +426,12 @@ class DbtExplorer(Vertical):
         try:
             paths, roots, warning = await asyncio.to_thread(read_project)
         except (DbtError, OSError) as exc:
-            if home == self.home:
+            if (home, workspace) == (self.home, self.workspace):
                 status.update(str(exc))
             return
-        if home != self.home:
+        if (home, workspace) != (self.home, self.workspace):
             return
-        tree = self.query_one(Tree)
+        tree = self.query_one("#dbt-tree", Tree)
 
         def add_files(root, paths: list[str], prefix: Path = Path()) -> None:
             folders = {prefix: root}
@@ -327,15 +469,24 @@ class DbtExplorer(Vertical):
 
     @on(Button.Pressed, "#dbt-home")
     def _home(self) -> None:
+        if not self.ide.session.dbt_enabled:
+            return
         self.app.push_screen(DBTScreen(self.ide), lambda path: self.ide.show_dbt_explorer() if path else None)
 
     @on(Button.Pressed, "#dbt-refresh")
     def _refresh(self) -> None:
+        if not self.ide.session.dbt_enabled:
+            return
         self.refresh_project(force=True)
+        self.ide.dbt_authoring.invalidate()
+
+    @on(TabbedContent.TabActivated, "#dbt-panels")
+    def _panel_changed(self) -> None:
+        self.ide.dbt_authoring.request()
 
     @on(Tree.NodeSelected, "#dbt-tree")
     def _select(self, event: Tree.NodeSelected) -> None:
-        if not isinstance(event.node.data, tuple):
+        if not self.ide.session.dbt_enabled or not isinstance(event.node.data, tuple):
             return
         kind, value = event.node.data
         if kind == "file" and self.home == self.ide.session.dbt_project_dir:
@@ -352,28 +503,37 @@ class DbtExplorer(Vertical):
             self.ide.action_create_dbt_test()
         elif value == "reload":
             self.ide.reload_dbt_file()
+        elif value == "rename":
+            self.ide.action_dbt_rename()
 
     def _docs(self) -> None:
         home = self.ide.session.dbt_project_dir
+        workspace = self.ide.session.source_key()
         if not home:
             self.ide._set_status("Open a dbt project home first")
             return
 
         def start(port: int | None) -> None:
-            if port is not None and home == self.ide.session.dbt_project_dir:
+            if port is not None and (home, workspace) == (self.home, self.workspace) and self.ide.session.dbt_enabled:
                 self.ide._flush_workspace()
-                self.run_worker(self._serve(home, port), group="dbt-docs", exit_on_error=False)
+                self.run_worker(self._serve(home, workspace, port), group="dbt-docs", exit_on_error=False)
 
         self.app.push_screen(DbtPortScreen(), start)
 
-    async def _serve(self, home: str, port: int) -> None:
+    async def _serve(self, home: str, workspace: str, port: int) -> None:
+        if (home, workspace) != (self.home, self.workspace) or not self.ide.session.dbt_enabled:
+            return
         self.ide._set_status("Generating documentation from saved project files…")
         try:
             url = await self.docs.start(DbtFiles(home), port)
         except (DbtError, OSError) as exc:
-            self.ide._set_status(str(exc))
+            if (home, workspace) == (self.home, self.workspace):
+                self.ide._set_status(str(exc))
         else:
-            self.ide._set_status(f"dbt docs: {url} · Stop Documentation Server in dbt Actions")
+            if (home, workspace) == (self.home, self.workspace) and self.ide.session.dbt_enabled:
+                self.ide._set_status(f"dbt docs: {url} · Stop Documentation Server in dbt Actions")
+            else:
+                await self.docs.stop()
 
     async def _stop_docs(self) -> None:
         await self.docs.stop()
@@ -385,7 +545,7 @@ class DbtExplorer(Vertical):
         except (DbtError, OSError) as exc:
             self.ide._set_status(str(exc))
             return
-        if not self.ide._modal_open() and page_id == self.ide._document_identity:
+        if self.ide.session.dbt_enabled and not self.ide._modal_open() and page_id == self.ide._document_identity:
             self.app.push_screen(DbtDiffScreen(path, diff))
 
     async def on_unmount(self) -> None:

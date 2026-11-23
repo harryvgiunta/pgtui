@@ -238,9 +238,38 @@ into Python, and no server-installed routines or Soda dependency are required.
 
 ## dbt workspace
 
-In the **dbt** explorer tab, choose **Project Home**, select the directory containing
-`dbt_project.yml`, and choose **Open & Save Project Home**. This is also the only
-option under **Settings → DBT**. The workspace remembers the path per data source.
+### Create a project with the setup assistant
+
+Choose **Settings → Workspace Settings → New dbt Project with AI**. You do not
+need to enable dbt first. Pick PostgreSQL, DuckDB for local Parquet, or remote
+Cloudflare D1 with SQLite SQL. Enter a project name and an empty directory, or a
+new directory under an existing parent. Reuse a connected source or open the
+secure connection form, then choose the upstream relation.
+
+The configured AI provider can recommend views or tables and starter tests. It
+receives only the target type and your choices about refreshes and expected
+rows—not project names, paths, connection details, or data. You can choose the
+settings yourself if AI is unavailable. Enter passwords, tokens, and keys only
+in the existing secure forms; the **Remember** options use your OS keyring.
+
+Review the full contents of the source definitions, starter models, data tests,
+and profile guidance. **Create & Link** writes the reviewed files, enables dbt
+for the selected source, and opens the project's `README.md`. Setup does not
+overwrite files or run dbt. PostgreSQL and DuckDB include a credential-free
+profile template and instructions for external `dbt debug`, `dbt parse`, and
+`dbt build`. D1 includes conditional verification instructions, not a profile:
+you need an adapter that explicitly supports remote Cloudflare D1. A local
+SQLite database or `dbt-sqlite` is not a substitute.
+
+### Open and edit an existing project
+
+In **Settings → Workspace Settings**, turn on **Enable dbt**, then choose
+**Open & Save Project Home** and select the directory containing `dbt_project.yml`.
+You can also change the directory from **Project Home** in the dbt explorer.
+New source workspaces default to off; existing configured projects stay enabled.
+Both settings are per data source. Turning dbt off hides its tools and stops
+project-file autosave. Saved file drafts remain readable in **Pages**; ordinary
+SQL pages keep their native IntelliSense and execution tools.
 
 - Edits to project files, including SQL models, data tests, and YAML, autosave to
   disk after a short pause or when you switch pages. **Pages** remembers opened files
@@ -250,10 +279,65 @@ option under **Settings → DBT**. The workspace remembers the path per data sou
 - **Ctrl+click** a literal `source()` or `ref()` in the editor to open the local
   source YAML or model. **F12** follows the reference at the caret when a terminal
   does not forward modified clicks.
+- **Shift+F12** (`\dbt-references`) lists statically resolved usages of the
+  `ref()`, `source()`, or column at the caret. On a model output name it follows
+  that column downstream. **Enter** opens the selected usage at its location.
 - The file editor's **Git Diff** shows staged, working-tree, and unsaved changes.
   If a file changed externally, autosave keeps your draft without overwriting
   the file. **Actions → Reload File from Disk** loads the new baseline and leaves
   the previous editor text available via Undo.
+
+### Lineage and editor feedback
+
+- Select **dbt → Lineage** (or `\dbt-lineage`) for the open file's upstream
+  dependencies, downstream consumers, and known column origins and uses. Expand
+  branches to trace indirect dependencies; **Enter** opens a local resource.
+  The graph uses current project files and drafts. An existing manifest can
+  supply package metadata and dependencies that static analysis cannot recover.
+  Use **Refresh** in the Files tab to pick up external project edits.
+- **Problems** lists positioned syntax errors and warnings for the open file.
+  The **Lineage** tree also lists them in a **File diagnostics** branch. Both
+  panels show project index notes separately from file diagnostics. **Enter**
+  on a file diagnostic jumps to the affected text. Long lists are paginated
+  rather than capped; the existing draft, token, and scope limits still apply.
+- Local warnings include missing or ambiguous columns in known inputs, output
+  types that differ from model properties, and suspicious operands. `JOIN`
+  checks distinguish different known key types from a key whose type cannot be
+  verified. They never infer a mismatch from missing metadata alone.
+- Argument counts are checked against matching cached overloads, including
+  defaults and variadic arguments where the catalog exposes them. Selected
+  built-in signatures are used when catalog entries are unavailable.
+- PostgreSQL and DuckDB flag ungrouped columns. D1 uses SQLite affinity and
+  coercion rules and warns when an ungrouped value may come from any row in its
+  group. SQLite's single `min()`/`max()` extremum idiom is left alone. These
+  draft checks neither validate against the warehouse nor run dbt.
+- The model editor suggests `ref()`, `source()`, and macro names while typing
+  Jinja. **Ctrl+Space** requests suggestions; **Tab** accepts the selection.
+- Hover over a relation, column, or `SELECT *`, or press **F9** at the caret,
+  to inspect known schema and types. **Shift+F9** expands `*` in the draft only
+  when the complete projection is known. YAML can document a partial schema;
+  unknown columns and types are not invented.
+
+### Rename a model or output column
+
+Open the model and press **F2** or choose **Rename Model**. **Preview Rename**
+lists the file move and local reference and metadata edits, including supported
+properties and selectors. **Apply Rename** rechecks the project before writing.
+Versioned models, unresolved dynamic `ref()` calls, and unsaved dbt buffers that
+could affect the result block the rename rather than risking a partial refactor.
+Rename does not alter package files, run dbt, or change warehouse relations.
+
+For a SQL model's output column, put the caret on its name and press **Shift+F2**
+(`\dbt-rename-column`). Preview shows the definition, resolved downstream uses,
+and supported YAML property edits without moving the file. Inherited output
+names propagate through downstream projections; explicit aliases keep their
+own names. Ambiguous bindings, name collisions, and unsupported column-bearing
+metadata block the operation rather than leaving a partial rename.
+
+Indexing and both rename commands honor `.dbtignore` and project-local
+`.gitignore` rules (including nested `.gitignore` files). The rules apply
+regardless of Git tracking status. Apply rechecks ignore rules and the input
+inventory before writing.
 
 ### SQL ↔ dbt switch
 
@@ -469,9 +553,9 @@ folds that hide a match.
 | Alt/Option+Up / Down | Jump by page; scroll completion details instead when they overflow |
 | Up Arrow / Down Arrow with completion open (defaults) | Navigate suggestions |
 | Tab / Enter with completion open (Enter configurable) | Accept completion |
-| Esc in the SQL editor (default toggle) | Pause or resume IntelliSense without changing the saved setting |
+| Esc in the query editor (default toggle) | Pause or resume IntelliSense without changing the saved setting |
 | Escape in Explorer (Schema, Pages or Functions) | Hide Explorer and return to the query editor at the same cursor position |
-| Escape in non-SQL function form fields | Return to the query and previous Explorer tab without discarding the function draft |
+| Escape in the function editor (default bindings) | Return to the query and previous Explorer tab even with suggestions open; preserve the function draft |
 | Escape in chat | Hide Conversations and return to the query editor without discarding the chat draft |
 | Ctrl+Q | Return from function mode; otherwise quit |
 

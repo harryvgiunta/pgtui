@@ -32,6 +32,10 @@ ACTIONS: tuple[tuple[str, str, str], ...] = (
     ("Data source…", "ctrl+o · PostgreSQL, Cloudflare D1 or local Parquet", "add-source"),
     ("Functions…", "open the SQL function library", "fn"),
     ("dbt", "switch this draft between native SQL and dbt Jinja", "dbt"),
+    ("dbt lineage", "follow upstream and downstream models and columns", "dbt-lineage"),
+    ("dbt problems", "review this file's live diagnostics", "dbt-problems"),
+    ("dbt references", "find usages of the dbt resource or column at the caret", "dbt-references"),
+    ("dbt rename column", "preview an output-column rename", "dbt-rename-column"),
     ("Query to function", "create a function draft from this document", "query-to-fn"),
     ("Export results", "save selected rows, the buffer or the full query result as CSV", "export-results"),
     ("AI", "chat and review an AI-proposed replacement", "ai"),
@@ -43,6 +47,8 @@ ACTIONS: tuple[tuple[str, str, str], ...] = (
     ("Schema", "show/hide the schema pane", "toggle-schema"),
     ("Settings", "every setting, full screen", "settings"),
 )
+
+_DBT_ACTIONS = frozenset({"dbt", "dbt-lineage", "dbt-problems", "dbt-references", "dbt-rename-column"})
 
 
 @dataclass(frozen=True)
@@ -111,7 +117,8 @@ def view_for(session: Session, doc: str, line: str, column: int, *,
         start, end, token = action
         entries = [Entry(label, detail=detail, action=name, kind="action")
                    for label, detail, name in ACTIONS
-                   if token.casefold() in label.casefold() or token.casefold() in name.casefold()]
+                   if (session.dbt_enabled or name not in _DBT_ACTIONS)
+                   and (token.casefold() in label.casefold() or token.casefold() in name.casefold())]
         return View(start, token, entries, "command", end) if entries else None
     if commands_only:
         return None
@@ -187,7 +194,9 @@ class CommandPalette(OptionList):
     def __init__(self, session: Session, *, source_id: str | None = None,
                  workspace_actions: bool = True,
                  parameters: Callable[[], Iterable[str]] | None = None,
-                 local_completion: Callable[[str, int, bool], Completion] | None = None, **kwargs) -> None:
+                 local_completion: Callable[[str, int, bool], Completion] | None = None,
+                 template_completion: Callable[[str, int, bool], Completion | None] | None = None,
+                 **kwargs) -> None:
         super().__init__(**kwargs)
         self.session = session
         self.source_id = source_id
@@ -196,6 +205,7 @@ class CommandPalette(OptionList):
         # A supplied completion provider is editor-local: no workspace actions,
         # history, schema/value requests, or AI. Its editor dialect is already pinned.
         self.local_completion = local_completion
+        self.template_completion = template_completion
         self.editor = None
         self.details: CompletionDetails | None = None
         self._view: View | None = None
@@ -274,8 +284,8 @@ class CommandPalette(OptionList):
                     and editor.selection.start == editor.selection.end
                     and self.session.intellisense
                     and (not self._sql_muted or allow_commands)
-                    and (allow_commands or self.local_completion is not None or not getattr(editor, "dbt_template", False))
-                    and (not ai or self.local_completion is None and not self.session.busy)
+                    and (not ai or (self.local_completion is None and not self.session.busy
+                                    and not getattr(editor, "dbt_template", False)))
                     and not getattr(self.app, "_closing", False))
 
     def cancel_ai(self) -> None:
@@ -352,11 +362,15 @@ class CommandPalette(OptionList):
         if self._view is not None and self._view.phase == "ai":
             return
         row, column = editor.cursor_location
-        if self.local_completion is not None:
+        result = None
+        if self.local_completion is None and self.template_completion is not None and not self._sql_muted:
+            result = self.template_completion(editor.text, _offset(editor.text, (row, column)), manual)
+        if self.local_completion is not None or result is not None:
             if self._sql_muted:
                 self._hide()
                 return
-            result = self.local_completion(editor.text, _offset(editor.text, (row, column)), manual)
+            if self.local_completion is not None:
+                result = self.local_completion(editor.text, _offset(editor.text, (row, column)), manual)
             context = result.context
             if result.items or result.signature or result.hint:
                 self._show(View(context.start, context.token, _completion_entries(result),
@@ -381,7 +395,7 @@ class CommandPalette(OptionList):
                                                            value_field.column, self._snapshot()))
         if view is not None and not self.workspace_actions:
             view = replace(view, entries=[entry for entry in view.entries
-                                          if not entry.action or entry.action in {"ai", "fn", "dbt"}])
+                                          if not entry.action or entry.action in {"ai", "fn"}])
         if view is None:
             self._hide()
             self._render_details()
@@ -483,13 +497,13 @@ class CommandPalette(OptionList):
             keys = self.session.completion_keys
             toggle = key_label(keys["completion_toggle"])
             accept = key_label(keys["completion_accept"])
-            self._ai_status = f"AI · requesting suggestions… · {toggle} mutes completion"
+            self._ai_status = f"AI · requesting suggestions… · {toggle} dismisses"
             self._render_details()
             suggestions = await sql_completion.complete_sql(config, request)
             if not self._ai_current(generation, snapshot):
                 return
             self._ai_status = (
-                f"AI · review only · Tab/{accept} accepts · {toggle} mutes completion"
+                f"AI · review only · Tab/{accept} accepts · {toggle} dismisses"
                 if suggestions else "AI · no suggestions"
             )
             if suggestions:
@@ -685,8 +699,12 @@ class CommandPalette(OptionList):
 
     def accept(self, index: int) -> bool:
         self._guard_ai()
+        shown = self._view.entries[index] if self._view is not None and 0 <= index < len(self._view.entries) else None
         if self._sync_pending or (self._view is not None and self._view.phase != "ai"):
             self.sync()
+        if shown is None or self._view is None:
+            return False
+        index = next((i for i, entry in enumerate(self._view.entries) if entry == shown), -1)
         return self._accept(index)
 
     def _accept(self, index: int) -> bool:

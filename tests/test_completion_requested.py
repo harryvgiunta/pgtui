@@ -8,6 +8,7 @@ from d8r.completion.context import analyze, command_span
 from d8r.completion.engine import complete, function_insertion
 from d8r.sql import ColumnDef, FnDef, SchemaContext, TableDef
 from d8r.tui.palette import CommandPalette, view_for
+from d8r.tui.session import Session
 
 
 @pytest.fixture
@@ -180,10 +181,11 @@ def test_nested_call_in_membership_does_not_borrow_outer_value_pool(schema):
 
 
 @pytest.mark.parametrize("command,action", [("AI", "ai"), ("aI", "ai"), ("FUNCTIONS", "fn"), ("functions", "fn"), ("dbt", "dbt")])
-def test_inline_commands_replace_only_the_command_span(schema, command, action):
+def test_inline_commands_replace_only_the_command_span(command, action):
     document = "SELECT ds.id, \\" + command + " FROM public.dataset_symbol ds"
     offset = document.index(command) + len(command)
-    session = SimpleNamespace(source=SimpleNamespace(dialect="postgres"), schema=schema)
+    session = Session()
+    session.workspace["source_workspaces"][session.source_key()]["dbt_enabled"] = action == "dbt"
     view = view_for(session, document, document, offset)
     assert view.phase == "command"
     assert any(item.action == action for item in view.entries)
@@ -191,14 +193,20 @@ def test_inline_commands_replace_only_the_command_span(schema, command, action):
     assert view.start == len("SELECT ds.id, ")
 
 
-def test_partial_command_replaces_its_word_suffix_not_sql(schema):
+def test_partial_command_replaces_its_word_suffix_not_sql():
     document = "SELECT 1; \\FUNCTIONS FROM saved"
     offset = document.index("FUNCTIONS") + 3
-    session = SimpleNamespace(source=SimpleNamespace(dialect="postgres"), schema=schema)
-    view = view_for(session, document, document, offset)
+    view = view_for(Session(), document, document, offset)
     assert view.entries[0].action == "fn"
     assert document[view.start:view.end] == "\\FUNCTIONS"
     assert document[view.end:] == " FROM saved"
+
+
+def test_dbt_command_is_not_offered_in_disabled_workspace():
+    session = Session()
+    session.workspace["source_workspaces"][session.source_key()]["dbt_enabled"] = False
+    document = "SELECT 1; \\dbt"
+    assert view_for(session, document, document, len(document)) is None
 
 
 @pytest.mark.parametrize("marked", [
@@ -338,13 +346,14 @@ def value_publication(schema, *, changed_index=None, eligible=True):
     prefix = "SELECT * FROM public.dataset_symbol WHERE display_name = '"
     original, updated = prefix + "O", prefix + "Ot"
     snapshot = (original, (0, len(original)), source, id(source), schema, id(schema),
-                (), (), None, "page", "draft", False, True, False, False, 1, 0, 1, 0)
+                (), (), None, "page", "draft", False, True, False, False, 1, 0, 1, 0, 0)
     current = list(snapshot)
     current[0], current[1], current[15], current[17] = updated, (0, len(updated)), 2, 2
     if changed_index is not None:
         current[changed_index] = "changed"
     published = []
     palette = SimpleNamespace(
+        local_completion=None,
         _eligible=lambda: eligible, _snapshot=lambda: tuple(current),
         session=SimpleNamespace(target_source=lambda source_id: nullcontext(), schema=schema),
         source_id=None, editor=SimpleNamespace(text=updated, cursor_location=(0, len(updated))),

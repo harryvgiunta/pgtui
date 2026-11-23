@@ -14,8 +14,12 @@ from textual.widgets import Button, Input, OptionList, Switch, TabbedContent, Te
 from d8r.ai import client
 from d8r.ai.client import AIConfig, AIEvent
 from d8r.dbt import DbtError
+from d8r.dbt_analysis import analyze_file
 from d8r.dbt_files import DbtFiles
+from d8r.dbt_index import DbtIndex
+from d8r.dbt_rename import apply_rename, plan_rename
 from d8r.engine import DataSource
+from d8r.sql import SchemaContext
 from d8r.tui.app import D8RApp
 from d8r.tui.dbt import DbtExplorer
 from d8r.tui.session import Session
@@ -34,6 +38,8 @@ def tree_node(node, data):
 
 
 async def open_home(app, pilot, root):
+    assert app.set_dbt_enabled(True)
+    await pilot.pause()
     tabs = app.query_one("#explorer-tabs", TabbedContent)
     await pilot.click(tabs.get_tab("tab-dbt"))
     await pilot.click("#dbt-home")
@@ -322,3 +328,44 @@ def test_paths_exclude_credentials_and_refuse_external_changes(tmp_path):
     assert path.read_bytes() == b"\xef\xbb\xbfversion: 2\r\nmodels: []\r\n"
     with pytest.raises(DbtError, match="changed on disk"):
         files.save("models/utf8.yml", "version: 2", baseline.revision)
+
+
+def test_rename_refuses_new_project_reference_after_review(tmp_path):
+    home = project(tmp_path)
+    model = put(home, "models/base.sql", "select 1 as id\n")
+    ref = "select * from {{ ref('base') }}\n"
+    report = put(home, "models/report.sql", ref)
+    files = DbtFiles(home)
+    plan = plan_rename(files, "models/base.sql", "upstream")
+
+    # A concurrent addition could otherwise keep a reference to the old name
+    # even if every file in the diff still has its original revision.
+    late = put(home, "tests/new_check.sql", ref)
+    with pytest.raises(DbtError, match="no longer safe"):
+        apply_rename(files, plan)
+    assert model.read_text() == "select 1 as id\n"
+    assert report.read_text() == late.read_text() == ref
+    assert not (home / "models/upstream.sql").exists()
+
+
+def test_star_reveals_partial_source_without_rewriting_projection(tmp_path):
+    home = project(tmp_path)
+    put(home, "models/sources.yml", """version: 2
+sources:
+  - name: landing
+    tables:
+      - name: orders
+        columns: [{name: id, data_type: bigint}]
+""")
+    path = "models/report.sql"
+    text = "select o.* from {{ source('landing', 'orders') }} o\n"
+    put(home, path, text)
+    index = DbtIndex(DbtFiles(home), {})
+    result = analyze_file(index, path, text, "postgres", SchemaContext())
+
+    # YAML documents one field; it is not evidence that the warehouse relation
+    # has only one field. Expanding this projection could drop data.
+    star, = result.stars
+    assert text[star.start:star.end] == "o.*"
+    assert any("id" in label and "bigint" in label.lower() for label in star.columns)
+    assert not star.replacement
