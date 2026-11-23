@@ -218,6 +218,24 @@ async def test_where_real_edit_is_offline_and_uses_executed_values(parquet_sourc
         assert app.editor.text == text + "'b"
 
 
+@async_test
+async def test_accept_cte_join_with_real_catalog_key(d1_source):
+    session = Session({d1_source.id: d1_source})
+    assert session.run("CREATE TABLE notes(record_id INTEGER REFERENCES records(id))", record=False).ok
+    text = ("WITH q(record_key) AS (SELECT id FROM records) "
+            "SELECT * FROM q r JOIN notes n ON ")
+    app = D8RApp(session)
+    async with app.run_test(size=(150, 48)) as pilot:
+        await load_sql(app, pilot, text)
+        await pilot.press("ctrl+space")
+        condition = "n.record_id = r.record_key"
+        view = app.palette.view
+        app.palette.highlighted = next(i for i, entry in enumerate(view.entries)
+                                       if entry.kind == "join" and entry.insert == condition)
+        await pilot.press("enter")
+        assert app.editor.text == text + condition
+
+
 def test_typed_functions_persist_and_quality_install_is_atomic(parquet_source, tmp_path, monkeypatch):
     from d8r.quality import quality_functions
 

@@ -1,9 +1,7 @@
 """Immutable completion-only context and edit proposals; never executable query ASTs."""
 from __future__ import annotations
 
-from dataclasses import dataclass
-
-from d8r.sql import ForeignKey
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -14,6 +12,7 @@ class Field:
     column: str | None = None
     doc: str = ""
     values: tuple[object, ...] | None = None
+    occurrence: object | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -23,7 +22,7 @@ class Relation:
     fields: tuple[Field, ...] = ()
     table: str | None = None
     doc: str = ""
-    foreign_keys: tuple[ForeignKey, ...] = ()
+    projection_slots: tuple[Field, ...] | None = None  # Includes anonymous expressions when ordered.
     outer: bool = False
 
 

@@ -6,6 +6,7 @@ must read an already successful cache, not issue a database query.
 from __future__ import annotations
 
 from bisect import insort
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import replace
 from datetime import date, datetime, time
@@ -379,11 +380,10 @@ def _tables(document: str, context: Context, schema: SchemaContext, offers: _Off
         if (context.clause == "join" and reference
                 and not re.match(r"(?:ON|USING)\b", _following(document, join_end), re.I)):
             target = Relation(table.name, reference,
-                              tuple(Field(c.name, c.type, table.name, c.name) for c in table.columns),
-                              table.name, foreign_keys=table.foreign_keys)
+                              tuple(Field(c.name, c.type, table.name, c.name) for c in table.columns), table.name)
             for left in context.join_left:
                 for source, other in ((left, target), (target, left)):
-                    for condition in _fk_conditions(source, other, dialect):
+                    for condition in _fk_conditions(source, other, schema, dialect):
                         join_insert = insert + (document[context.end:join_end] if following_alias else "")
                         offers.add(Suggestion(label + " ON " + condition, join_insert + " ON " + condition,
                                               "table and foreign-key join", "join", end=join_end, table=table.name),
@@ -478,29 +478,51 @@ def function_insertion(document: str, offset: int, fn: FnDef, schema: SchemaCont
                       start=context.start, end=end)
 
 
-def _fk_conditions(source: Relation, target: Relation, dialect: str) -> Iterable[str]:
-    if not target.table:
+def _fk_fields(relation: Relation, dialect: str) -> dict[tuple[str, object | None], dict[str, str | None]]:
+    def visible(name: str) -> str:
+        return name if dialect == "postgres" else name.lower()
+
+    counts = Counter(visible(field.name) for field in relation.fields)
+    groups: dict[tuple[str, object | None], dict[str, str | None]] = {}
+    for field in relation.fields:
+        if not field.table or not field.column or counts[visible(field.name)] != 1:
+            continue
+        if field.occurrence is None and field.table != relation.table:
+            continue
+        columns = groups.setdefault((field.table, field.occurrence), {})
+        columns[field.column] = field.name if field.column not in columns else None
+    return groups
+
+
+def _fk_conditions(source: Relation, target: Relation, schema: SchemaContext, dialect: str) -> Iterable[str]:
+    if not source.reference or not target.reference:
         return
-    for key in source.foreign_keys:
-        if not _same_name(key.target_table, target.table, dialect):
-            continue
-        if not key.columns or len(key.columns) != len(key.target_columns):
-            continue
-        pairs: list[str] = []
-        for source_column, target_column in zip(key.columns, key.target_columns):
-            left = next((field for field in source.fields
-                         if (field.column or field.name) == source_column), None)
-            right = next((field for field in target.fields
-                          if (field.column or field.name) == target_column), None)
-            if left is None or right is None:
-                break
-            pairs.append(source.reference + "." + _identifier(left.name, dialect) + " = "
-                         + target.reference + "." + _identifier(right.name, dialect))
-        else:
-            yield " AND ".join(pairs)
+    if source.table:
+        keys = schema.foreign_keys_from(source.table)
+        if not keys or (target.table and not any(_same_name(k.target_table, target.table, dialect) for k in keys)):
+            return
+    target_groups = _fk_fields(target, dialect)
+    if not target_groups:
+        return
+    for (source_table, _), left in _fk_fields(source, dialect).items():
+        for key in schema.foreign_keys_from(source_table):
+            if not key.columns or len(key.columns) != len(key.target_columns):
+                continue
+            for (target_table, _), right in target_groups.items():
+                if not _same_name(key.target_table, target_table, dialect):
+                    continue
+                pairs = []
+                for source_column, target_column in zip(key.columns, key.target_columns):
+                    source_name, target_name = left.get(source_column), right.get(target_column)
+                    if source_name is None or target_name is None:
+                        break
+                    pairs.append(source.reference + "." + _identifier(source_name, dialect) + " = "
+                                 + target.reference + "." + _identifier(target_name, dialect))
+                else:
+                    yield " AND ".join(pairs)
 
 
-def _joins(document: str, context: Context, offers: _Offers, dialect: str) -> None:
+def _joins(document: str, context: Context, offers: _Offers, schema: SchemaContext, dialect: str) -> None:
     if context.join_target is None or context.clause not in {"on", "after_join"}:
         return
     if context.qualifier and not any(_same_name(relation.reference, context.qualifier, dialect)
@@ -508,7 +530,7 @@ def _joins(document: str, context: Context, offers: _Offers, dialect: str) -> No
         return
     for left in context.join_left:
         for source, target in ((left, context.join_target), (context.join_target, left)):
-            for condition in _fk_conditions(source, target, dialect):
+            for condition in _fk_conditions(source, target, schema, dialect):
                 insert = ("ON " if context.clause == "after_join" else "") + condition
                 # The whole condition replaces the typed component; qualified
                 # prefixes must be replaced too or they would be duplicated.
@@ -752,7 +774,7 @@ def complete(document: str, offset: int, schema: SchemaContext, *, dialect: str 
     if phrases is not None:
         _continuations(document, context, phrases, offers)
         if context.clause == "after_join":
-            _joins(document, context, offers, dialect)
+            _joins(document, context, offers, schema, dialect)
         if not context.quote and not context.qualifier:
             _group_edit(context, offers)
         return Completion(context, offers.result())
@@ -817,7 +839,7 @@ def complete(document: str, offset: int, schema: SchemaContext, *, dialect: str 
             _same_name(relation.reference, context.qualifier, dialect) for relation in context.relations)
         if not relation_qualifier:
             _functions(document, context, schema, offers, dialect, relation_only)
-    _joins(document, context, offers, dialect)
+    _joins(document, context, offers, schema, dialect)
     _values(context, offers, dialect, values)
     if not context.qualifier and not context.quote:
         syntax_context = (replace(context, clause="select")

@@ -135,6 +135,10 @@ def _key(text: str, dialect: str) -> tuple[str, ...]:
     return (_cached_key if len(text) <= 512 else _decode_key)(text, dialect)
 
 
+def _indirect(field: Field) -> Field:
+    return replace(field, table=None, column=None, values=None, occurrence=None)
+
+
 def _merge(local: tuple[Relation, ...], outer: tuple[Relation, ...], dialect: str) -> tuple[Relation, ...]:
     names = {_key(r.reference, dialect) for r in local}
     return local + tuple(replace(r, outer=True) for r in outer if _key(r.reference, dialect) not in names)
@@ -158,6 +162,7 @@ class _Scope:
     relations: tuple[Relation, ...] = ()
     ctes: tuple[Relation, ...] = ()
     outputs: tuple[Field, ...] = ()
+    projection_slots: tuple[Field, ...] | None = None
     children: list[_Scope] = field(default_factory=list)
     # Relation source positions make JOIN ON/USING visibility left-to-right.
     sources: list[_Source] = field(default_factory=list)
@@ -215,11 +220,21 @@ class _Model:
     def relation(self, name: str, ctes: tuple[Relation, ...]) -> Relation | None:
         relation = next((r for r in reversed(ctes) if _key(r.reference, self.dialect) == _key(name, self.dialect)), None)
         if relation is not None:
-            return replace(relation, reference=name)
+            # Two references to one CTE are two input row occurrences. Keep
+            # composite key components together within each reference only.
+            fields = relation.projection_slots if relation.projection_slots is not None else relation.fields
+            bindings = {origin: object() for origin in {f.occurrence for f in fields} if origin is not None}
+            if bindings:
+                fields = tuple(replace(f, occurrence=bindings[f.occurrence]) if f.occurrence is not None else f
+                               for f in fields)
+            return replace(relation, reference=name, fields=tuple(f for f in fields if f.name),
+                           projection_slots=fields if relation.projection_slots is not None else None)
         table = self.schema.table_by_name(name, dialect=self.dialect)
         if table is not None:
-            return Relation(name, name, tuple(Field(c.name, c.type, table.name, c.name, c.doc, c.values)
-                                             for c in table.columns), table.name, table.doc, table.foreign_keys)
+            occurrence = object()
+            fields = tuple(Field(c.name, c.type, table.name, c.name, c.doc, c.values, occurrence)
+                           for c in table.columns)
+            return Relation(name, name, fields, table.name, table.doc, projection_slots=fields)
         return None
 
     def resolve(self, lo: int, hi: int, relations: tuple[Relation, ...]) -> Field | None:
@@ -266,7 +281,7 @@ class _Model:
             begin = at + (2 if self.tokens[at].text == ":" else 1)
             original = self.expression(lo, at, relations)
             typ = self.text[self.tokens[begin].start:self.tokens[hi - 1].end] if begin < hi else ""
-            return replace(original, type=typ) if original else Field("", typ)
+            return replace(_indirect(original), type=typ) if original else Field("", typ)
         first = self.tokens[lo]
         if self.upper(lo) == "CAST" and lo + 1 < hi and self.tokens[lo + 1].text == "(":
             close = min(self.pairs.get(lo + 1, hi), hi)
@@ -274,7 +289,7 @@ class _Model:
             if as_at is not None and as_at + 1 < close:
                 original = self.expression(lo + 2, as_at, relations)
                 typ = self.text[self.tokens[as_at + 1].start:self.tokens[close - 1].end]
-                return replace(original, type=typ) if original else Field("", typ)
+                return replace(_indirect(original), type=typ) if original else Field("", typ)
         if hi == lo + 1:
             if first.kind in {"string", "dollar_string"}:
                 return Field("", "text")
@@ -312,25 +327,41 @@ class _Model:
                     alias, end = _name(self.tokens[end - 1]), end - 1
             yield start, end, alias
 
-    def projection(self, lo: int, hi: int, relations: tuple[Relation, ...]) -> tuple[Field, ...]:
+    def projection(self, lo: int, hi: int, relations: tuple[Relation, ...], *, merged_star: bool):
         result: list[Field] = []
+        ordered = True
         for start, end, alias in self.projection_parts(lo, hi):
             if end <= start:
                 continue
             if self.tokens[end - 1].text == "*":
-                if end == start + 1:
-                    result.extend(c for r in relations if not r.outer for c in r.fields)
+                bare = end == start + 1
+                if bare or self.tokens[end - 2].text == ".":
+                    if bare:
+                        sources = tuple(r for r in relations if not r.outer)
+                    else:
+                        qualifier = self.text[self.tokens[start].start:self.tokens[end - 2].start]
+                        sources = tuple(r for r in relations if _key(r.reference, self.dialect) == _key(qualifier, self.dialect))
+                    if bare and merged_star:
+                        # USING/NATURAL can merge and reorder output columns.
+                        result.extend(_indirect(f) for r in sources for f in r.fields)
+                        ordered = False
+                    else:
+                        ordered &= bool(sources) and all(r.projection_slots is not None for r in sources)
+                        for relation in sources:
+                            slots = relation.projection_slots
+                            result.extend(relation.fields if slots is None else slots)
                     continue
-                if self.tokens[end - 2].text == ".":
-                    qualifier = self.text[self.tokens[start].start:self.tokens[end - 2].start]
-                    result.extend(c for r in relations if _key(r.reference, self.dialect) == _key(qualifier, self.dialect) for c in r.fields)
-                    continue
-            value = self.expression(start, end, relations)
-            if alias is not None:
-                result.append(replace(value, name=alias) if value else Field(alias))
-            elif value is not None and value.name:
-                result.append(value)
-        return tuple(result)
+            if self.dialect == "duckdb":
+                for i in range(start, end):
+                    t = self.tokens[i]
+                    if (t.text == "*" and (i == start or self.tokens[i - 1].text == ".")
+                            or (t.kind in _IDS and _name(t).upper() in {"COLUMNS", "UNNEST"}
+                                and i + 1 < end and self.tokens[i + 1].text == "(")):
+                        ordered = False
+                        break
+            value = self.expression(start, end, relations) or Field("")
+            result.append(replace(value, name=alias) if alias is not None else value)
+        return tuple(f for f in result if f.name), tuple(result) if ordered else None
 
     def grouping(self, scope: _Scope, start: int, end: int, clause: str, anchor: int):
         """Retain SQL expressions, not output names, for a complete GROUP BY edit."""
@@ -475,11 +506,15 @@ class _Model:
         close = min(self.pairs.get(opening, hi), hi)
         names = [_name(self.tokens[a]) for a, b in self.split(opening + 1, close)
                  if b == a + 1 and self.tokens[a].kind in _IDS]
-        fields = tuple(replace(relation.fields[i], name=name) if i < len(relation.fields) else Field(name)
-                       for i, name in enumerate(names))
-        if len(relation.fields) > len(names):
-            fields += relation.fields[len(names):]
-        return replace(relation, fields=fields), min(close + 1, hi)
+        slots = relation.projection_slots
+        if slots is None:
+            if names:
+                relation = replace(relation, fields=tuple(Field(name) for name in names))
+        else:
+            renamed = tuple(replace(slots[i], name=name) if i < len(slots) else Field(name)
+                            for i, name in enumerate(names)) + slots[len(names):]
+            relation = replace(relation, fields=tuple(f for f in renamed if f.name), projection_slots=renamed)
+        return relation, min(close + 1, hi)
 
     def query(self, lo: int, hi: int, ctes: tuple[Relation, ...] = (),
               outer: tuple[Relation, ...] = (), depth: int = 0, *, recursive_self: Relation | None = None) -> _Scope:
@@ -536,7 +571,7 @@ class _Model:
                 child.cte_steps.insert(0, (child.start, "cte_body"))
                 scope.children.append(child)
                 consumed.add(pos)
-                relation = replace(relation, fields=child.outputs)
+                relation = replace(relation, fields=child.outputs, projection_slots=child.projection_slots)
                 if explicit is not None:
                     relation, _ = self.renamed(relation, explicit, hi)
                 ctes = visible + (relation,)
@@ -557,11 +592,14 @@ class _Model:
                 child = self.query(begin, stop, ctes, outer, depth + 1)
                 scope.children.append(child)
                 if begin == main:
-                    scope.outputs = child.outputs
+                    scope.outputs = tuple(_indirect(f) for f in child.outputs)
+                    if child.projection_slots is not None:
+                        scope.projection_slots = tuple(_indirect(f) for f in child.projection_slots)
                     # Without an explicit column list, the seed SELECT names
                     # the fields visible to the recursive arm of UNION [ALL].
                     if recursive_self is not None:
-                        ctes = tuple(replace(r, fields=child.outputs) if r is recursive_self else r for r in ctes)
+                        ctes = tuple(replace(r, fields=scope.outputs, projection_slots=scope.projection_slots)
+                                     if r is recursive_self else r for r in ctes)
                 begin = stop + 1
                 if self.upper(begin) in {"ALL", "DISTINCT"}:
                     begin += 1
@@ -598,7 +636,7 @@ class _Model:
                     child.start = self.tokens[i].end
                     scope.children.append(child)
                     consumed.add(i)
-                    relation = Relation("", "", child.outputs)
+                    relation = Relation("", "", child.outputs, projection_slots=child.projection_slots)
                 i = min(close + 1, hi)
             else:
                 name, after = self.identifier(i, hi)
@@ -654,7 +692,8 @@ class _Model:
                 if self.upper(begin) == "ON" and begin + 1 < hi and self.tokens[begin + 1].text == "(":
                     begin = self.pairs.get(begin + 1, hi) + 1
             stop = next((i for i in top if i > projection and self.upper(i) in {"FROM", "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "WINDOW", "QUALIFY", "INTO"}), hi)
-            scope.outputs = self.projection(begin, stop, scope.relations)
+            merged_star = any(self.upper(i) in {"USING", "NATURAL", "SEMI", "ANTI"} for i in top if i > projection)
+            scope.outputs, scope.projection_slots = self.projection(begin, stop, scope.relations, merged_star=merged_star)
             scope.projection_span = (begin, stop)
         # Scalar/EXISTS subqueries correlate; ordinary expression parentheses do not make scopes.
         def children(a: int, b: int, level: int) -> None:
@@ -691,10 +730,11 @@ class _Model:
             if len(tokens) <= _MAX_TOKENS:
                 model = _Model(fn.body, tokens, self.schema, self.dialect, self.depth + depth + 1, bindings, self.budget)
                 scope = model.query(0, len(tokens))
-                return Relation(name, name, scope.outputs, doc=fn.doc)
+                return Relation(name, name, scope.outputs, doc=fn.doc, projection_slots=scope.projection_slots)
         native = next((r for r in self.schema.routines if _key(r.name, self.dialect) == _key(name, self.dialect) and r.columns), None)
         if native:
-            return Relation(name, name, tuple(Field(c.name, c.type, doc=c.doc, values=c.values) for c in native.columns), doc=native.doc)
+            fields = tuple(Field(c.name, c.type, doc=c.doc, values=c.values) for c in native.columns)
+            return Relation(name, name, fields, doc=native.doc, projection_slots=fields)
         return Relation(name, name)
 
     def conditioned_join(self, scope: _Scope, anchor: int) -> bool:

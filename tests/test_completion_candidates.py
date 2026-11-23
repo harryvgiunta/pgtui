@@ -22,11 +22,20 @@ def schema():
     ))
 
 
+@pytest.fixture
+def composite_schema():
+    return SchemaContext((
+        TableDef("parent", columns=(ColumnDef("tenant_id", "integer"), ColumnDef("id", "integer"))),
+        TableDef("child", columns=(ColumnDef("tenant_id", "integer"), ColumnDef("parent_id", "integer")),
+                 foreign_keys=(ForeignKey(("tenant_id", "parent_id"), "parent", ("tenant_id", "id")),)),
+    ))
+
+
 def relation(schema, table, alias):
     definition = schema.table_by_name(table)
     return Relation(table, alias, tuple(Field(column.name, column.type, table, column.name,
                                              column.doc, column.values) for column in definition.columns),
-                    table, definition.doc, definition.foreign_keys)
+                    table, definition.doc)
 
 
 def candidates(monkeypatch, context, schema, document="", **options):
@@ -155,17 +164,12 @@ def test_cte_relation_candidates(monkeypatch, schema):
     assert by_label(result, "recent").kind == "cte"
 
 
-@pytest.mark.parametrize("reverse", [False, True])
-def test_composite_foreign_key_join_both_directions(monkeypatch, reverse):
-    left = Relation("parent", "p", (Field("tenant_id"), Field("id")), "parent")
-    right = Relation("child", "c", (Field("tenant_id"), Field("parent_id")), "child",
-                     foreign_keys=(ForeignKey(("tenant_id", "parent_id"), "parent", ("tenant_id", "id")),))
-    target, previous = (left, right) if reverse else (right, left)
-    context = Context(50, 50, clause="on", relations=(previous, target),
-                      join_target=target, join_left=(previous,))
-    joins = [item for item in candidates(monkeypatch, context, SchemaContext()).items if item.kind == "join"]
-    assert len(joins) == 1
-    assert joins[0].insert == "c.tenant_id = p.tenant_id AND c.parent_id = p.id"
+def test_mismatched_key_arity_does_not_generate_a_partial_join(composite_schema):
+    parent, child = composite_schema.tables
+    malformed = ForeignKey(("tenant_id", "parent_id"), "parent", ("id",))
+    schema = replace(composite_schema, tables=(parent, replace(child, foreign_keys=(malformed,))))
+    result, _ = complete_marked("SELECT * FROM parent p JOIN child c ON |", schema)
+    assert not any(item.kind == "join" for item in result.items)
 
 
 def test_using_offers_only_shared_unused_columns(monkeypatch, schema):
@@ -617,12 +621,8 @@ def test_joined_table_completion_includes_native_fk_edit(schema, suffix, referen
 
 
 @pytest.mark.parametrize("reverse", [False, True])
-def test_real_composite_join_preserves_every_pair_and_actual_alias(reverse):
-    schema = SchemaContext((
-        TableDef("parent", columns=(ColumnDef("tenant_id", "integer"), ColumnDef("id", "integer"))),
-        TableDef("child", columns=(ColumnDef("tenant_id", "integer"), ColumnDef("parent_id", "integer")),
-                 foreign_keys=(ForeignKey(("tenant_id", "parent_id"), "parent", ("tenant_id", "id")),)),
-    ))
+def test_real_composite_join_preserves_every_pair_and_actual_alias(reverse, composite_schema):
+    schema = composite_schema
     sources = 'child "Child" JOIN parent p' if reverse else 'parent p JOIN child "Child"'
     result, document = complete_marked("SELECT * FROM " + sources + " ON |", schema)
     joins = [item for item in result.items if item.kind == "join"]
@@ -631,6 +631,43 @@ def test_real_composite_join_preserves_every_pair_and_actual_alias(reverse):
     assert apply_completion(result, document, joins[0]).endswith("ON " + joins[0].insert)
     incomplete = replace(schema, tables=(replace(schema.tables[0], columns=(ColumnDef("id", "integer"),)), schema.tables[1]))
     result, _ = complete_marked("SELECT * FROM " + sources + " ON |", incomplete)
+    assert not any(item.kind == "join" for item in result.items)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_wrapped_composite_join_uses_exported_names_in_both_directions(composite_schema, reverse):
+    prefix = "WITH p(ignored, tenant, key) AS (SELECT 1, tenant_id, id FROM parent) SELECT * FROM "
+    child = '(SELECT parent_id AS "Parent Key", tenant_id AS account FROM child) "Child"'
+    sources = f'{child} JOIN p x' if reverse else f'p x JOIN {child}'
+    result, document = complete_marked(prefix + sources + " ON |", composite_schema)
+    expected = '"Child".account = x.tenant AND "Child"."Parent Key" = x."key"'
+    joins = [item for item in result.items if item.kind == "join"]
+    assert [item.insert for item in joins] == [expected]
+    assert apply_completion(result, document, joins[0]) == prefix + sources + " ON " + expected
+
+
+def test_table_choice_maps_its_fk_to_a_cte_key(schema):
+    prefix = "WITH q(customer_key) AS (SELECT id FROM users) SELECT * FROM q a JOIN "
+    result, document = complete_marked(prefix + "ord|", schema)
+    item = by_label(result, "orders ON o.user_id = a.customer_key")
+    assert apply_completion(result, document, item) == prefix + "orders AS o ON o.user_id = a.customer_key"
+
+
+@pytest.mark.parametrize("declaration", [
+    "p AS (SELECT id FROM parent)",
+    "p AS (SELECT tenant_id AS k, id AS k FROM parent)",
+    "p AS (SELECT tenant_id, CAST(id AS bigint) AS id FROM parent)",
+    "p AS (SELECT tenant_id, id FROM parent UNION ALL SELECT tenant_id, parent_id FROM child)",
+    "p AS (SELECT a.tenant_id, b.id FROM parent a CROSS JOIN parent b)",
+    "x AS (SELECT tenant_id, id FROM parent), p AS (SELECT a.tenant_id, b.id FROM x a CROSS JOIN x b)",
+])
+def test_wrapped_join_does_not_guess_a_partial_or_ambiguous_key(composite_schema, declaration):
+    result, _ = complete_marked(f"WITH {declaration} SELECT * FROM p JOIN child c ON |", composite_schema)
+    assert not any(item.kind == "join" for item in result.items)
+
+
+def test_unaliased_derived_relation_does_not_offer_an_unaddressable_key(schema):
+    result, _ = complete_marked("SELECT * FROM users u JOIN (SELECT user_id FROM orders) ON |", schema)
     assert not any(item.kind == "join" for item in result.items)
 
 

@@ -102,6 +102,7 @@ class SchemaContext:
     routines: tuple[RoutineDef, ...] = ()
     pool: tuple[PoolColumn, ...] = field(init=False)
     _fns_by_name: Mapping[str, FnDef] = field(init=False, repr=False, compare=False)
+    _fks_by_table: Mapping[str, tuple[ForeignKey, ...]] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tables", tuple(self.tables))
@@ -119,6 +120,9 @@ class SchemaContext:
             PoolColumn(column.name, column.type, column.doc, column.values, tuple(tables))
             for column, tables in columns.values()
         ))
+        object.__setattr__(self, "_fks_by_table", MappingProxyType({
+            table.name: table.foreign_keys for table in self.tables if table.foreign_keys
+        }))
 
     def table_by_name(self, name: str, *, dialect: str = "postgres") -> TableDef | None:
         exact = next((table for table in self.tables if table.name == name), None)
@@ -139,6 +143,10 @@ class SchemaContext:
                    if (candidate := relation_parts(table.name, dialect=dialect)) is not None
                    and len(parts) == 1 and candidate[-1] == parts[0]]
         return matches[0] if len(matches) == 1 else None
+
+    def foreign_keys_from(self, table: str) -> tuple[ForeignKey, ...]:
+        """Declared outgoing keys for a canonical catalog table name."""
+        return self._fks_by_table.get(table, ())
 
     def column_by_name(self, name: str) -> PoolColumn | None:
         return next((column for column in self.pool if column.name == name), None)

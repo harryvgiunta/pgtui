@@ -424,8 +424,11 @@ older builds did not write a durable snapshot that could be recovered retroactiv
   Typing an alias prefix offers the relation and its qualified fields; a dot narrows
   completion to that relation without duplicating the dot or surrounding quotes.
 - Declared foreign keys supply JOIN predicates while choosing a joined table and
-  entering ON, in both directions and with every composite-key pair. USING offers
-  common columns. Projection stars expand without confusing COUNT(*) or multiplication.
+  entering `ON`, in both directions. CTE and derived-table projections use their
+  visible names when they expose every key column from the same input relation.
+  Missing, transformed and ambiguous keys are not guessed. Parquet sources do not
+  expose foreign keys. `USING` offers common columns. Projection stars expand
+  without confusing `COUNT(*)` or multiplication.
 - GROUP BY offers the full nonaggregate projection, expanding known `*`/`alias.*`
   fields and retaining complex expressions and unaggregated dependencies of mixed
   aggregate/window expressions. Already-grouped expressions, aliases and ordinals

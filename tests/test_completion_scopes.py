@@ -123,7 +123,8 @@ def test_recursive_arm_uses_seed_projection_when_no_column_list(schema):
     context = at("WITH RECURSIVE walk AS (SELECT id AS node FROM users "
                  "UNION ALL SELECT w.| FROM walk w) SELECT * FROM walk", schema)
     node, = refs(context)["w"].fields
-    assert (node.name, node.table, node.column) == ("node", "users", "id")
+    assert (node.name, node.type) == ("node", "integer")
+    assert node.table is None and node.column is None
 
 
 def test_derived_star_and_alias_type_lineage(schema):
@@ -133,6 +134,7 @@ def test_derived_star_and_alias_type_lineage(schema):
     assert derived["display_name"].column == "name"
     assert derived["key"].type == "bigint"
     assert derived["literal"].type == "integer"
+    assert derived["key"].column is None
 
 
 def test_unknown_expression_does_not_invent_output_name(schema):
@@ -144,6 +146,21 @@ def test_derived_explicit_column_list(schema):
     context = at("SELECT d.| FROM (SELECT id, name FROM users) AS d(user_key, label)", schema)
     assert set(fields(refs(context)["d"])) == {"user_key", "label"}
     assert fields(refs(context)["d"])["label"].column == "name"
+
+
+@pytest.mark.parametrize("field,expected", [("constant", None), ("label", "name")])
+def test_cte_explicit_names_do_not_shift_after_anonymous_expression(schema, field, expected):
+    context = at("WITH q(constant, label) AS (SELECT 1, name FROM users) "
+                 f"SELECT * FROM q WHERE {field} = |", schema)
+    assert context.value_field.name == field
+    assert context.value_field.column == expected
+
+
+def test_merged_star_cannot_supply_positional_alias_provenance(schema):
+    context = at("WITH q(a, b) AS (SELECT * FROM users JOIN orders USING (id)) "
+                 "SELECT * FROM q WHERE b = |", schema)
+    assert context.value_field.name == "b"
+    assert context.value_field.column is None
 
 
 def test_saved_and_native_table_function_outputs(schema):
