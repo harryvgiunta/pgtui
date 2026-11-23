@@ -29,7 +29,7 @@ from .session import Session
 ACTIONS: tuple[tuple[str, str, str], ...] = (
     ("Run", "ctrl+enter · execute the document", "run"),
     ("Explain query", "inspect a PostgreSQL plan without running the query", "explain"),
-    ("SQL preview", "ctrl+k · expand functions without executing", "compile"),
+    ("SQL preview", "ctrl+k · render and expand without executing", "compile"),
     ("Data source…", "ctrl+o · PostgreSQL, Cloudflare D1 or local Parquet", "add-source"),
     ("Functions…", "open the SQL function library", "fn"),
     ("dbt", "switch this draft between native SQL and dbt Jinja", "dbt"),

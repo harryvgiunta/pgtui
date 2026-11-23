@@ -1,7 +1,7 @@
 """Offline dbt SQL conversion; never invokes a dbt runtime.
 
-Only literal ref/source/config calls are interpreted. Relation names come from
-manifest artifacts or literal source YAML, never profiles or schema guesses.
+Relation names come from manifest artifacts or literal source YAML, never
+profiles or schema guesses. Explicit query previews may also render Jinja.
 """
 from __future__ import annotations
 
@@ -15,7 +15,9 @@ import re
 from typing import Any
 
 import yaml
+from jinja2 import TemplateError, TemplateSyntaxError
 
+from d8r.dbt_jinja import render_template
 from d8r.sql import (
     SqlError, Token, _relation_end, _relation_sites, lex_sql, relation_parts,
     quote_identifier, split_statements,
@@ -23,6 +25,7 @@ from d8r.sql import (
 
 
 _JINJA_OPEN = re.compile(r"\{[{%#]")
+_NO_DEFAULT = object()
 _JINJA_PART = re.compile(r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[{}'"]''', re.DOTALL)
 
 
@@ -30,10 +33,16 @@ class DbtError(ValueError):
     """An actionable project or conversion error, safe to show in the form."""
 
 
-def has_query_jinja(document: str, *, dialect: str = "postgres") -> bool:
-    """Recognize template code without treating SQL strings or comments as Jinja."""
+class _NeedsCompiled(DbtError):
+    """The offline context could not resolve a dbt template."""
+
+
+def has_query_jinja(document: str, *, dialect: str = "postgres", dbt_file: bool = False) -> bool:
+    """dbt templates the whole file; ordinary SQL strings and comments are opaque."""
     if not _JINJA_OPEN.search(document):
         return False
+    if dbt_file:
+        return True
     try:
         tokens = lex_sql(document, dialect=dialect)
     except SqlError:
@@ -221,7 +230,7 @@ def _call(expression: str) -> tuple[str, list[Any], dict[str, Any]]:
             raise ValueError
         return node.func.id, args, kwargs
     except (SyntaxError, ValueError, TypeError, RecursionError) as exc:
-        raise DbtError("Advanced/dynamic Jinja requires an actual compiled artifact. Compile outside PGTUI, then reload.") from exc
+        raise _NeedsCompiled("Advanced/dynamic Jinja requires a compiled artifact.") from exc
 
 
 def _expression_end(text: str, start: int) -> int:
@@ -239,7 +248,7 @@ def _expression_end(text: str, start: int) -> int:
                 break
         elif part[0] in {"'", '"'}:
             break  # unterminated quoted literal
-    raise DbtError("Unbalanced Jinja expression; compile the model outside PGTUI.")
+    raise _NeedsCompiled("Unbalanced Jinja expression.")
 
 
 class DbtProject:
@@ -330,7 +339,7 @@ class DbtProject:
                     raise DbtError("Manifest node config must be an object.")
                 if config.get("enabled") is False:
                     continue
-                if kind == "model":
+                if kind in {"model", "test", "analysis", "snapshot"}:
                     self.nodes.append(node)
                 if kind not in {"model", "seed", "snapshot", "source"}:
                     continue
@@ -395,11 +404,65 @@ class DbtProject:
             raise DbtError(f"Model {name!r} is described in multiple YAML files; resolve the ambiguity first.")
         return matches[0] if matches else (None, {})
 
-    def render_query(self, jinja: str, *, database: str) -> str:
-        """Resolve supported Jinja to one native query without executing it."""
-        sql = self._simple_import(jinja, {}, database=database)
-        self._query_tokens(sql)
+    def render_query(self, jinja: str, *, database: str, path: str = "") -> str:
+        """Render a draft to one native query. Only a linked file may use an artifact."""
+        sql, _ = self.preview_query(jinja, database=database, path=path)
         return sql
+
+    def preview_query(self, jinja: str, *, database: str, path: str = "") -> tuple[str, bool]:
+        """Return native SQL and whether literal conversion can preserve the template."""
+        try:
+            sql = self._simple_import(jinja, {}, database=database)
+        except _NeedsCompiled:
+            sql = self._render_advanced(jinja, database, path)
+            reversible = False
+        else:
+            reversible = has_query_jinja(jinja, dialect=self.dialect)
+        if has_query_jinja(sql, dialect=self.dialect):
+            raise DbtError("The rendered SQL still contains Jinja outside of SQL strings or comments.")
+        self._query_tokens(sql)
+        return sql, reversible
+
+    def _render_advanced(self, jinja: str, database: str, path: str) -> str:
+        def var(name: str, default=_NO_DEFAULT):
+            variables = self.project.get("vars", {})
+            if not isinstance(variables, dict):
+                raise DbtError("Project vars must be a mapping.")
+            local = variables.get(self.name, {})
+            value = variables.get(name, default)
+            if isinstance(local, dict):
+                value = local.get(name, value)
+            if value is _NO_DEFAULT:
+                raise _NeedsCompiled(f"No project value for var({name!r}).")
+            if isinstance(value, str) and _JINJA_OPEN.search(value):
+                raise _NeedsCompiled(f"var({name!r}) requires dbt to render its value.")
+            return value
+
+        def config(*args, **kwargs):
+            self._config_values(args, kwargs)
+            return ""
+
+        try:
+            return render_template(
+                jinja, var=var, config=config, execute=True,
+                ref=lambda *args, **kwargs: self._resolve("ref", args, kwargs, database=database),
+                source=lambda *args, **kwargs: self._resolve("source", args, kwargs, database=database),
+            )
+        except TemplateSyntaxError as exc:
+            reason = f"Jinja syntax at line {exc.lineno}: {exc.message}"
+        except (TemplateError, _NeedsCompiled) as exc:
+            reason = str(exc)
+        except DbtError:
+            raise
+        except (ArithmeticError, LookupError, RecursionError, TypeError, ValueError) as exc:
+            reason = f"Jinja evaluation failed ({type(exc).__name__})."
+        if path:
+            self._path(path)
+            node = self._node_for_path(path)
+            compiled = self._compiled(path, jinja, node, database=database)
+            if compiled is not None:
+                return compiled
+        raise DbtError(f"{reason.rstrip('. ')}. Compile the dbt file for this target and reload its artifacts.")
 
     def query_views(self, document: str, *, database: str, schema: str = "") -> tuple[str, str]:
         """Render to SQL first, then normalize every convertible relation for dbt."""
@@ -536,7 +599,7 @@ class DbtProject:
                             item.version is None or item.version == item.latest_version)]
         values = {item.relation for item in matches}
         if len(values) != 1:
-            raise DbtError(f"Cannot resolve {kind}{tuple(args)!r} unambiguously. Supply a current manifest with relation_name, or an actual compiled artifact.")
+            raise _NeedsCompiled(f"Cannot resolve {kind}{tuple(args)!r} unambiguously. Supply a current manifest with relation_name, or an actual compiled artifact.")
         relation = values.pop()
         if self.dialect == "postgres" and database:
             parts = relation_parts(relation, dialect=self.dialect)
@@ -544,19 +607,40 @@ class DbtProject:
                 raise DbtError(f"{relation!r} belongs to another database; refresh the project's target manifest.")
         return relation
 
-    def _compiled(self, path: str, raw: str, node: dict | None) -> str | None:
+    def _node_for_path(self, path: str) -> dict | None:
+        nodes = [node for node in self.nodes if node.get("package_name") == self.name
+                 and str(node.get("original_file_path", "")).replace("\\", "/") == path]
+        if len(nodes) > 1:
+            raise DbtError("Multiple manifest nodes use this file; select an unambiguous dbt query.")
+        return nodes[0] if nodes else None
+
+    @staticmethod
+    def _artifact_input(text: str) -> str:
+        # dbt strips outer whitespace and normalizes file newlines when reading SQL.
+        return text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    def _compiled(self, path: str, raw: str, node: dict | None, *, database: str = "") -> str | None:
         if node is not None:
             recorded = node.get("raw_code", node.get("raw_sql"))
-            if recorded is not None and recorded != raw:
-                raise DbtError("The manifest is stale for this model. Compile the current model outside PGTUI and reload.")
+            if isinstance(recorded, str) and self._artifact_input(recorded) != self._artifact_input(raw):
+                raise DbtError("The manifest is stale for this draft. Compile the current dbt file and reload.")
+            if self.dialect == "postgres" and database:
+                relation = node.get("relation_name")
+                parts = relation_parts(relation, dialect=self.dialect) if isinstance(relation, str) else None
+                artifact_db = node.get("database") or (parts[0] if parts and len(parts) == 3 else "")
+                if artifact_db and artifact_db != database:
+                    raise DbtError("The compiled artifact belongs to another database; refresh the project's target manifest.")
             compiled = node.get("compiled_code", node.get("compiled_sql"))
-            if isinstance(compiled, str) and compiled.strip():
+            if isinstance(recorded, str) and isinstance(compiled, str) and compiled.strip():
                 return compiled
         artifact = self.target / "compiled" / self.name / _relative(path)
         artifact = self._path(artifact.relative_to(self.root).as_posix())
         if artifact.is_file():
-            if artifact.stat().st_mtime_ns < self._path(path).stat().st_mtime_ns:
-                raise DbtError("The compiled SQL file predates this model. Compile outside PGTUI and reload.")
+            model_path = self._path(path)
+            if not model_path.is_file() or self._artifact_input(self._read(path)) != self._artifact_input(raw):
+                raise DbtError("The compiled SQL file does not match the current draft. Compile the current dbt file and reload.")
+            if artifact.stat().st_mtime_ns < model_path.stat().st_mtime_ns:
+                raise DbtError("The compiled SQL file predates this dbt file. Compile it and reload.")
             return self._read(artifact.relative_to(self.root).as_posix())
         return None
 
@@ -583,10 +667,7 @@ class DbtProject:
         if path not in self.models:
             raise DbtError("Select a .sql model within the configured model-paths.")
         raw = self._read(path)
-        nodes = [node for node in self.nodes if node.get("original_file_path") == path and node.get("package_name") == self.name]
-        if len(nodes) > 1:
-            raise DbtError("Multiple manifest nodes use this file; import an unambiguous compiled model.")
-        node = nodes[0] if nodes else None
+        node = self._node_for_path(path)
         name = node.get("name", candidate.stem) if node else candidate.stem
         _, metadata = self._model_metadata(name)
         config = dict(node.get("config", {})) if node else self._project_config(path, name)
@@ -609,6 +690,16 @@ class DbtProject:
                              str(metadata.get("description", node.get("description", "") if node else "")),
                              config, used_compiled)
 
+    @staticmethod
+    def _config_values(args: list | tuple, kwargs: dict) -> dict:
+        if args:
+            if len(args) != 1 or not isinstance(args[0], dict) or kwargs:
+                raise DbtError("config() requires keyword arguments or one dictionary.")
+            kwargs = args[0]
+        if any(not isinstance(key, str) for key in kwargs):
+            raise DbtError("config() keys must be strings.")
+        return kwargs
+
     def _simple_import(self, raw: str, config: dict, *, database: str = "",
                        templates: list[tuple[int, int, str]] | None = None) -> str:
         result = []
@@ -617,19 +708,13 @@ class DbtProject:
         while match := _JINJA_OPEN.search(raw, offset):
             start = match.end()
             if match[0] != "{{" or raw.startswith("-", start):
-                raise DbtError("Jinja blocks, comments and whitespace controls require compiled SQL.")
+                raise _NeedsCompiled("Jinja blocks, comments and whitespace controls require rendering.")
             end = _expression_end(raw, start)
             if raw[end - 1] == "-":
-                raise DbtError("Jinja whitespace controls require compiled SQL.")
+                raise _NeedsCompiled("Jinja whitespace controls require rendering.")
             kind, args, kwargs = _call(raw[start:end])
             if kind == "config":
-                if args:
-                    if len(args) != 1 or not isinstance(args[0], dict) or kwargs:
-                        raise DbtError("config() requires literal keyword arguments or one literal dictionary.")
-                    kwargs = args[0]
-                if any(not isinstance(key, str) for key in kwargs):
-                    raise DbtError("config() keys must be strings.")
-                config.update(kwargs)
+                config.update(self._config_values(args, kwargs))
                 replacement = ""
             else:
                 replacement = self._resolve(kind, args, kwargs, database=database)

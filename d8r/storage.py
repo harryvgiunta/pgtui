@@ -765,9 +765,14 @@ def _workspace_document(value: object) -> dict:
         fields = {"id", "title", "description", "document", "cursor", "source", "dialect"}
         if isinstance(page, dict) and "dbt_views" in page:
             fields.add("dbt_views")
-            views = _record(page["dbt_views"], {"project_dir", "sql", "jinja"}, "query page dbt views")
-            for name, text in views.items():
-                _text(text, f"query page dbt {name}", nonempty=name == "project_dir")
+            raw_views = page["dbt_views"]
+            names = {"project_dir", "sql", "jinja"}
+            has_mode = isinstance(raw_views, dict) and "render_only" in raw_views
+            views = _record(raw_views, names | ({"render_only"} if has_mode else set()), "query page dbt views")
+            for name in names:
+                _text(views[name], f"query page dbt {name}", nonempty=name == "project_dir")
+            if has_mode and type(views["render_only"]) is not bool:
+                raise ValueError("invalid query page dbt preview mode")
         if isinstance(page, dict) and "dbt_file" in page:
             fields.add("dbt_file")
             link = _record(page["dbt_file"], {"project_dir", "path", "revision"}, "dbt file page")

@@ -806,7 +806,7 @@ class D8RApp(App):
         self.editor.focus()
         self._flush_workspace()
         if not self._autosave_error:
-            if self.editor.read_only:
+            if self._dbt_file and not self.session.dbt_enabled:
                 self._set_status("Saved file draft · read-only while dbt is disabled")
             else:
                 self._set_status("dbt file restored from Pages" if self._dbt_file else "Query page restored · nothing executed")
@@ -927,7 +927,7 @@ class D8RApp(App):
         editor = self.active_sql_editor()
         if editor.file_format != "sql" or editor.read_only:
             return
-        if self._dbt_home and has_query_jinja(editor.text, dialect=editor.dialect):
+        if editor.dbt_template:
             self._set_status("Switch to SQL before using the SQL formatter on a dbt template")
             return
         self.query_one(FindBar).close(restore_focus=False)
@@ -1374,13 +1374,14 @@ class D8RApp(App):
             if paged_read is None:
                 self.function_editor.action_preview()
             return
-        if self.editor.file_format != "sql" or self.editor.read_only:
+        if not self._can_query_workspace():
             return
         dbt_home = self._dbt_home
+        dbt_path = self._dbt_query_path
         document = self.editor.selected_text or self.editor.text
         self.submit_sql(self.session.source, "Query",
                         lambda source, stop: self.session.run_all(document, paged_read=paged_read, cancel_event=stop,
-                                                                  dbt_home=dbt_home),
+                                                                  dbt_home=dbt_home, dbt_path=dbt_path),
                         self._publish_run)
 
     def submit_sql(self, source: DataSource, label: str, work: Callable[[DataSource, Event], T],
@@ -1523,16 +1524,17 @@ class D8RApp(App):
         """Inspect an estimate for the selected SQL or current draft."""
         if self.function_mode or self._modal_open() or self.ai_panel.has_focus_within:
             return
-        if self.editor.file_format != "sql" or self.editor.read_only:
+        if not self._can_query_workspace():
             return
         source = self.session.source
         if source.dialect != "postgres" or not self.session.source_connected():
             self._set_status("Connect to PostgreSQL to inspect query plans.")
             return
         document, dbt_home, page = self.editor.selected_text or self.editor.text, self._dbt_home, self._document_identity
+        dbt_path = self._dbt_query_path
         self.palette.close()
         self.submit_sql(source, "Explain query", lambda target, stop: self.session.explain_query(
-            target, document, dbt_home=dbt_home, cancel_event=stop),
+            target, document, dbt_home=dbt_home, dbt_path=dbt_path, cancel_event=stop),
             lambda target, result: self._publish_query_plan(target, page, result), reconnect=False)
 
     def _publish_query_plan(self, source: DataSource, page: str, result: dict) -> None:
@@ -1559,15 +1561,15 @@ class D8RApp(App):
         self.call_after_refresh(reveal)
 
     def action_compile(self) -> None:
-        """Expand local functions only; native SQL grammar is checked on Run."""
+        """Render dbt Jinja and expand local functions without executing SQL."""
         if self.function_mode or self._modal_open() or self.ai_panel.has_focus_within:
             return
-        if self.editor.file_format != "sql" or self.editor.read_only:
+        if not self._can_query_workspace():
             return
         if self.refuse_busy("SQL preview"):
             return
         self.palette.close()
-        outcome = self.session.compile(self.editor.text)
+        outcome = self.session.compile(self.editor.text, dbt_home=self._dbt_home, dbt_path=self._dbt_query_path)
         self._set_error(outcome.error)
         self._set_status(outcome.status)
         if not outcome.ok:
@@ -1718,6 +1720,21 @@ class D8RApp(App):
             return ""
         return self._dbt_file["project_dir"] if self._dbt_file else self.session.dbt_project_dir
 
+    @property
+    def _dbt_views(self) -> dict:
+        views = self._active_page().get("dbt_views", {})
+        return views if views.get("project_dir") == self._dbt_home else {}
+
+    @property
+    def _dbt_query_path(self) -> str:
+        # A SQL preview is already rendered, including any literal template markers it contains.
+        if self._dbt_file and self.editor.text != self._dbt_views.get("sql"):
+            return self._dbt_file["path"]
+        return ""
+
+    def _can_query_workspace(self) -> bool:
+        return self.editor.file_format == "sql" and (not self._dbt_file or self.session.dbt_enabled)
+
     def _sync_dbt_availability(self) -> None:
         tabs = self.query_one(ExplorerTabs)
         if self.session.dbt_enabled:
@@ -1737,11 +1754,13 @@ class D8RApp(App):
         suffix = Path(self._dbt_file["path"]).suffix.lower() if self._dbt_file else ".sql"
         sql = suffix == ".sql"
         editor = self.editor
-        editor.read_only = bool(self._dbt_file and not enabled)
+        views = self._dbt_views
+        preview = editor.text == views.get("sql")
+        editor.read_only = bool(self._dbt_file and not enabled or preview and views.get("render_only"))
         editor.file_format = "sql" if sql else "yaml" if suffix in {".yaml", ".yml"} else "text"
         editor.dbt_navigation = bool(self._dbt_home)
-        templated = enabled and sql and has_query_jinja(editor.text, dialect=self.session.dialect)
-        dbt_template = templated
+        dbt_template = enabled and sql and not preview and has_query_jinja(
+            editor.text, dialect=self.session.dialect, dbt_file=link is not None)
         if dbt_template and not editor.dbt_template:
             self.palette.close()
         editor.dbt_template = dbt_template
@@ -1754,9 +1773,11 @@ class D8RApp(App):
             details = self.query_one("#page-details", PageDetails)
             details.display = False
             self.query_one("#page-details-toggle", Button).label = "Show Page Details"
-        for selector in ("#run-query", "#format-query", "#query-sections", "#page-details-toggle"):
+        can_query = self._can_query_workspace()
+        self.query_one("#run-query", Button).display = can_query
+        self.query_one("#explain-query", Button).display = can_query and self.session.dialect == "postgres"
+        for selector in ("#format-query", "#query-sections", "#page-details-toggle"):
             self.query_one(selector, Button).display = sql and not editor.read_only
-        self.query_one("#explain-query", Button).display = sql and not editor.read_only and self.session.dialect == "postgres"
         self.query_one("#open-ai", Button).display = not editor.read_only
         self.query_one("#dbt-file-diff", Button).display = bool(link)
         self.query_one("#dbt-rename-model", Button).display = bool(link) and suffix in {".sql", ".py"}
@@ -1767,7 +1788,7 @@ class D8RApp(App):
         self.query_one("#dbt-editor-tools").display = bool(link) or convert
         switch = self.query_one("#dbt-toggle", Switch)
         with switch.prevent(Switch.Changed):
-            switch.value = templated
+            switch.value = dbt_template
         if self._workspace_ready:
             self.dbt_authoring.request()
 
@@ -1789,31 +1810,49 @@ class D8RApp(App):
         document = editor.text
         directory = self._dbt_home
         dialect = self.session.dialect
-        templated = has_query_jinja(document, dialect=dialect)
+        path = self._dbt_query_path
+        views = self._dbt_views
+        templated = document != views.get("sql") and has_query_jinja(document, dialect=dialect, dbt_file=bool(path))
         if to_dbt is None:
             to_dbt = not templated
+        render_only = bool(views.get("render_only", False))
+        restored = to_dbt and document == views.get("sql")
+        note = ""
         try:
             if not directory:
                 raise DbtError("Set a project home in Settings → Workspace Settings first")
             if not document.strip():
                 raise DbtError("Open a model or enter a SQL query first")
-            project = DbtProject(directory, dialect=dialect)
-            target = self._dbt_conversion_target()
-            views = self._active_page().get("dbt_views", {})
-            if views.get("project_dir") != directory:
-                views = {}
-            if to_dbt:
-                authored = views["jinja"] if document == views.get("sql") else document
-                sql, jinja = project.query_views(authored, **target)
+            if restored:
+                sql, jinja = document, views["jinja"]
+                if not render_only:
+                    # Keep literal normalization for reversible drafts, but never
+                    # strand the authored template if project mappings changed.
+                    try:
+                        project = DbtProject(directory, dialect=dialect)
+                        _, jinja = project.query_views(jinja, **self._dbt_conversion_target())
+                    except (DbtError, OSError) as exc:
+                        note = f" · restored without normalization: {exc}"
+            elif to_dbt:
+                project = DbtProject(directory, dialect=dialect)
+                target = self._dbt_conversion_target()
+                sql, jinja = project.query_views(document, **target)
+                render_only = False
                 if not templated:
                     sql = document
-                    if authored == document and views:
+                    if views and not views.get("render_only"):
                         configs = project.config_calls(views["jinja"], database=target["database"])
                         if configs:
                             jinja = "\n".join((*configs, jinja))
             else:
                 jinja = document
-                sql = views["sql"] if document == views.get("jinja") else project.render_query(document, database=target["database"])
+                if not path and not render_only and document == views.get("jinja"):
+                    sql = views["sql"]
+                else:
+                    project = DbtProject(directory, dialect=dialect)
+                    sql, reversible = project.preview_query(document, database=self._dbt_conversion_target()["database"],
+                                                            path=path)
+                    render_only = not reversible
             next_view = "jinja" if to_dbt else "sql"
             replacement = jinja if to_dbt else sql
             if document == replacement:
@@ -1826,10 +1865,10 @@ class D8RApp(App):
         # Persist prior edits, not the representation change itself. Edits made
         # in a native preview become writable once they are converted back.
         edited_sql_view = False
-        if self._dbt_file and to_dbt and not templated and views and document != views["sql"]:
+        if self._dbt_file and to_dbt and not templated and views and not restored:
             try:
                 disk = DbtFiles(directory).read(self._dbt_file["path"], missing=True)
-                edited_sql_view = has_query_jinja(disk.text, dialect=dialect) or not disk.revision
+                edited_sql_view = has_query_jinja(disk.text, dialect=dialect, dbt_file=True) or not disk.revision
             except (DbtError, OSError):
                 edited_sql_view = True  # Keep the edits; autosave will report the disk error.
         if not edited_sql_view:
@@ -1841,11 +1880,13 @@ class D8RApp(App):
             if edited_sql_view:
                 self._queue_workspace_save()
         editor.focus()
-        self._sync_dbt_controls()
         self._capture_workspace()
-        views = {"project_dir": directory, "sql": sql, "jinja": jinja, next_view: editor.text}
-        if self.save_workspace(dbt_views=views, **self._workspace_snapshot):
-            self._set_status("dbt Jinja · nothing executed" if to_dbt else "Native SQL · nothing executed")
+        views = {"project_dir": directory, "sql": sql, "jinja": jinja, "render_only": render_only, next_view: editor.text}
+        saved = self.save_workspace(dbt_views=views, **self._workspace_snapshot)
+        self._sync_dbt_controls()
+        if saved:
+            mode = "dbt Jinja" if to_dbt else "Native SQL (read-only preview)" if render_only else "Native SQL"
+            self._set_status(f"{mode} · nothing executed{note}")
 
     def _dbt_workspace_settings(self, *, source_key: str | None = None, **changes) -> bool:
         workspaces = deepcopy(self.session.workspace["source_workspaces"])
@@ -2061,7 +2102,7 @@ class D8RApp(App):
         for page, link, text in self._linked_dbt_pages(home):
             views = page.get("dbt_views", {})
             if (views.get("project_dir") == home and views.get("sql") != views.get("jinja")
-                    and (text == views.get("sql") or not has_query_jinja(text, dialect=page["dialect"] or self.session.dialect))):
+                    and (text == views.get("sql") or not has_query_jinja(text, dbt_file=True))):
                 # Converted SQL previews are not the project authoring buffer.
                 continue
             if file_revision(text) != link["revision"]:
@@ -2228,8 +2269,9 @@ class D8RApp(App):
     def _persist_dbt_file(self, page: dict, project: DbtFiles) -> DbtFile:
         link, text = page["dbt_file"], page["document"]
         before = project.read(link["path"], missing=True)
-        if (page.get("dbt_views") and not has_query_jinja(text, dialect=self.session.dialect)
-                and has_query_jinja(before.text or page["dbt_views"]["jinja"], dialect=self.session.dialect)):
+        views = page.get("dbt_views")
+        if (views and (text == views.get("sql") or not has_query_jinja(text, dbt_file=True))
+                and has_query_jinja(before.text or views["jinja"], dbt_file=True)):
             raise DbtError(f"Switch {link['path']} back to dbt to autosave without losing its template.")
         return project.save(link["path"], text, link["revision"])
 

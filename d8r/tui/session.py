@@ -587,7 +587,7 @@ class Session:
         if default_rows is not None:
             self.default_rows = default_rows
 
-    def save_workspace(self, *, dbt_views: dict[str, str] | None = None,
+    def save_workspace(self, *, dbt_views: dict[str, str | bool] | None = None,
                        dbt_file: dict[str, str] | None = None, **changes) -> None:
         """Merge owned fields under one lock; failures preserve the live draft."""
         with self._workspace_lock:
@@ -1283,10 +1283,16 @@ class Session:
         """Expand saved functions and split native SQL; no server validation or IO."""
         return parse_sql(doc, self.fns, dialect=self.source.dialect)
 
-    def compile(self, doc: str) -> RunOutcome:
-        """Preview expanded native SQL offline, even for disconnected targets."""
-        document = self.parse(doc)
+    def compile(self, doc: str, *, dbt_home: str = "", dbt_path: str = "") -> RunOutcome:
+        """Preview rendered SQL and expanded native functions, without execution."""
         outcome = RunOutcome(source=self.active_id, dialect=self.source.dialect, doc=doc)
+        try:
+            native, _ = self._native_query(doc, self.source, dbt_home, dbt_path)
+        except (DbtError, OSError) as exc:
+            outcome.error = str(exc)
+            outcome.status = f"not executed · {outcome.error}"
+            return outcome
+        document = self.parse(native)
         if document.errors:
             first = document.errors[0]
             outcome.error = f"line {first.line}: {first.message}"
@@ -1298,22 +1304,25 @@ class Session:
                           " · server syntax/schema not validated")
         return outcome
 
-    def _render_dbt_sql(self, doc: str, source: DataSource, dbt_home: str) -> str:
+    def _native_query(self, doc: str, source: DataSource, dbt_home: str, dbt_path: str) -> tuple[str, bool]:
+        if not has_query_jinja(doc, dialect=source.dialect, dbt_file=bool(dbt_path)):
+            return doc, False
+        if not self.dbt_enabled:
+            raise DbtError("dbt is disabled in Settings → Workspace Settings.")
         directory = dbt_home or self.dbt_project_dir
         if not directory:
             raise DbtError("Set a project home in Settings → Workspace Settings before running dbt Jinja.")
         target = source.postgres or self.saved_source_profile(source.id) or {}
-        return DbtProject(directory, dialect=source.dialect).render_query(doc, database=target.get("database", ""))
+        project = DbtProject(directory, dialect=source.dialect)
+        return project.render_query(doc, database=target.get("database", ""), path=dbt_path), True
 
-    def explain_query(self, source: DataSource, doc: str, *, dbt_home: str = "", cancel_event: Event) -> dict:
+    def explain_query(self, source: DataSource, doc: str, *, dbt_home: str = "", dbt_path: str = "",
+                      cancel_event: Event) -> dict:
         """Plan one query in the worker, without updating rows or Run history."""
-        if has_query_jinja(doc, dialect=source.dialect):
-            if not self.dbt_enabled:
-                raise EngineError("dbt is disabled in Settings → Workspace Settings.")
-            try:
-                doc = self._render_dbt_sql(doc, source, dbt_home)
-            except (DbtError, OSError) as exc:
-                raise EngineError(str(exc)) from None
+        try:
+            doc, _ = self._native_query(doc, source, dbt_home, dbt_path)
+        except (DbtError, OSError) as exc:
+            raise EngineError(str(exc)) from None
         document = parse_sql(doc, self.functions_for(source.id), dialect=source.dialect)
         if document.errors:
             first = document.errors[0]
@@ -1332,10 +1341,10 @@ class Session:
         return self.run_all(doc, record=record)[0]
 
     def run_all(self, doc: str, record: bool = True, *, paged_read: bool | None = None,
-                cancel_event: Event | None = None, dbt_home: str = "") -> list[RunOutcome]:
+                cancel_event: Event | None = None, dbt_home: str = "", dbt_path: str = "") -> list[RunOutcome]:
         """Execute statements in order, stopping at the first server error.
 
-        PostgreSQL dbt Jinja is rendered offline before parsing. Conversion,
+        dbt Jinja is rendered offline before parsing. Conversion,
         lexical and expansion errors prevent execution. Native SQL transaction
         boundaries are exactly those authored; successful earlier statements are
         not silently rolled back when a later statement fails.
@@ -1346,17 +1355,11 @@ class Session:
         the in-flight statement is separate and does not release ownership.
         """
         source = self.source
-        is_dbt = has_query_jinja(doc, dialect=source.dialect)
-        native = doc
-        if is_dbt:
-            if not self.dbt_enabled:
-                message = "dbt is disabled in Settings → Workspace Settings. Nothing was executed."
-                return [RunOutcome(status=message, error=message, doc=doc)]
-            try:
-                native = self._render_dbt_sql(doc, source, dbt_home)
-            except (DbtError, OSError) as exc:
-                message = str(exc)
-                return [RunOutcome(status=f"not executed · {message}", error=message, doc=doc)]
+        try:
+            native, is_dbt = self._native_query(doc, source, dbt_home, dbt_path)
+        except (DbtError, OSError) as exc:
+            message = str(exc)
+            return [RunOutcome(status=f"not executed · {message}", error=message, doc=doc)]
         document = self.parse(native)
         if document.errors:
             first = document.errors[0]

@@ -254,6 +254,16 @@ def test_advanced_jinja_requires_real_compiled_artifact(tmp_path):
     assert imported.sql == "select 2"
     assert imported.used_compiled
     assert imported.materialized == "incremental"
+    assert DbtProject(root).render_query(raw, database="", path="models/advanced.sql") == "select 2"
+    with pytest.raises(DbtError, match="manifest is stale"):
+        DbtProject(root).render_query(raw + "\n-- unsaved edit", database="", path="models/advanced.sql")
+
+
+def test_jinja_loop_budget_covers_iterations_that_emit_nothing(tmp_path):
+    dbt = DbtProject(project(tmp_path))
+    draft = "{% for x in range(200) %}{% for y in range(200) %}{% endfor %}{% endfor %}select 1"
+    with pytest.raises(DbtError, match="Jinja render limit exceeded"):
+        dbt.render_query(draft, database="")
 
 
 def test_compiled_file_uses_custom_target_and_refuses_stale(tmp_path):

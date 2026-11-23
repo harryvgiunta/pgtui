@@ -353,13 +353,24 @@ inventory before writing.
 
 ### SQL ↔ dbt switch
 
-Turn the editor switch to **SQL** to resolve literal `ref()`, `source()`, and `config()`
-calls, or to **dbt** to normalize a mixed draft: resolve it to SQL first, then turn
-mapped relations into dbt calls. `\dbt` flips the switch via the command palette.
-Switching views is undoable and does not itself run or save the file. Model
-mappings use the project's manifest; literal sources also work directly from YAML.
-Dynamic Jinja and unmapped relations report an error instead of guessing. Edits to
-a templated model in the native SQL preview autosave after switching back to dbt.
+Switch to **SQL** to preview the rendered query in the editor, or use
+**Ctrl+K** to see it in the SQL pane without changing the draft. `\dbt` flips
+the editor switch. **Run** (**Ctrl+Enter**) renders Jinja and executes the
+resulting native query on the selected source; it does not run `dbt build`,
+materialize the model, or execute hooks.
+
+Offline rendering handles `{% set %}`, `{% if %}`, `{% for %}`, Jinja comments
+and whitespace control, and `var()` values from `dbt_project.yml`. `ref()` and
+`source()` use manifest relation names; literal sources also work from YAML.
+For features that need dbt's runtime, such as `is_incremental()` or package
+macros, use `dbt compile` for the intended target. PGTUI can use the linked
+file's matching compiled artifact and rejects artifacts it can tell are stale.
+
+Switching views is undoable and does not itself run or save the file. SQL
+previews of blocks, expressions, and compiled artifacts are read-only so
+switching back restores the original template. Literal relation conversions
+remain editable: switch back to dbt to normalize mapped relations and autosave
+edits to a templated model.
 
 ### Assistant skills
 

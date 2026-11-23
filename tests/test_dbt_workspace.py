@@ -23,7 +23,7 @@ from d8r.sql import SchemaContext
 from d8r.tui.app import D8RApp
 from d8r.tui.dbt import DbtExplorer
 from d8r.tui.session import Session
-from tests.test_dbt_exchange import project, put, source
+from tests.test_dbt_exchange import manifest, node, project, put, source
 
 
 def workspace(tmp_path):
@@ -169,6 +169,62 @@ def test_mixed_switch_normalizes_and_does_not_save_a_sql_preview(tmp_path):
             await pilot.pause(app._WORKSPACE_SAVE_INTERVAL + 0.1)
             assert "-- edited in SQL preview" in model.read_text()
             assert model.read_text().count("{{ source('landing', 'orders') }}") == 2
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("artifact", [False, True], ids=["live-jinja", "compiled-artifact"])
+def test_open_model_previews_and_runs_jinja_without_rewriting_file(tmp_path, parquet_source, artifact):
+    root = project(tmp_path, extra={"vars": {"columns": ["id", "label"], "record_id": 2}})
+    path = "models/current.sql"
+    if artifact:
+        raw = "{% if is_incremental() %}\r\nselect id, label from {{ package.pick_records() }}\r\n{% endif %}\r\n"
+        manifest(root, {"model.demo.current": node(
+            "current", raw_code=raw.strip().replace("\r\n", "\n"),
+            compiled_code="select id, label from data where id = 2",
+        )})
+    else:
+        raw = ("{# query the selected record -#}\n"
+               "{%- set fields = var('columns') -%}\n"
+               "{% if fields %}select {% for field in fields %}{{ field }}{{ ', ' if not loop.last }}{% endfor %}\n"
+               "from data where id = {{ var('record_id') }}{% else %}select 0 as id{% endif %}\n")
+    model = put(root, path, raw)
+    original = model.read_bytes()
+
+    async def scenario():
+        session = Session({parquet_source.id: parquet_source}, data_dir=tmp_path / "workspace")
+        app = D8RApp(session)
+        async with app.run_test(size=(145, 55)) as pilot:
+            tree = await open_home(app, pilot, root)
+            await select(tree, pilot, ("file", path))
+            assert app.editor.text == raw
+            await pilot.press("ctrl+k")
+            sql = app.query_one("#sql-text", TextArea).text
+            assert "select id, label from data where id = 2" == " ".join(sql.split())
+            assert not session.history and app.editor.text == raw
+
+            app.editor.focus()
+            await pilot.press("ctrl+enter")
+            await app.workers.wait_for_complete()
+            assert app._main_outcome.rows == [[2, "beta"]]
+            assert session.history[0].doc == raw
+
+            switch = app.query_one("#dbt-toggle", Switch)
+            assert switch.value
+            await pilot.click(switch)
+            assert not switch.value and app.editor.read_only
+            assert " ".join(app.editor.text.split()) == " ".join(sql.split())
+            await pilot.press("ctrl+enter")
+            await app.workers.wait_for_complete()
+            assert len(session.history) == 2 and app._main_outcome.rows == [[2, "beta"]]
+            await pilot.pause(app._WORKSPACE_SAVE_INTERVAL + 0.1)
+            assert model.read_bytes() == original
+
+            if artifact:
+                (root / "target" / "manifest.json").unlink()  # Restoring does not depend on artifacts.
+            await pilot.click(switch)
+            assert switch.value and not app.editor.read_only and app.editor.text == raw
+            assert model.read_bytes() == original
 
     asyncio.run(scenario())
 
