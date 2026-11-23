@@ -357,7 +357,7 @@ def value_publication(schema, *, changed_index=None, eligible=True):
         _eligible=lambda: eligible, _snapshot=lambda: tuple(current),
         session=SimpleNamespace(target_source=lambda source_id: nullcontext(), schema=schema),
         source_id=None, editor=SimpleNamespace(text=updated, cursor_location=(0, len(updated))),
-        _parameters=lambda: (), _values_snapshot=snapshot, sync=lambda: published.append(True))
+        _parameters=lambda: (), sync=lambda: published.append(True))
     return palette, snapshot, source, published
 
 
@@ -365,7 +365,6 @@ def test_value_publication_survives_typing_same_physical_predicate(schema):
     palette, snapshot, source, published = value_publication(schema)
     assert CommandPalette.values_ready(palette, snapshot, source, "public.dataset_symbol", "display_name")
     assert published == [True]
-    assert palette._values_snapshot is None
 
 
 @pytest.mark.parametrize("index", [3, 5, 9, 10, 11, 12, 16, 18])

@@ -219,6 +219,7 @@ def test_functions_and_history_are_target_scoped(parquet_source):
 def test_value_cache_is_typed_bounded_and_invalidated(parquet_source):
     session = session_for(parquet_source)
     session.update_settings(value_cache_enabled=True, value_cache_limit=2)
+    assert session.run("CREATE TABLE write_probe (id integer)", record=False).ok
     values, capped = session.distinct_values(parquet_source, "data", "id")
     assert values == [1, 2] and capped
     assert session.cached_value_columns == 1
@@ -229,7 +230,9 @@ def test_value_cache_is_typed_bounded_and_invalidated(parquet_source):
     with pytest.raises(EngineError):
         session.distinct_values(parquet_source, "data", "id", epoch=epoch)
     session.distinct_values(parquet_source, "data", "id")
-    session.run("SELECT 1")
+    assert session.run("SELECT 1", record=False).ok
+    assert session.cached_values(parquet_source, "data", "id") == ([1, 2], True)
+    assert session.run("INSERT INTO write_probe VALUES (1)", record=False).ok
     assert session.cached_value_columns == 0
 
 
