@@ -43,9 +43,10 @@ from textual.widgets.option_list import Option
 from d8r.ai.context import AIProposal
 from d8r.ai.dbt import DbtAIContext
 from d8r.completion.engine import function_insertion
-from d8r.dbt import DbtError, DbtProject, has_query_jinja
+from d8r.dbt import DbtError, has_query_jinja
 from d8r.dbt_edits import DbtDraft, add_description
 from d8r.dbt_files import DbtFile, DbtFiles, file_revision, reference_at
+from d8r.dbt_profiles import DbtTargetSettings
 from d8r.dbt_rename import DbtRenamePlan
 from d8r.engine import POSTGRES_VERSION, DataSource, EngineError, postgres_definition
 from d8r.sql import ColumnDef, format_parameters
@@ -1378,10 +1379,12 @@ class D8RApp(App):
             return
         dbt_home = self._dbt_home
         dbt_path = self._dbt_query_path
+        dbt_preview = self._dbt_preview_key()
         document = self.editor.selected_text or self.editor.text
         self.submit_sql(self.session.source, "Query",
                         lambda source, stop: self.session.run_all(document, paged_read=paged_read, cancel_event=stop,
-                                                                  dbt_home=dbt_home, dbt_path=dbt_path),
+                                                                  dbt_home=dbt_home, dbt_path=dbt_path,
+                                                                  dbt_preview=dbt_preview),
                         self._publish_run)
 
     def submit_sql(self, source: DataSource, label: str, work: Callable[[DataSource, Event], T],
@@ -1532,9 +1535,10 @@ class D8RApp(App):
             return
         document, dbt_home, page = self.editor.selected_text or self.editor.text, self._dbt_home, self._document_identity
         dbt_path = self._dbt_query_path
+        dbt_preview = self._dbt_preview_key()
         self.palette.close()
         self.submit_sql(source, "Explain query", lambda target, stop: self.session.explain_query(
-            target, document, dbt_home=dbt_home, dbt_path=dbt_path, cancel_event=stop),
+            target, document, dbt_home=dbt_home, dbt_path=dbt_path, dbt_preview=dbt_preview, cancel_event=stop),
             lambda target, result: self._publish_query_plan(target, page, result), reconnect=False)
 
     def _publish_query_plan(self, source: DataSource, page: str, result: dict) -> None:
@@ -1569,7 +1573,8 @@ class D8RApp(App):
         if self.refuse_busy("SQL preview"):
             return
         self.palette.close()
-        outcome = self.session.compile(self.editor.text, dbt_home=self._dbt_home, dbt_path=self._dbt_query_path)
+        outcome = self.session.compile(self.editor.text, dbt_home=self._dbt_home, dbt_path=self._dbt_query_path,
+                                       dbt_preview=self._dbt_preview_key())
         self._set_error(outcome.error)
         self._set_status(outcome.status)
         if not outcome.ok:
@@ -1725,6 +1730,16 @@ class D8RApp(App):
         views = self._active_page().get("dbt_views", {})
         return views if views.get("project_dir") == self._dbt_home else {}
 
+    def _dbt_preview_key(self) -> str | None:
+        views = self._active_page().get("dbt_views", {})
+        if not views or views["sql"] == views["jinja"] or not (self.session.dbt_enabled or views.get("artifact_key")):
+            return None
+        text = self.editor.text
+        if text != views["sql"] and has_query_jinja(text, dialect=self.session.dialect, dbt_file=bool(self._dbt_file)):
+            return None
+        # Keep stale views recognizable so previously rendered SQL cannot bypass validation.
+        return views.get("artifact_key", "") if views["project_dir"] == self._dbt_home else "stale"
+
     @property
     def _dbt_query_path(self) -> str:
         # A SQL preview is already rendered, including any literal template markers it contains.
@@ -1812,6 +1827,7 @@ class D8RApp(App):
         dialect = self.session.dialect
         path = self._dbt_query_path
         views = self._dbt_views
+        artifact_key = views.get("artifact_key", "")
         templated = document != views.get("sql") and has_query_jinja(document, dialect=dialect, dbt_file=bool(path))
         if to_dbt is None:
             to_dbt = not templated
@@ -1829,12 +1845,17 @@ class D8RApp(App):
                     # Keep literal normalization for reversible drafts, but never
                     # strand the authored template if project mappings changed.
                     try:
-                        project = DbtProject(directory, dialect=dialect)
-                        _, jinja = project.query_views(jinja, **self._dbt_conversion_target())
+                        project = self.session.dbt_project(directory)
+                        if project.artifact_key == artifact_key:
+                            _, jinja = project.query_views(jinja, **self._dbt_conversion_target())
                     except (DbtError, OSError) as exc:
                         note = f" · restored without normalization: {exc}"
             elif to_dbt:
-                project = DbtProject(directory, dialect=dialect)
+                project = self.session.dbt_project(directory)
+                preview_key = self._dbt_preview_key()
+                if not templated and preview_key is not None and preview_key != project.artifact_key:
+                    raise DbtError("This edited SQL preview is stale for the workspace's dbt target. Restore its target before converting it.")
+                artifact_key = project.artifact_key
                 target = self._dbt_conversion_target()
                 sql, jinja = project.query_views(document, **target)
                 render_only = False
@@ -1846,13 +1867,14 @@ class D8RApp(App):
                             jinja = "\n".join((*configs, jinja))
             else:
                 jinja = document
-                if not path and not render_only and document == views.get("jinja"):
+                project = self.session.dbt_project(directory)
+                if not path and not render_only and document == views.get("jinja") and project.artifact_key == artifact_key:
                     sql = views["sql"]
                 else:
-                    project = DbtProject(directory, dialect=dialect)
                     sql, reversible = project.preview_query(document, database=self._dbt_conversion_target()["database"],
                                                             path=path)
                     render_only = not reversible
+                artifact_key = project.artifact_key
             next_view = "jinja" if to_dbt else "sql"
             replacement = jinja if to_dbt else sql
             if document == replacement:
@@ -1881,7 +1903,8 @@ class D8RApp(App):
                 self._queue_workspace_save()
         editor.focus()
         self._capture_workspace()
-        views = {"project_dir": directory, "sql": sql, "jinja": jinja, "render_only": render_only, next_view: editor.text}
+        views = {"project_dir": directory, "sql": sql, "jinja": jinja, "render_only": render_only,
+                 "artifact_key": artifact_key, next_view: editor.text}
         saved = self.save_workspace(dbt_views=views, **self._workspace_snapshot)
         self._sync_dbt_controls()
         if saved:
@@ -1918,17 +1941,21 @@ class D8RApp(App):
             self._set_status(f"dbt {'enabled' if enabled else 'disabled'} for this workspace")
         return saved
 
-    def set_dbt_project_dir(self, path: str) -> bool:
+    def set_dbt_project_dir(self, path: str, *, target_settings: DbtTargetSettings | None = None) -> bool:
         if not self.session.dbt_enabled:
             return False
         self._capture_workspace()
-        saved = self._dbt_workspace_settings(dbt_project_dir=path)
+        settings = target_settings or self.session.dbt_target_settings(path)
+        saved = self._dbt_workspace_settings(dbt_project_dir=path, dbt_profiles_path=settings.profiles_path,
+                                             dbt_target_override=settings.override)
         self._sync_dbt_availability()
+        self.dbt_authoring.invalidate()
         return saved
 
     def link_new_dbt_project(self, source_key: str, path: str) -> bool:
         self._capture_workspace()
-        return self._dbt_workspace_settings(source_key=source_key, dbt_project_dir=path, dbt_enabled=True)
+        return self._dbt_workspace_settings(source_key=source_key, dbt_project_dir=path, dbt_enabled=True,
+                                            dbt_profiles_path="", dbt_target_override="")
 
     def show_dbt_explorer(self, panel: str | None = None) -> None:
         if not self.session.dbt_enabled:
@@ -2253,7 +2280,7 @@ class D8RApp(App):
         try:
             call = reference_at(document, offset)
             if call is None and not has_query_jinja(document, dialect=self.session.dialect):
-                project = DbtProject(home, dialect=self.session.dialect)
+                project = self.session.dbt_project(home)
                 expression = project.relation_call_at(document, offset, **self._dbt_conversion_target())
                 call = reference_at(expression, 0) if expression else None
             if call is not None:

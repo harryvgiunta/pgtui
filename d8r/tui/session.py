@@ -31,6 +31,8 @@ from d8r.completion.context import analyze
 from d8r.completion.lineage import projection_origins
 from d8r.credentials import CredentialError
 from d8r.dbt import DbtError, DbtProject, has_query_jinja
+from d8r.dbt_files import DbtFiles
+from d8r.dbt_profiles import DbtTargetSettings
 
 from d8r.engine import (
     DataSource, EngineError, add_d1_source, add_parquet_source, add_postgres_source,
@@ -332,6 +334,24 @@ class Session:
         """Whether this source workspace may use the dbt integration."""
         state = self.workspace["source_workspaces"].get(self.source_key(), {})
         return state.get("dbt_enabled", bool(state.get("dbt_project_dir")))
+
+    def dbt_target_settings(self, home: str, source_id: str | None = None) -> DbtTargetSettings:
+        state = self.workspace["source_workspaces"].get(self.source_key(source_id), {})
+        if state.get("dbt_project_dir") != home:
+            return DbtTargetSettings()
+        return DbtTargetSettings(state.get("dbt_profiles_path", ""), state.get("dbt_target_override", ""))
+
+    def dbt_project(self, directory: str, source: DataSource | None = None) -> DbtProject:
+        source = self.source if source is None else source
+        project = DbtFiles(directory)
+        settings = self.dbt_target_settings(str(project.root), source.id)
+        target = settings.resolve(project.root, project.config, for_artifacts=True)
+        if target and target.adapter == source.dialect == "postgres":
+            database = (source.postgres or self.saved_source_profile(source.id) or {}).get("database", "")
+            if target.database and database and target.database != database:
+                raise DbtError(f"dbt target {target.name!r} uses database {target.database!r}, but this workspace "
+                               f"uses {database!r}. Check Workspace Default Target Override.")
+        return DbtProject(project.root, dialect=source.dialect, target=target)
 
     @property
     def history(self) -> list[HistoryEntry]:
@@ -1283,11 +1303,12 @@ class Session:
         """Expand saved functions and split native SQL; no server validation or IO."""
         return parse_sql(doc, self.fns, dialect=self.source.dialect)
 
-    def compile(self, doc: str, *, dbt_home: str = "", dbt_path: str = "") -> RunOutcome:
+    def compile(self, doc: str, *, dbt_home: str = "", dbt_path: str = "",
+                dbt_preview: str | None = None) -> RunOutcome:
         """Preview rendered SQL and expanded native functions, without execution."""
         outcome = RunOutcome(source=self.active_id, dialect=self.source.dialect, doc=doc)
         try:
-            native, _ = self._native_query(doc, self.source, dbt_home, dbt_path)
+            native, _ = self._native_query(doc, self.source, dbt_home, dbt_path, dbt_preview)
         except (DbtError, OSError) as exc:
             outcome.error = str(exc)
             outcome.status = f"not executed · {outcome.error}"
@@ -1304,8 +1325,9 @@ class Session:
                           " · server syntax/schema not validated")
         return outcome
 
-    def _native_query(self, doc: str, source: DataSource, dbt_home: str, dbt_path: str) -> tuple[str, bool]:
-        if not has_query_jinja(doc, dialect=source.dialect, dbt_file=bool(dbt_path)):
+    def _native_query(self, doc: str, source: DataSource, dbt_home: str, dbt_path: str,
+                      dbt_preview: str | None) -> tuple[str, bool]:
+        if dbt_preview is None and not has_query_jinja(doc, dialect=source.dialect, dbt_file=bool(dbt_path)):
             return doc, False
         if not self.dbt_enabled:
             raise DbtError("dbt is disabled in Settings → Workspace Settings.")
@@ -1313,14 +1335,18 @@ class Session:
         if not directory:
             raise DbtError("Set a project home in Settings → Workspace Settings before running dbt Jinja.")
         target = source.postgres or self.saved_source_profile(source.id) or {}
-        project = DbtProject(directory, dialect=source.dialect)
+        project = self.dbt_project(directory, source)
+        if dbt_preview is not None:
+            if dbt_preview != project.artifact_key:
+                raise DbtError("This SQL preview is stale for the workspace's dbt target. Switch back to dbt and render again.")
+            return doc, False
         return project.render_query(doc, database=target.get("database", ""), path=dbt_path), True
 
     def explain_query(self, source: DataSource, doc: str, *, dbt_home: str = "", dbt_path: str = "",
-                      cancel_event: Event) -> dict:
+                      dbt_preview: str | None = None, cancel_event: Event) -> dict:
         """Plan one query in the worker, without updating rows or Run history."""
         try:
-            doc, _ = self._native_query(doc, source, dbt_home, dbt_path)
+            doc, _ = self._native_query(doc, source, dbt_home, dbt_path, dbt_preview)
         except (DbtError, OSError) as exc:
             raise EngineError(str(exc)) from None
         document = parse_sql(doc, self.functions_for(source.id), dialect=source.dialect)
@@ -1341,7 +1367,8 @@ class Session:
         return self.run_all(doc, record=record)[0]
 
     def run_all(self, doc: str, record: bool = True, *, paged_read: bool | None = None,
-                cancel_event: Event | None = None, dbt_home: str = "", dbt_path: str = "") -> list[RunOutcome]:
+                cancel_event: Event | None = None, dbt_home: str = "", dbt_path: str = "",
+                dbt_preview: str | None = None) -> list[RunOutcome]:
         """Execute statements in order, stopping at the first server error.
 
         dbt Jinja is rendered offline before parsing. Conversion,
@@ -1356,7 +1383,7 @@ class Session:
         """
         source = self.source
         try:
-            native, is_dbt = self._native_query(doc, source, dbt_home, dbt_path)
+            native, is_dbt = self._native_query(doc, source, dbt_home, dbt_path, dbt_preview)
         except (DbtError, OSError) as exc:
             message = str(exc)
             return [RunOutcome(status=f"not executed · {message}", error=message, doc=doc)]

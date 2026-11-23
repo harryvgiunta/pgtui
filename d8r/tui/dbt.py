@@ -10,8 +10,9 @@ from rich.text import Text
 from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
+from textual.suggester import SuggestFromList
 from textual.widgets import Button, Input, OptionList, Static, TabbedContent, TabPane, TextArea, Tree
 from textual.widgets.option_list import Option
 
@@ -21,6 +22,7 @@ from d8r.dbt_docs import DbtDocs
 from d8r.dbt_edits import DbtDraft, model_ref, singular_test
 from d8r.dbt_files import DbtFile, DbtFiles, DbtModel, file_revision
 from d8r.dbt_git import git_diff
+from d8r.dbt_profiles import DbtTargetSettings
 from d8r.dbt_references import DbtReferences
 from d8r.dbt_rename import DbtRenamePlan, apply_rename, plan_rename
 from .dbt_authoring import DbtLineage, DbtProblems
@@ -66,30 +68,82 @@ class DbtDialog(ModalScreen):
 
 
 class DBTScreen(DbtDialog):
-    """One source-scoped setting. No file writes or execution when opening a project."""
+    """Save the project and its dbt target selection for one source workspace."""
 
-    def __init__(self, ide: D8RApp, **kwargs) -> None:
+    def __init__(self, ide: D8RApp, *, focus_field: str = "dbt-project-dir", **kwargs) -> None:
         super().__init__(**kwargs)
         self.ide = ide
         self.source = ide.session.source_key()
+        self.focus_field = focus_field
 
     def compose(self) -> ComposeResult:
-        with Vertical(classes="dbt-dialog"):
+        settings = self.ide.session.dbt_target_settings(self.ide.session.dbt_project_dir)
+        with VerticalScroll(classes="dbt-dialog"):
             yield Static("Workspace project home (directory containing dbt_project.yml)")
             yield Input(self.ide.session.dbt_project_dir, placeholder="Local project directory", id="dbt-project-dir")
+            yield Static("Path to dbt Profiles (directory or profiles.yml)")
+            yield Input(settings.profiles_path, placeholder="Discover profiles.yml", id="dbt-profiles-path")
+            yield Static("Workspace Default Target Override")
+            yield Input(settings.override, placeholder="Use the profile default", id="dbt-target-override")
+            yield Static("List Targets to see the profile default and its outputs.", id="dbt-profile-targets", markup=False)
             yield Static("", id="dbt-message", markup=False)
             with Horizontal(classes="dbt-buttons"):
                 yield Button("Open & Save Project Home", id="dbt-open", variant="primary")
+                yield Button("List Targets", id="dbt-list-targets")
                 yield Button("Close", id="dbt-close")
+
+    def on_mount(self) -> None:
+        if self.ide.session.dbt_project_dir:
+            self._list_targets()
+        self.query_one(f"#{self.focus_field}", Input).focus()
+
+    def _project(self) -> DbtFiles:
+        if not self.ide.session.dbt_enabled or self.ide.session.source_key() != self.source:
+            raise DbtError("The source changed. Reopen project setup.")
+        return DbtFiles(self.query_one("#dbt-project-dir", Input).value.strip())
+
+    def _selection(self) -> DbtTargetSettings:
+        return DbtTargetSettings(self.query_one("#dbt-profiles-path", Input).value.strip(),
+                                 self.query_one("#dbt-target-override", Input).value.strip())
+
+    @on(Button.Pressed, "#dbt-list-targets")
+    def _list_targets(self) -> None:
+        target_input = self.query_one("#dbt-target-override", Input)
+        target_input.suggester = None
+        status = self.query_one("#dbt-profile-targets", Static)
+        try:
+            project = self._project()
+            profile = self._selection().profile(project.root, project.config)
+        except (DbtError, OSError) as exc:
+            status.update(str(exc))
+            return
+        if profile is None:
+            status.update("No profile found. Choose a profiles path to validate a target, or link for offline authoring.")
+            return
+        names = list(profile.outputs)
+        session = self.ide.session
+        matched = profile.suggest(session.source.postgres or session.saved_source_profile(session.active_id) or {})
+        if matched:
+            names.remove(matched)
+            names.insert(0, matched)
+        target_input.suggester = SuggestFromList(names)
+        outputs = ", ".join(names[:8]) + (" … type to complete" if len(names) > 8 else "")
+        default = profile.default or "templated or invalid"
+        status.update(f"Profile {profile.name} · Default: {default} · Outputs: {outputs}"
+                      + (f" · Suggested: {matched}" if matched else ""))
 
     @on(Button.Pressed, "#dbt-open")
     @on(Input.Submitted, "#dbt-project-dir")
+    @on(Input.Submitted, "#dbt-profiles-path")
+    @on(Input.Submitted, "#dbt-target-override")
     def _open_project(self) -> None:
         try:
-            if not self.ide.session.dbt_enabled or self.ide.session.source_key() != self.source:
-                raise DbtError("The source changed. Reopen project setup.")
-            project = DbtFiles(self.query_one("#dbt-project-dir", Input).value.strip())
-            if not self.ide.set_dbt_project_dir(str(project.root)):
+            project = self._project()
+            settings = self._selection()
+            target = settings.resolve(project.root, project.config)
+            if settings.profiles_path and target:
+                settings = DbtTargetSettings(str(target.profiles_dir), settings.override)
+            if not self.ide.set_dbt_project_dir(str(project.root), target_settings=settings):
                 raise DbtError("Project home could not be saved. Check workspace storage permissions.")
         except (DbtError, OSError) as exc:
             self._message(str(exc))

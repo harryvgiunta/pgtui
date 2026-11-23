@@ -272,8 +272,12 @@ class SettingsScreen(ModalScreen[None]):
                 for label, source_id in self.session.source_options()
             ]
         if self.menu == "workspace":
-            existing = ([Row("Open & Save Project Home", self.session.dbt_project_dir or "not configured", "dbt")]
-                        if self.session.dbt_enabled else [])
+            options = self.session.dbt_target_settings(self.session.dbt_project_dir)
+            existing = [
+                Row("Open & Save Project Home", self.session.dbt_project_dir or "not configured", "dbt"),
+                Row("Path to dbt Profiles", options.profiles_path or "dbt profile discovery", "dbt", "dbt-profiles-path"),
+                Row("Workspace Default Target Override", options.override or "use profile default", "dbt", "dbt-target-override"),
+            ] if self.session.dbt_enabled else []
             return [*existing, Row("New dbt Project with AI", "interview, preview and link a new project", "dbt-setup")]
         if self.menu == "ai":
             config = self.session.ai_config
@@ -408,7 +412,7 @@ class SettingsScreen(ModalScreen[None]):
                 if path:
                     self.ide.show_dbt_explorer()
 
-            self.app.push_screen(DBTScreen(self.ide), project_opened)
+            self.app.push_screen(DBTScreen(self.ide, focus_field=row.value or "dbt-project-dir"), project_opened)
             return
         elif row.action == "ai":
             self.app.push_screen(

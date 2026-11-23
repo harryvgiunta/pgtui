@@ -107,6 +107,40 @@ def test_query_conversion_resolves_active_database_and_preserves_cte_scope(tmp_p
         dbt.query_views("select * from {{ ref('remote') }}", database="warehouse", schema="raw")
 
 
+def test_target_artifacts_cannot_cross_workspaces_on_the_same_database(tmp_path):
+    from d8r.dbt_profiles import DbtTargetSettings
+
+    root = project(tmp_path, extra={"profile": "demo"})
+    profiles = put(tmp_path, "private/profiles.yml", """demo:
+  target: dev
+  outputs:
+    dev: {type: postgres, dbname: warehouse, schema: dev}
+    stage: {type: postgres, dbname: warehouse, schema: stage}
+""")
+    config = {"profile": "demo"}
+
+    def artifacts(directory, invocation_target):
+        header = {"invocation_id": invocation_target, "project_name": "demo", "adapter_type": "postgres"}
+        artifact = node(relation=f'"warehouse"."{invocation_target}"."upstream"')
+        put(root, f"target/{directory}/manifest.json", json.dumps({"metadata": header, "nodes": {"model.demo.upstream": artifact}}))
+        put(root, f"target/{directory}/run_results.json", json.dumps({"metadata": {"invocation_id": invocation_target},
+            "args": {"profile": "demo", "target": invocation_target, "profiles_dir": str(profiles.parent.resolve())}}))
+
+    artifacts("dev", "dev")
+    artifacts("stage", "stage")
+    raw = "select * from {{ ref('upstream') }}"
+    default = DbtTargetSettings(str(profiles)).resolve(root, config)
+    stage = DbtTargetSettings(str(profiles), "stage").resolve(root, config)
+    assert DbtProject(root, target=default).render_query(raw, database="warehouse") == (
+        'select * from "warehouse"."dev"."upstream"')
+    assert DbtProject(root, target=stage).render_query(raw, database="warehouse") == (
+        'select * from "warehouse"."stage"."upstream"')
+
+    artifacts("stage", "dev")  # The database guard alone cannot detect this swap.
+    with pytest.raises(DbtError, match=r"not compiled for profile .* --target stage"):
+        DbtProject(root, target=stage).render_query(raw, database="warehouse")
+
+
 def test_query_conversion_leaves_sql_json_and_literal_config_intact(tmp_path):
     root = project(tmp_path)
     source(root)

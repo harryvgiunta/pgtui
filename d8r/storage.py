@@ -767,11 +767,13 @@ def _workspace_document(value: object) -> dict:
             fields.add("dbt_views")
             raw_views = page["dbt_views"]
             names = {"project_dir", "sql", "jinja"}
-            has_mode = isinstance(raw_views, dict) and "render_only" in raw_views
-            views = _record(raw_views, names | ({"render_only"} if has_mode else set()), "query page dbt views")
+            optional = {"render_only", "artifact_key"} & raw_views.keys() if isinstance(raw_views, dict) else set()
+            views = _record(raw_views, names | optional, "query page dbt views")
             for name in names:
                 _text(views[name], f"query page dbt {name}", nonempty=name == "project_dir")
-            if has_mode and type(views["render_only"]) is not bool:
+            if "artifact_key" in views:
+                _text(views["artifact_key"], "query page dbt artifact key")
+            if "render_only" in views and type(views["render_only"]) is not bool:
                 raise ValueError("invalid query page dbt preview mode")
         if isinstance(page, dict) and "dbt_file" in page:
             fields.add("dbt_file")
@@ -812,9 +814,14 @@ def _workspace_document(value: object) -> dict:
             workspace.setdefault("dbt_project_dir", "")
             # Keep existing configured projects enabled on upgrade; new workspaces opt in.
             workspace.setdefault("dbt_enabled", bool(workspace["dbt_project_dir"]))
-        _record(workspace, {"document_id", "function_draft", "active_view", "dbt_project_dir", "dbt_enabled"},
+            workspace.setdefault("dbt_profiles_path", "")
+            workspace.setdefault("dbt_target_override", "")
+        _record(workspace, {"document_id", "function_draft", "active_view", "dbt_project_dir", "dbt_enabled",
+                            "dbt_profiles_path", "dbt_target_override"},
                 "source workspace")
         _text(workspace["dbt_project_dir"], "dbt project directory")
+        _text(workspace["dbt_profiles_path"], "dbt profiles path")
+        _text(workspace["dbt_target_override"], "dbt target override")
         if type(workspace["dbt_enabled"]) is not bool:
             raise ValueError("invalid workspace dbt setting")
         _text(workspace["document_id"], "source workspace document_id")

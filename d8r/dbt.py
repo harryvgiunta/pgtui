@@ -1,18 +1,20 @@
 """Offline dbt SQL conversion; never invokes a dbt runtime.
 
 Relation names come from manifest artifacts or literal source YAML, never
-profiles or schema guesses. Explicit query previews may also render Jinja.
+schema guesses. Explicit query previews may also render Jinja.
 """
 from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
+from hashlib import sha256
 import json
 import ntpath
 import os
 from pathlib import Path, PurePosixPath
 import re
-from typing import Any
+import stat
+from typing import TYPE_CHECKING, Any, Callable
 
 import yaml
 from jinja2 import TemplateError, TemplateSyntaxError
@@ -23,10 +25,15 @@ from d8r.sql import (
     quote_identifier, split_statements,
 )
 
+if TYPE_CHECKING:
+    from d8r.dbt_profiles import DbtTarget
+
 
 _JINJA_OPEN = re.compile(r"\{[{%#]")
 _NO_DEFAULT = object()
 _JINJA_PART = re.compile(r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[{}'"]''', re.DOTALL)
+_MAX_ARTIFACT = 32 * 1024 * 1024
+_ARTIFACT_SCHEMA = re.compile(r"https://schemas\.getdbt\.com/dbt/manifest/v(?:[4-9]|1\d)\.json\Z")
 
 
 class DbtError(ValueError):
@@ -118,8 +125,74 @@ def _relative(value: str) -> Path:
     if any(ntpath.isreserved(part) for part in path.parts):
         raise DbtError("Project paths cannot contain reserved names or control characters.")
     if any(part.lower() in {"profiles.yml", "profiles.yaml"} for part in path.parts):
-        raise DbtError("Credential profiles are outside dbt exchange and are never accessed.")
+        raise DbtError("Credential profiles are not accessible as dbt project files.")
     return Path(*path.parts)
+
+
+def _artifact_directory(config: dict, target: DbtTarget | None) -> Path:
+    directory = _relative(config.get("target-path", "target"))
+    if target:
+        directory /= _relative(target.name)
+    protected = [Path("dbt_packages"), Path("dbt_modules"), Path("logs")]
+    protected.extend(_relative(config[key]) for key in ("packages-install-path", "log-path") if key in config)
+    if any(part.startswith(".") for part in directory.parts) or any(
+            directory.is_relative_to(path) for path in protected):
+        raise DbtError("target-path cannot point into a hidden, package or log directory.")
+    return directory
+
+
+def _read_artifact(path: Path) -> dict:
+    if not stat.S_ISREG(path.stat().st_mode):
+        raise DbtError(f"{path.name} is not a regular file.")
+    with path.open("rb") as handle:
+        content = handle.read(_MAX_ARTIFACT + 1)
+    if len(content) > _MAX_ARTIFACT:
+        raise DbtError(f"{path.name} exceeds the offline artifact size limit.")
+    try:
+        value = json.loads(content.decode("utf-8-sig"))
+    except (ValueError, RecursionError):
+        raise DbtError(f"Invalid {path.name}; regenerate it with dbt.") from None
+    if not isinstance(value, dict):
+        raise DbtError(f"{path.name} must contain an object.")
+    return value
+
+
+def _load_manifest(directory: Path, resolve: Callable[[str], Path], project: str,
+                   target: DbtTarget | None) -> dict:
+    try:
+        manifest = _read_artifact(resolve((directory / "manifest.json").as_posix()))
+    except FileNotFoundError:
+        if target:
+            raise DbtError(f"No manifest.json in {directory.as_posix()} for target {target.name!r}.") from None
+        return {}
+    header = manifest.get("metadata", {})
+    if not isinstance(header, dict):
+        raise DbtError("manifest.json metadata must contain an object.")
+    version = header.get("dbt_schema_version")
+    if version is not None and (not isinstance(version, str) or not _ARTIFACT_SCHEMA.fullmatch(version)):
+        raise DbtError("manifest.json has an unrecognized dbt schema version.")
+    name = header.get("project_name")
+    if (target or name is not None) and name != project:
+        raise DbtError("manifest.json belongs to a different dbt project or has no project identity.")
+    if not target:
+        return manifest
+    if target.adapter and header.get("adapter_type") != target.adapter:
+        raise DbtError(f"manifest.json does not match the adapter for target {target.name!r}.")
+    try:
+        results = _read_artifact(resolve((directory / "run_results.json").as_posix()))
+    except FileNotFoundError:
+        raise DbtError(f"No run_results.json to verify target {target.name!r}.") from None
+    invocation = header.get("invocation_id")
+    result_header, args = results.get("metadata"), results.get("args")
+    if not (isinstance(invocation, str) and invocation and isinstance(result_header, dict)
+            and result_header.get("invocation_id") == invocation and isinstance(args, dict)):
+        raise DbtError(f"Artifacts for target {target.name!r} do not share a dbt invocation.")
+    profiles_dir = args.get("profiles_dir")
+    if not (args.get("target") == target.name and args.get("profile") == target.profile
+            and isinstance(profiles_dir, str) and Path(profiles_dir) == target.profiles_dir):
+        raise DbtError(f"Artifacts in {directory.as_posix()} were not compiled for profile {target.profile!r}, "
+                       f"target {target.name!r}, with the selected profiles directory.")
+    return manifest
 
 
 @dataclass(frozen=True)
@@ -254,7 +327,7 @@ def _expression_end(text: str, start: int) -> int:
 class DbtProject:
     """A user-opened local project snapshot. Construction performs file reads only."""
 
-    def __init__(self, directory: str | Path, *, dialect: str = "postgres") -> None:
+    def __init__(self, directory: str | Path, *, dialect: str = "postgres", target: DbtTarget | None = None) -> None:
         if dialect not in {"postgres", "sqlite", "duckdb"}:
             raise DbtError("dbt exchange supports PostgreSQL, SQLite and DuckDB SQL only.")
         self.root = _safe_root(directory)
@@ -270,8 +343,9 @@ class DbtProject:
         if not isinstance(paths, list) or not paths:
             raise DbtError("model-paths must be a nonempty list of relative directories.")
         self.model_paths = tuple(self._path(path) for path in paths)
-        target = self.project.get("target-path", "target")
-        self.target = self._path(target)
+        self.dbt_target = target
+        artifact_dir = _artifact_directory(self.project, target)
+        self.target = self._path(artifact_dir.as_posix())
         self.models: tuple[str, ...] = ()
         self.yaml_files: dict[Path, dict] = {}
         models = []
@@ -291,18 +365,29 @@ class DbtProject:
                     elif path.suffix.lower() in {".yml", ".yaml"}:
                         self.yaml_files[path] = _yaml(self._read(path.relative_to(self.root).as_posix()), path)
         self.models = tuple(sorted(set(models)))
-        manifest_path = self._path((self.target / "manifest.json").relative_to(self.root).as_posix())
-        self.manifest: dict = {}
-        if manifest_path.exists():
-            try:
-                self.manifest = json.loads(self._read(manifest_path.relative_to(self.root).as_posix()))
-            except json.JSONDecodeError as exc:
-                raise DbtError("Invalid manifest.json; regenerate the artifact outside PGTUI.") from exc
-            if not isinstance(self.manifest, dict):
-                raise DbtError("manifest.json must contain an object.")
+        self.artifact_issue = ""
+        try:
+            self.manifest = _load_manifest(artifact_dir, self._path, self.name, target)
+        except (DbtError, OSError) as exc:
+            if not target:
+                raise
+            self.artifact_issue = str(exc)
+            self.manifest = {}
+        self.artifact_key = ""
+        if target:
+            invocation = self.manifest.get("metadata", {}).get("invocation_id", "")
+            key = (str(target.profiles_dir), target.profile, target.name, target.adapter, target.database,
+                   artifact_dir.as_posix(), invocation)
+            self.artifact_key = sha256(json.dumps(key).encode("utf-8")).hexdigest()
         self.relations: list[_Relation] = []
         self.nodes: list[dict] = []
         self._index()
+
+    def _artifact_help(self) -> str:
+        if self.dbt_target:
+            hint = self.dbt_target.compile_hint(self.target.relative_to(self.root))
+            return f"{self.artifact_issue.rstrip('. ')}. {hint}" if self.artifact_issue else hint
+        return "Compile the dbt file for this target and reload its artifacts."
 
     def _path(self, value: str) -> Path:
         path = self.root / _relative(value)
@@ -462,7 +547,7 @@ class DbtProject:
             compiled = self._compiled(path, jinja, node, database=database)
             if compiled is not None:
                 return compiled
-        raise DbtError(f"{reason.rstrip('. ')}. Compile the dbt file for this target and reload its artifacts.")
+        raise DbtError(f"{reason.rstrip('. ')}. {self._artifact_help()}")
 
     def query_views(self, document: str, *, database: str, schema: str = "") -> tuple[str, str]:
         """Render to SQL first, then normalize every convertible relation for dbt."""
@@ -538,7 +623,8 @@ class DbtProject:
             expressions = {item.expression() for item in matches}
             if len(expressions) != 1:
                 reason = "Ambiguous" if expressions else "No authoritative"
-                raise DbtError(f"{reason} dbt mapping for {raw!r}. Use the exact manifest relation_name or a literal YAML source; refresh artifacts outside PGTUI.")
+                hint = self._artifact_help() if self.dbt_target else "Refresh artifacts outside PGTUI."
+                raise DbtError(f"{reason} dbt mapping for {raw!r}. Use the exact manifest relation_name or a literal YAML source. {hint}")
             # Preserve comments embedded between qualified identifier components.
             comments = [token.text for token in lex_sql(raw, dialect=self.dialect) if token.kind == "comment"]
             suffix = "".join(" " + comment + ("\n" if comment.startswith("--") else " ") for comment in comments)
@@ -633,6 +719,9 @@ class DbtProject:
             compiled = node.get("compiled_code", node.get("compiled_sql"))
             if isinstance(recorded, str) and isinstance(compiled, str) and compiled.strip():
                 return compiled
+        if self.dbt_target:
+            # A standalone compiled file carries no invocation or target provenance.
+            return None
         artifact = self.target / "compiled" / self.name / _relative(path)
         artifact = self._path(artifact.relative_to(self.root).as_posix())
         if artifact.is_file():
@@ -682,6 +771,8 @@ class DbtProject:
         except DbtError as exc:
             sql = self._compiled(path, raw, node)
             if sql is None:
+                if self.dbt_target:
+                    raise DbtError(f"{exc} {self._artifact_help()}") from exc
                 raise DbtError(f"{exc} No compiled artifact found in manifest.json or target/compiled/<project>/{path}.") from exc
             if any(marker in sql for marker in ("{{", "{%", "{#")):
                 raise DbtError("The compiled artifact still contains Jinja; regenerate it outside PGTUI.")

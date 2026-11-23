@@ -200,14 +200,17 @@ this profile's in-memory models do not persist across invocations.
 {setup.strip()}
 
 From the project directory, replace `<profiles-directory>` with the private
-profiles directory. Review the models and choose a development target where
-creating or replacing the named model relations is safe. `debug` checks the
-connection; `parse` checks project structure; `build` creates models and runs tests.
+profiles directory. Set **Path to dbt Profiles** in **Workspace Settings** to
+that directory if it is not discovered automatically. Leave **Workspace Default
+Target Override** blank to use the profile default. Review the models and choose
+a development target where creating or replacing the named model relations is
+safe. `debug` checks the connection; `parse` checks project structure; `build`
+creates models and runs tests.
 
 ```sh
-dbt debug --profiles-dir "<profiles-directory>" --target dev
-dbt parse --profiles-dir "<profiles-directory>" --target dev
-dbt build --profiles-dir "<profiles-directory>" --target dev
+dbt debug --profiles-dir "<profiles-directory>" --profile {project} --target dev
+dbt parse --profiles-dir "<profiles-directory>" --profile {project} --target dev
+dbt build --profiles-dir "<profiles-directory>" --profile {project} --target dev --target-path target/dev --write-json
 ```
 
 Project setup writes local files and links a PGTUI source. It does not run dbt

@@ -4,9 +4,7 @@ from __future__ import annotations
 import ast
 import csv
 import io
-import json
 import re
-import stat
 from bisect import bisect_left, bisect_right
 from collections import defaultdict, deque
 from collections.abc import Iterable, Iterator, Mapping
@@ -17,9 +15,10 @@ from types import MappingProxyType
 
 import yaml
 
-from d8r.dbt import DbtError, _literal, _UniqueLoader
+from d8r.dbt import DbtError, _artifact_directory, _literal, _load_manifest, _UniqueLoader
 from d8r.dbt_files import DbtFiles
 from d8r.dbt_ignore import DbtIgnore
+from d8r.dbt_profiles import DbtTargetSettings
 from d8r.sql import ColumnDef, quote_identifier, relation_parts
 
 _MAX_TEXT = 2 * 1024 * 1024
@@ -339,12 +338,10 @@ _PATH_DEFAULTS = {
     "analysis": ("analysis-paths", "analyses"), "macro": ("macro-paths", "macros"),
 }
 _MAX_PROJECT_TEXT = 32 * 1024 * 1024
-_MAX_ARTIFACT = 32 * 1024 * 1024
 _MAX_RESOURCES = 10_000
 _MAX_EDGES = 40_000
 _MAX_WARNINGS = 100
 _MAX_YAML_NODES = 40_000
-_ARTIFACT_SCHEMA = re.compile(r"https://schemas\.getdbt\.com/dbt/manifest/v(?:[4-9]|1\d)\.json\Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -458,10 +455,10 @@ class DbtIndex:
     """
 
     def __init__(self, project: DbtFiles, drafts: Mapping[str, str], *, dialect: str = 'postgres',
-                 include_artifact: bool = True) -> None:
+                 include_artifact: bool = True, target_settings: DbtTargetSettings | None = None) -> None:
         builder = _IndexBuilder(project, drafts, dialect)
         builder.discover()
-        artifact_edges = builder.artifact() if include_artifact else {}
+        artifact_edges = builder.artifact(target_settings) if include_artifact else {}
         self.project = project
         self.dialect = dialect
         self.package = builder.package
@@ -1020,47 +1017,21 @@ class _IndexBuilder:
         else:
             self.warn("dbt macro limit exceeded; some macros were omitted.")
 
-    def artifact(self) -> dict[str, tuple[str, ...]]:
+    def artifact(self, settings: DbtTargetSettings | None) -> dict[str, tuple[str, ...]]:
         if not self.package:
             return {}
-        target = self.config.get("target-path", "target")
+        target = directory = None
         try:
-            directory = self.directory(target)
-            protected = [Path(".git"), Path("dbt_packages"), Path("dbt_modules"), Path("logs")]
-            for setting in ("packages-install-path", "log-path"):
-                if setting in self.config:
-                    try:
-                        protected.append(self.directory(self.config[setting]))
-                    except (DbtError, OSError):
-                        pass  # Already reported during configured path discovery.
-            if any(part.startswith(".") for part in directory.parts) or any(
-                    directory.is_relative_to(path) for path in protected):
-                raise DbtError("target-path cannot point into a hidden, package or log directory.")
-            # Artifact files are intentionally not editable. Reuse the same confined
-            # path walk, and access exactly this fixed filename, never a manifest path.
-            path = self.project._path((directory / "manifest.json").as_posix())
-            if not stat.S_ISREG(path.stat().st_mode):
-                raise DbtError("manifest.json is not a regular file.")
-            with path.open("rb") as handle:
-                content = handle.read(_MAX_ARTIFACT + 1)
-            if len(content) > _MAX_ARTIFACT:
-                raise DbtError("manifest.json exceeds the offline artifact size limit.")
-            value = json.loads(content.decode("utf-8-sig"))
-            if not isinstance(value, dict):
-                raise DbtError("manifest.json must contain an object.")
-            metadata = value.get("metadata", {})
-            if not isinstance(metadata, dict):
-                raise DbtError("manifest.json metadata must contain an object.")
-            version = metadata.get("dbt_schema_version")
-            if version is not None and (not isinstance(version, str) or not _ARTIFACT_SCHEMA.fullmatch(version)):
-                raise DbtError("manifest.json has an unrecognized dbt schema version.")
-            manifest_project = metadata.get("project_name")
-            if manifest_project is not None and manifest_project != self.package:
-                raise DbtError("manifest.json belongs to a different dbt project.")
-        except FileNotFoundError:
-            return {}
+            if settings is not None:
+                target = settings.resolve(self.project.root, self.config, for_artifacts=True)
+            directory = _artifact_directory(self.config, target)
+            value = _load_manifest(directory, self.project._path, self.package, target)
+            if not value:
+                return {}
+            manifest_project = value.get("metadata", {}).get("project_name")
         except (DbtError, OSError, ValueError, RecursionError) as exc:
-            self.warn(f"Artifact ignored: {str(exc)[:350]}")
+            hint = f" {target.compile_hint(directory)}" if target and directory is not None else ""
+            self.warn(f"Artifact ignored: {str(exc)[:350]}{hint}")
             return {}
 
         live: dict[tuple[str, str, str, str, str], list[str]] = defaultdict(list)

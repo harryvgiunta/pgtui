@@ -283,6 +283,26 @@ Both settings are per data source. Turning dbt off hides its tools and stops
 project-file autosave. Saved file drafts remain readable in **Pages**; ordinary
 SQL pages keep their native IntelliSense and execution tools.
 
+**Path to dbt Profiles** accepts a private `profiles.yml` file or its directory.
+Leave it blank to use `DBT_PROFILES_DIR`, the project directory, or `~/.dbt`,
+in that order. **Workspace Default Target Override** is optional: a blank
+override uses the `target:` under the profile named in `dbt_project.yml`.
+**List Targets** shows the profile default and available outputs. Saving checks
+that the effective target exists without connecting or running dbt. If the
+default is templated, select a literal output as the override.
+
+Compile each target into its own directory from the project home. For example:
+
+```sh
+dbt compile --profiles-dir "<profiles-directory>" --profile analytics --target stage --target-path target/stage --write-json
+```
+
+Replace `analytics` with the project’s profile name and `stage` with the
+workspace’s effective target. Use `<target-path>/<target>` if the project
+configures an artifact root other than `target`. Keep the manifest and run
+results from the same dbt invocation. PGTUI does not fall back to shared
+artifacts or switch the active database connection.
+
 - Edits to project files, including SQL models, data tests, and YAML, autosave to
   disk after a short pause or when you switch pages. **Pages** remembers opened files
   and any unsaved drafts. Removing a page never deletes its project file.

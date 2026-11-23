@@ -19,6 +19,7 @@ from d8r.dbt import DbtError
 from d8r.dbt_analysis import DbtAnalysis, Diagnostic, analyze_file
 from d8r.dbt_files import DbtFiles, file_revision
 from d8r.dbt_index import DbtIndex
+from d8r.dbt_profiles import DbtTargetSettings
 from d8r.dbt_references import DbtReference, find_references
 from .dbt_model_completion import complete_dbt
 
@@ -39,6 +40,7 @@ class _Site:
     workspace: str
     page: str
     home: str
+    target: DbtTargetSettings
     path: str
     text: str
     dialect: str
@@ -122,7 +124,8 @@ class DbtAuthoring:
         trace = (ide.pane_visible('schema')
                  and ide.query_one('#explorer-tabs', TabbedContent).active == 'tab-dbt'
                  and ide.query_one('#dbt-panels', TabbedContent).active == 'dbt-panel-lineage')
-        return _Site(ide._workspace_key, ide._document_identity, ide._dbt_home, path,
+        home = ide._dbt_home
+        return _Site(ide._workspace_key, ide._document_identity, home, ide.session.dbt_target_settings(home), path,
                      editor.text if path else '', editor.dialect, id(ide.session.schema),
                      bool(link), trace, self._epoch)
 
@@ -150,8 +153,8 @@ class DbtAuthoring:
         if self._timer is not None:
             self._timer.stop()
             self._timer = None
-        if site is None or previous is None or (site.workspace, site.home, site.dialect) != (
-                previous.workspace, previous.home, previous.dialect):
+        if site is None or previous is None or (site.workspace, site.home, site.target, site.dialect) != (
+                previous.workspace, previous.home, previous.target, previous.dialect):
             self._index = self._index_key = None
         self.ide.editor.set_dbt_feedback()
         problems = self.ide.query_one(DbtProblems)
@@ -171,7 +174,7 @@ class DbtAuthoring:
             return
         site = self._requested
         drafts = self.ide._dbt_project_drafts(site.home) if site.home else {}
-        key = (site.workspace, site.home, site.dialect, site.epoch, drafts)
+        key = (site.workspace, site.home, site.dialect, site.target, site.epoch, drafts)
         self._running = True
         self.ide.run_worker(self._work(site, key, drafts, self.ide.session.schema),
                             group="dbt-authoring", exit_on_error=False)
@@ -182,7 +185,7 @@ class DbtAuthoring:
             index_error = ""
             if site.home and index is None:
                 try:
-                    index = DbtIndex(DbtFiles(site.home), drafts, dialect=site.dialect)
+                    index = DbtIndex(DbtFiles(site.home), drafts, dialect=site.dialect, target_settings=site.target)
                 except (DbtError, OSError, RecursionError) as exc:
                     index_error = str(exc)
             feedback = _analyze(index, site, schema)
@@ -194,8 +197,8 @@ class DbtAuthoring:
         try:
             index, feedback = await asyncio.to_thread(build)
             current = self._site()
-            if current is not None and (current.workspace, current.home, current.dialect) == (
-                    site.workspace, site.home, site.dialect) and current.epoch == site.epoch:
+            if current is not None and (current.workspace, current.home, current.dialect, current.target) == (
+                    site.workspace, site.home, site.dialect, site.target) and current.epoch == site.epoch:
                 self._index_key, self._index = key, index
             if site != current or site != self._requested:
                 return
