@@ -19,7 +19,7 @@ import yaml
 from d8r.dbt import DbtError, _UniqueLoader
 from d8r.dbt_index import DbtIndex, DbtResource, template_calls
 from d8r.dbt_lint import call_warnings, select_warnings, types_incompatible
-from d8r.sql import ColumnDef, SchemaContext, SqlError, lex_sql, quote_identifier, relation_parts
+from d8r.sql import ColumnDef, SchemaContext, SqlError, TableDef, lex_sql, quote_identifier, relation_parts
 
 
 @dataclass(frozen=True)
@@ -505,7 +505,7 @@ class _Analysis:
         self.resources: dict[str, _Shape] = {}
         self.active: set[str] = set()
         self.physical_resources: dict[tuple[str, ...], list[DbtResource]] | None = None
-        self.physical_shapes: dict[tuple[str, ...], tuple[_Shape, str]] = {}
+        self.physical_shapes: dict[tuple[str, ...], tuple[_Shape, str, TableDef | None]] = {}
         self.upstream_count = self.upstream_chars = 0
 
     def key(self, name: str) -> str:
@@ -515,7 +515,7 @@ class _Analysis:
         parts = relation_parts(name, dialect=self.dialect)
         return tuple(map(self.key, parts)) if parts else None
 
-    def physical(self, sql_name: str, parts: tuple[str, ...], label: str) -> tuple[_Shape, str]:
+    def physical(self, sql_name: str, parts: tuple[str, ...], label: str) -> tuple[_Shape, str, TableDef | None]:
         if parts in self.physical_shapes:
             return self.physical_shapes[parts]
         table = self.schema.table_by_name(sql_name, dialect=self.dialect)
@@ -530,11 +530,11 @@ class _Analysis:
         active_match = len(matches) == 1 and matches[0].key in self.active
         if len(matches) == 1 and not active_match:
             resource = matches[0]
-            result = self.resource(resource), resource.label
+            result = self.resource(resource), resource.label, table
         elif table is not None:
-            result = _shape(table.columns, table.name, complete=bool(table.columns)), table.name
+            result = _shape(table.columns, table.name, complete=bool(table.columns)), table.name, table
         else:
-            result = _Shape(), label
+            result = _Shape(), label, None
         if not active_match:
             self.physical_shapes[parts] = result
         return result
@@ -826,6 +826,7 @@ class _Projection:
             _, source = entry
             shape = _Shape()
             parts: tuple[str, ...] = ()
+            table = None
             label = "Derived query"
             qualifier = ""
             if (isinstance(relation, exp.Table) and (identifiers := relation.parts)
@@ -856,11 +857,17 @@ class _Projection:
                                 parts = physical
                                 qualifier = resource.relation
                 else:
-                    shape, label = self.analysis.physical(qualifier, parts, label)
+                    shape, label, table = self.analysis.physical(qualifier, parts, label)
                 if isinstance(alias, exp.TableAlias) and alias.columns:
                     shape = (_renamed(shape, [self.name(p) for p in alias.columns])
                              if all(isinstance(p, exp.Identifier) for p in alias.columns) else _Shape())
-                self.hover(table_span, _fields_text(label, tuple(f.column for f in shape.fields)))
+                if self.hovers is not None:
+                    detail = _fields_text(label, tuple(f.column for f in shape.fields))
+                    if table is not None and table.indexes:
+                        detail += "\nIndexes: " + "\n".join(f"{idx.name} · {idx.detail}"[:240] for idx in table.indexes[:6])
+                        if len(table.indexes) > 6:
+                            detail += f"\n… (+{len(table.indexes) - 6})"
+                    self.hover(table_span, detail)
             elif isinstance(source, Scope) and isinstance(relation, exp.Subquery):
                 shape = self.outputs.get(id(source.expression), _Shape())
             if isinstance(alias_id, exp.Identifier):

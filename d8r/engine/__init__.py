@@ -13,10 +13,12 @@ from .datasources import (
 )
 from .execute import column_values, execute_sql, explain_sql, export_query_csv, prepare_sql, sample_rows
 from .parquet import add_parquet_source
+from .pg_definition import postgres_definition
 from .d1api import add_d1_source
 
 __all__ = [
     "POSTGRES_VERSION", "DataSource", "EngineError", "add_postgres_source",
     "add_parquet_source", "add_d1_source", "cancel_source", "close_source", "column_values",
-    "execute_sql", "explain_sql", "export_query_csv", "load", "preflight_source", "prepare_sql", "refresh_source_schema", "sample_rows", "transaction_open",
+    "execute_sql", "explain_sql", "export_query_csv", "load", "postgres_definition", "preflight_source",
+    "prepare_sql", "refresh_source_schema", "sample_rows", "transaction_open",
 ]

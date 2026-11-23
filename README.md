@@ -112,6 +112,18 @@ before retrying: PGTUI does not replay it.
 statements in the batch. It does not undo earlier commits or guarantee rollback
 on D1. The connection stays busy until the driver finishes.
 
+**Explain** (or `\explain`) opens a **Plan** tab in the results pane for one
+read-only PostgreSQL query. Select SQL to explain just that selection, or use
+the whole draft. The tree shows plan nodes, estimated rows, startup/total costs
+in planner units, and conditions such as filters and join or index predicates.
+With the tree focused, use **↑/↓**, **Page Up/Down** or **Home/End** to move through
+it, **←/→** for long conditions, and **Space** to fold a branch.
+
+Explain requires a live PostgreSQL connection outside a user transaction. It
+uses `EXPLAIN (FORMAT JSON, ANALYZE FALSE)`: the query does not run, but planning
+can evaluate immutable functions. Plans over 64,000 characters are withheld
+in full. The viewer leaves row results and Run history unchanged.
+
 The pager below each unpinned read result shows **Previous · Page N · Next**.
 Click a button or press **Ctrl+Left / Ctrl+Right** with the grid focused. Each
 page request re-reads only that statement, read-only, at the
@@ -376,6 +388,24 @@ Server** or exiting PGTUI stops the server. Only the documentation artifacts and
 configured docs assets are served, not profiles, logs, or the project directory.
 
 
+## PostgreSQL schema catalog
+
+Expand a relation in **Explorer → Schema** to see its columns and indexes.
+Indexes show key columns in order, included columns, and whether they are
+unique, partial, invalid, or deferrable. Partitioned tables nest their visible
+children under **Partitions**, including tables that are themselves partitioned.
+The catalog also lists sequences, installed extensions, collations, standalone
+composite and domain types, and native routines grouped by schema.
+
+On a live connection, select an index or a function/procedure overload and press
+**Enter** to open its PostgreSQL definition. **View query** shows the defining
+query of a view or materialized view; **Definition** on a table shows column and
+constraint definitions, partition keys, and partition bounds where applicable.
+Other catalog objects show their settings or type definitions. Aggregate routines
+show signatures only. The viewer is read-only and copyable, not a schema dump.
+Opening it does not run the displayed SQL, read table rows, or advance sequences.
+
+
 ## IntelliSense
 
 Local SQL analysis and ranking are source-scoped and offline, using cached metadata.
@@ -388,16 +418,18 @@ whole list. Unknown derived names/types stay unknown rather than being invented.
 
 The last successful catalog snapshot is saved per connection identity in
 `schema_cache.json`. After disconnect or restart, table-first completion, columns,
-foreign keys, PostgreSQL enum labels and native routine signatures use that snapshot
-without contacting the database. The source header, completion details and permitted
+foreign keys, PostgreSQL enum labels, indexes, partition relationships, other catalog
+objects, and native routine signatures use that snapshot without contacting the
+database. The source header, completion details and permitted
 AI schema context mark it **cached, with its capture time; it may be stale**.
 Reconnect replaces the snapshot with freshly discovered metadata, including an
 empty catalog if permissions or objects changed. No SQL is executed to restore it.
-Use **Schema → Refresh schema** to reload tables, columns and routines after an
-external change. This updates the explorer and completion without running the draft.
+Use **Schema → Refresh schema** to reload catalog metadata after an external
+change. This updates the explorer and completion without running the draft.
 
 Only committed catalog metadata is saved. Temporary PostgreSQL objects and routines,
-transactions, result rows, distinct-value pools and credentials are excluded. For
+transactions, result rows, distinct-value pools and credentials are excluded.
+Definition text is fetched on demand; it is not cached or sent to AI. For
 local Parquet, only the selected file's `data` schema survives restart, not in-memory
 tables/macros. Cache-save errors preserve live metadata and never relabel a successful
 connection or SQL statement as failed. A first successful connection is required:
@@ -429,6 +461,12 @@ older builds did not write a durable snapshot that could be recovered retroactiv
   Missing, transformed and ambiguous keys are not guessed. Parquet sources do not
   expose foreign keys. `USING` offers common columns. Projection stars expand
   without confusing `COUNT(*)` or multiplication.
+- PostgreSQL index names are suggested in index commands. `INSERT … ON CONFLICT`
+  offers column lists from matching valid, non-partial, immediate unique indexes
+  with plain column keys, excluding included columns. These are suggestions, not
+  a server validation result. PostgreSQL catalogs also supply composite and domain
+  casts, collations, and names in relevant object commands. dbt table hovers and
+  permitted AI schema context include structural index details, not definitions.
 - GROUP BY offers the full nonaggregate projection, expanding known `*`/`alias.*`
   fields and retaining complex expressions and unaggregated dependencies of mixed
   aggregate/window expressions. Already-grouped expressions, aliases and ordinals
@@ -715,7 +753,7 @@ Plan scans, joins, row estimates and costs are not measured execution results or
 proof that a query will run successfully. ANALYZE stays disabled, but PostgreSQL
 planning can evaluate immutable functions. Plans can expose schema details and
 SQL literals even when Allow Sample Data is off; no result rows are sampled.
-Plan inspection never changes drafts, results, history or query-execution receipts.
+AI plan inspection never changes drafts, results, history or query-execution receipts.
 
 Streaming, questions, steering, cancellation, source/definition guards and saved
 chat history remain available. No app HTTP server or browser is involved.

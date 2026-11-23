@@ -20,11 +20,70 @@ from textual.content import Text
 from textual.coordinate import Coordinate
 from textual.geometry import Size
 from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, Input, Select, Static
+from textual.widgets import Button, DataTable, Input, Select, Static, Tree
 
 from .session import ResultPage, RunOutcome, Session
 
 MIN_COLUMN_WIDTH = 4
+
+
+_PLAN_QUALS = ("Filter", "Index Cond", "Recheck Cond", "Hash Cond", "Merge Cond", "Join Filter",
+               "One-Time Filter", "TID Cond", "TID Range Cond", "Run Condition")
+_PLAN_WHITESPACE = str.maketrans({"\n": r"\n", "\r": r"\r", "\t": r"\t"})
+
+
+def _plan_label(node: dict) -> Text:
+    label = Text(node["Node Type"], style="bold")
+    if join := node.get("Join Type"):
+        label.append(f" · {join} join")
+    if index := node.get("Index Name"):
+        label.append(f" using {index}")
+    relation = node.get("Relation Name") or node.get("CTE Name") or node.get("Function Name")
+    if relation:
+        label.append(f" on {relation}")
+        if (alias := node.get("Alias")) and alias != relation:
+            label.append(f" as {alias}")
+    if subplan := node.get("Subplan Name"):
+        label.append(f" · {subplan}")
+    label.plain = label.plain.translate(_PLAN_WHITESPACE)
+    label.append(f'  rows={node["Plan Rows"]:,}  cost={node["Startup Cost"]:,.2f}..{node["Total Cost"]:,.2f}', "dim")
+    return label
+
+
+class PlanTree(Tree[None]):
+    """An in-memory view of the engine's bounded EXPLAIN (FORMAT JSON) result."""
+
+    DEFAULT_CSS = "PlanTree { height: 1fr; }"
+    BINDINGS = [
+        Binding("pageup", "page_up", "Plan page up", show=False),
+        Binding("pagedown", "page_down", "Plan page down", show=False),
+        Binding("home", "scroll_home", "First plan line", show=False),
+        Binding("end", "scroll_end", "Last plan line", show=False),
+        Binding("left", "scroll_left", "Scroll plan left", show=False),
+        Binding("right", "scroll_right", "Scroll plan right", show=False),
+    ]
+
+    def show_plan(self, result: dict) -> None:
+        root = self.root
+        root.remove_children()
+        if result["truncated"]:
+            root.set_label(Text(f'The plan exceeded {result["plan_limit"]:,} characters and was withheld in full.'))
+            root.allow_expand = False
+        else:
+            root.set_label(Text("Estimated plan · ANALYZE off · costs in planner units", style="bold"))
+            root.allow_expand = True
+            root.expand()
+            pending = [(root, item["Plan"]) for item in reversed(result["plan"])]
+            while pending:
+                parent, plan = pending.pop()
+                children = plan.get("Plans", ())
+                quals = [(name, plan[name]) for name in _PLAN_QUALS if name in plan]
+                node = parent.add(_plan_label(plan), expand=True, allow_expand=bool(children or quals))
+                for name, expression in quals:
+                    node.add_leaf(Text.assemble((f"{name}: ", "dim"), expression.translate(_PLAN_WHITESPACE)))
+                pending.extend((node, child) for child in reversed(children))
+        self.cursor_line = 0
+        self.scroll_home(animate=False, immediate=True)
 
 
 @dataclass(frozen=True)

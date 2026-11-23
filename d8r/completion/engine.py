@@ -371,7 +371,7 @@ def _tables(document: str, context: Context, schema: SchemaContext, offers: _Off
         if fresh:
             insert = "SELECT  FROM " + insert
             cursor_back = len(insert) - len("SELECT ")
-        offers.add(Suggestion(label, insert, table.doc or "table", "table", table.doc,
+        offers.add(Suggestion(label, insert, table.doc or table.kind, "table", table.doc,
                               cursor_back=cursor_back,
                               start=context.statement_relation_start if fresh else None, table=table.name),
                    name=match_name, relevance=1, category="dataset", usage_name=table.name)
@@ -401,6 +401,54 @@ def _tables(document: str, context: Context, schema: SchemaContext, offers: _Off
             relevance = -1 if prefix and folded != prefix and folded.startswith(prefix) else 3
             offers.add(Suggestion(name + ".", _identifier(name, dialect, context.quote) + ("" if following_dot else "."),
                                   "schema", "schema"), name=name, relevance=relevance)
+
+
+def _catalog_names(document: str, context: Context, schema: SchemaContext, offers: _Offers, kinds: set[str]) -> None:
+    qualifier = _parts(context.qualifier, "postgres") if context.qualifier else ()
+    if _following(document, context.end).startswith("."):
+        return
+
+    def add(name: str, kind: str, detail: str, doc: str = "") -> None:
+        parts = _parts(name, "postgres")
+        if qualifier and qualifier != parts[:-1]:
+            return
+        insert = (_identifier(parts[-1], "postgres", context.quote) if qualifier or len(parts) == 1
+                  else _qualified(name, "postgres"))
+        offers.add(Suggestion(parts[-1] if qualifier else name, insert, detail, kind, doc),
+                   name=parts[-1], relevance=0)
+
+    if "index" in kinds:
+        for table in schema.tables:
+            for index in table.indexes:
+                if _match(context.token, _parts(index.name, "postgres")[-1]) is not None:
+                    add(index.name, "index", f"{table.name} · {index.detail}")
+    else:
+        for obj in schema.objects:
+            if obj.kind in kinds:
+                add(obj.name, obj.kind, " · ".join(filter(None, (obj.kind, obj.detail))), obj.doc)
+
+
+def _conflict_targets(document: str, context: Context, schema: SchemaContext, offers: _Offers) -> None:
+    table = schema.table_by_name(context.conflict_table) if context.conflict_table is not None else None
+    suffix = _following(document, context.end)
+    after_open = context.clause == "conflict_keys"
+    if table is None or suffix.startswith(("(", ",", ".")) or (not after_open and re.match(r"ON\b", suffix, re.I)):
+        return
+    # Do not infer expression or partial indexes without their expression or
+    # predicate. A deferrable unique index with the same keys also makes a
+    # bare inference unsafe, even alongside an immediate one.
+    unique = [index for index in table.indexes if index.unique and index.valid and not index.partial
+              and index.keys and all(key is not None for key in index.keys)]
+    deferred = {frozenset(index.keys) for index in unique if not index.immediate}
+    for index in unique:
+        if frozenset(index.keys) in deferred:
+            continue
+        keys = ", ".join(_identifier(key, "postgres", context.quote if i == 0 else "")
+                         for i, key in enumerate(index.keys) if key is not None)
+        label = f"({keys})"
+        insert = keys + ("" if suffix.startswith(")") else ")") if after_open else label
+        offers.add(Suggestion(label, insert, f"conflict target · {index.name}", "index", index.detail),
+                   name=index.keys[0], relevance=0)
 
 
 def _functions(document: str, context: Context, schema: SchemaContext,
@@ -787,6 +835,14 @@ def complete(document: str, offset: int, schema: SchemaContext, *, dialect: str 
         for parameter in parameters:
             offers.add(Suggestion("@" + parameter, "@" + parameter, "function parameter", "parameter"), relevance=0)
         return Completion(context, offers.result(), signature)
+    if context.clause.startswith("catalog_"):
+        kind = context.clause.removeprefix("catalog_")
+        kinds = {"domain", "composite"} if kind == "type" else {kind}
+        _catalog_names(document, context, schema, offers, kinds)
+        return Completion(context, offers.result())
+    if context.clause in {"conflict_target", "conflict_keys"}:
+        _conflict_targets(document, context, schema, offers)
+        return Completion(context, offers.result())
     if context.clause == "statement" and context.call is None:
         if not context.qualifier and not context.quote:
             _syntax(document, context, offers, dialect)
@@ -802,8 +858,11 @@ def complete(document: str, offset: int, schema: SchemaContext, *, dialect: str 
             _columns(context, offers, dialect, "")
         return Completion(context, offers.result(), signature)
     if context.clause in {"type", "cast", "cast_type"}:
-        for name in types_for(dialect):
-            offers.add(Suggestion(name, name, "native data type", "type"), relevance=0)
+        if not context.qualifier:
+            for name in types_for(dialect):
+                offers.add(Suggestion(name, name, "native data type", "type"), relevance=0)
+        if dialect_name(dialect) == "postgres":
+            _catalog_names(document, context, schema, offers, {"composite", "domain"})
         return Completion(context, offers.result(), signature)
     if (context.call and context.call.name.casefold() == "extract" and context.call.argument == 0
             and dialect_name(dialect) != "sqlite"):

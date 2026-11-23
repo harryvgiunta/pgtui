@@ -63,6 +63,7 @@ class Context:
     group_slot: bool = False
     # First relation token of an otherwise fresh statement (including qualifiers).
     statement_relation_start: int | None = None
+    conflict_table: str | None = None
 
 
 @dataclass(frozen=True)

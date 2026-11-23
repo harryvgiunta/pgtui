@@ -444,7 +444,11 @@ def _execute_statement(source, sql, *, max_rows, readonly, timeout, explain=Fals
             )
             if expired.is_set():
                 raise EngineError("Query deadline exceeded")
-            schema_changed = not readonly and (first in {"CREATE", "ALTER", "DROP", "COMMENT", "GRANT", "REVOKE", "SECURITY", "DO", "CALL", "COMMIT", "END", "ROLLBACK", "ABORT"})
+            schema_changed = not readonly and (
+                first in {"CREATE", "ALTER", "DROP", "COMMENT", "GRANT", "REVOKE", "SECURITY", "DO", "CALL",
+                          "COMMIT", "END", "ROLLBACK", "ABORT"}
+                or (source.kind == "postgres-live" and first == "REINDEX")
+            )
             return {"columns": columns, "dtypes": dtypes, "rows": rows, "total": total,
                     "ms": (perf_counter() - started) * 1000, "sql": sql,
                     "status": status, "schema_changed": schema_changed, "pageable": pageable,

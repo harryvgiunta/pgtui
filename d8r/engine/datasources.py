@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import re
 import threading
 
-from d8r.sql import ColumnDef, ForeignKey, RoutineDef, quote_identifier, relation_name
+from d8r.sql import CatalogObject, ColumnDef, ForeignKey, IndexDef, RoutineDef, quote_identifier, relation_name
 
 POSTGRES_VERSION = "18.7"
 _RUN_PROBE_SECONDS = 2.0
@@ -38,6 +38,7 @@ class DataSource:
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
     _transaction: bool = field(default=False, repr=False, compare=False)
     routines: tuple[RoutineDef, ...] = ()
+    objects: tuple[CatalogObject, ...] = ()
     # Origins belong to this exact live connection and discovery snapshot.
     _pg_origin_catalog: tuple[object, dict[str, dict], dict[tuple[int, int], tuple[str, str]]] | None = field(
         default=None, init=False, repr=False, compare=False,
@@ -182,10 +183,43 @@ def add_postgres_source(source_id, *, host, port=5432, database, user, password,
 
 
 # Catalog queries intentionally never count, sample, or scan user relations.
-_PG_COLUMNS = """
-SELECT c.oid, n.nspname, c.relname, obj_description(c.oid, 'pg_class'),
-       a.attname, format_type(a.atttypid, a.atttypmod),
-       col_description(c.oid, a.attnum), c.relpersistence = 't',
+_PG_RELATION_KINDS = {"r": "table", "p": "partitioned table", "v": "view",
+                      "m": "materialized view", "f": "foreign table"}
+_PG_USER_NAMESPACE = """
+(pg_catalog.left(n.nspname, 3) <> 'pg_' AND n.nspname <> 'information_schema'
+ OR n.oid = pg_catalog.pg_my_temp_schema())
+"""
+_PG_SCHEMA_USAGE = "pg_catalog.has_schema_privilege(n.oid, 'USAGE')"
+# PostgreSQL may evaluate filters before catalog joins. Guard privilege
+# functions that reject OIDs belonging to a different kind of pg_class row.
+_PG_RELATION_ACCESS = f"""
+{_PG_USER_NAMESPACE} AND {_PG_SCHEMA_USAGE}
+AND CASE WHEN c.relkind IN ('r','p','v','m','f') THEN
+        pg_catalog.has_table_privilege(c.oid, 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
+        OR pg_catalog.has_any_column_privilege(c.oid, 'SELECT,INSERT,UPDATE,REFERENCES')
+    ELSE false END
+"""
+_PG_ROUTINE_ACCESS = f"""
+(n.nspname = 'pg_catalog' OR {_PG_USER_NAMESPACE}) AND {_PG_SCHEMA_USAGE}
+AND pg_catalog.has_function_privilege(p.oid, 'EXECUTE')
+"""
+_PG_SEQUENCE_ACCESS = f"""
+{_PG_USER_NAMESPACE} AND {_PG_SCHEMA_USAGE}
+AND CASE WHEN c.relkind = 'S' THEN pg_catalog.has_sequence_privilege(c.oid, 'USAGE,SELECT,UPDATE') ELSE false END
+"""
+_PG_COLLATION_ACCESS = f"""
+(n.nspname = 'pg_catalog' OR {_PG_USER_NAMESPACE}) AND {_PG_SCHEMA_USAGE}
+AND c.collencoding IN (-1, pg_catalog.pg_char_to_encoding(pg_catalog.current_setting('server_encoding')))
+"""
+_PG_TYPE_ACCESS = f"""
+{_PG_USER_NAMESPACE} AND {_PG_SCHEMA_USAGE} AND pg_catalog.has_type_privilege(t.oid, 'USAGE')
+AND (t.typtype = 'd' OR (t.typtype = 'c' AND c.relkind = 'c'))
+"""
+
+_PG_COLUMNS = f"""
+SELECT c.oid, n.nspname, c.relname, pg_catalog.obj_description(c.oid, 'pg_class'),
+       a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod),
+       pg_catalog.col_description(c.oid, a.attnum), c.relpersistence = 't',
        (SELECT pg_catalog.array_agg(e.enumlabel::text ORDER BY e.enumsortorder)
         FROM pg_catalog.pg_enum e
         WHERE e.enumtypid = CASE WHEN column_type.typtype = 'd'
@@ -194,14 +228,9 @@ FROM pg_catalog.pg_class c
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
 LEFT JOIN pg_catalog.pg_type column_type ON column_type.oid = a.atttypid
-WHERE c.relkind IN ('r','p','v','m','f')
-  AND ((n.nspname NOT LIKE 'pg\\_%%' ESCAPE '\\' AND n.nspname <> 'information_schema')
-       OR n.oid = pg_my_temp_schema())
-  AND has_schema_privilege(n.oid, 'USAGE')
-  AND (has_table_privilege(c.oid, 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
-       OR has_any_column_privilege(c.oid, 'SELECT,INSERT,UPDATE,REFERENCES'))
+WHERE c.relkind IN ('r','p','v','m','f') AND {_PG_RELATION_ACCESS}
 ORDER BY n.nspname, c.relname, a.attnum
-""".replace("%%", "%")
+"""
 _PG_FKS = """
 SELECT k.conrelid, k.oid, ns.nspname, target.relname, src.attname, dst.attname
 FROM pg_catalog.pg_constraint k
@@ -213,7 +242,67 @@ JOIN pg_catalog.pg_attribute dst ON dst.attrelid = k.confrelid AND dst.attnum = 
 WHERE k.contype = 'f'
 ORDER BY k.conrelid, k.oid, pair.position
 """
-_PG_ROUTINES = """
+_PG_PARTITIONS = """
+SELECT edge.inhrelid, edge.inhparent
+FROM pg_catalog.pg_inherits edge
+JOIN pg_catalog.pg_class child ON child.oid = edge.inhrelid AND child.relispartition
+JOIN pg_catalog.pg_class parent ON parent.oid = edge.inhparent AND parent.relkind = 'p'
+"""
+_PG_INDEXES = f"""
+SELECT i.indrelid, n.nspname, ix.relname, am.amname, i.indnkeyatts,
+       i.indisunique, i.indisprimary, i.indisvalid AND i.indisready AND i.indislive,
+       i.indpred IS NOT NULL, i.indimmediate,
+       ARRAY(SELECT a.attname::text
+             FROM pg_catalog.unnest(i.indkey) WITH ORDINALITY AS k(attnum, position)
+             LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
+             ORDER BY k.position)
+FROM pg_catalog.pg_index i
+JOIN pg_catalog.pg_class ix ON ix.oid = i.indexrelid
+JOIN pg_catalog.pg_am am ON am.oid = ix.relam
+JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE {_PG_RELATION_ACCESS}
+ORDER BY n.nspname, c.relname, ix.relname
+"""
+_PG_SEQUENCES = f"""
+SELECT n.nspname, c.relname, pg_catalog.format_type(s.seqtypid, NULL),
+       pg_catalog.obj_description(c.oid, 'pg_class')
+FROM pg_catalog.pg_sequence s
+JOIN pg_catalog.pg_class c ON c.oid = s.seqrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE {_PG_SEQUENCE_ACCESS}
+ORDER BY n.nspname, c.relname
+"""
+_PG_EXTENSIONS = f"""
+SELECT e.extname, e.extversion, n.nspname, pg_catalog.obj_description(e.oid, 'pg_extension')
+FROM pg_catalog.pg_extension e
+JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace
+WHERE {_PG_SCHEMA_USAGE}
+ORDER BY e.extname
+"""
+_PG_COLLATIONS = f"""
+SELECT DISTINCT ON (n.nspname, c.collname) n.nspname, c.collname, c.collprovider,
+       pg_catalog.obj_description(c.oid, 'pg_collation')
+FROM pg_catalog.pg_collation c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.collnamespace
+WHERE {_PG_COLLATION_ACCESS}
+ORDER BY n.nspname, c.collname, c.collencoding DESC
+"""
+_PG_TYPES = f"""
+SELECT n.nspname, t.typname, t.typtype, pg_catalog.format_type(t.typbasetype, t.typtypmod),
+       t.typnotnull, pg_catalog.obj_description(t.oid, 'pg_type'),
+       a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod),
+       pg_catalog.col_description(c.oid, a.attnum)
+FROM pg_catalog.pg_type t
+JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+LEFT JOIN pg_catalog.pg_class c ON c.oid = t.typrelid
+LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+WHERE {_PG_TYPE_ACCESS}
+ORDER BY n.nspname, t.typname, a.attnum
+"""
+_PG_COLLATION_PROVIDERS = {"b": "builtin", "c": "libc", "i": "icu", "d": "default"}
+
+_PG_ROUTINES = f"""
 SELECT n.nspname, p.proname, p.prokind, p.proretset,
        pg_catalog.pg_get_function_result(p.oid),
        pg_catalog.obj_description(p.oid, 'pg_proc'), p.provariadic <> 0,
@@ -229,24 +318,44 @@ SELECT n.nspname, p.proname, p.prokind, p.proretset,
        ARRAY(SELECT pg_catalog.format_type(a.atttypid, a.atttypmod)
              FROM pg_catalog.pg_attribute a
              WHERE a.attrelid = t.typrelid AND a.attnum > 0 AND NOT a.attisdropped
-             ORDER BY a.attnum)
+             ORDER BY a.attnum),
+       p.oid
 FROM pg_catalog.pg_proc p
 JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
 JOIN pg_catalog.pg_type t ON t.oid = p.prorettype
-WHERE (n.nspname = 'pg_catalog'
-       OR (n.nspname NOT LIKE 'pg\\_%%' ESCAPE '\\' AND n.nspname <> 'information_schema')
-       OR n.oid = pg_catalog.pg_my_temp_schema())
-  AND pg_catalog.has_schema_privilege(n.oid, 'USAGE')
-  AND pg_catalog.has_function_privilege(p.oid, 'EXECUTE')
+WHERE {_PG_ROUTINE_ACCESS}
 ORDER BY n.nspname, p.proname, p.oid
-""".replace("%%", "%")
+"""
+
+
+def _postgres_objects(cursor) -> tuple[CatalogObject, ...]:
+    objects = []
+    cursor.execute(_PG_SEQUENCES)
+    objects.extend(CatalogObject(relation_name(schema, name), "sequence", dtype, doc or "")
+                   for schema, name, dtype, doc in cursor)
+    cursor.execute(_PG_EXTENSIONS)
+    objects.extend(CatalogObject(relation_name(name), "extension", f"{version} · schema {quote_identifier(schema)}", doc or "")
+                   for name, version, schema, doc in cursor)
+    cursor.execute(_PG_COLLATIONS)
+    objects.extend(CatalogObject(relation_name(schema, name), "collation", _PG_COLLATION_PROVIDERS.get(provider, provider), doc or "")
+                   for schema, name, provider, doc in cursor)
+    cursor.execute(_PG_TYPES)
+    types = {}
+    for schema, name, kind, base, not_null, doc, column, dtype, column_doc in cursor:
+        entry = types.setdefault(relation_name(schema, name), (kind, base, not_null, doc or "", []))
+        if column is not None:
+            entry[-1].append(ColumnDef(column, dtype, column_doc or ""))
+    for name, (kind, base, not_null, doc, fields) in types.items():
+        detail = base + (" NOT NULL" if not_null else "") if kind == "d" else ""
+        objects.append(CatalogObject(name, "domain" if kind == "d" else "composite", detail, doc, tuple(fields)))
+    return tuple(objects)
 
 
 def _postgres_routines(cursor) -> tuple[RoutineDef, ...]:
     cursor.execute(_PG_ROUTINES)
     routines = []
     for (namespace, name, native_kind, returns_set, result, doc, variadic,
-         defaults, names, modes, types, column_names, column_types) in cursor:
+         defaults, names, modes, types, column_names, column_types, oid) in cursor:
         parameters, parameter_types, outputs = [], [], []
         for index, dtype in enumerate(types):
             mode = modes[index] if modes else "i"
@@ -270,6 +379,7 @@ def _postgres_routines(cursor) -> tuple[RoutineDef, ...]:
             relation_name(namespace, name), tuple(parameters), result or "", doc or "",
             kind, bool(variadic), tuple(parameter_types), columns if kind == "table" else (),
             min_args=max(0, len(parameters) - defaults - int(variadic)),
+            oid=oid,
         ))
     return tuple(routines)
 
@@ -307,19 +417,20 @@ def refresh_source_schema(source: DataSource) -> None:
     with source._lock:
         source._pg_origin_catalog = None
         if source.con is None:
-            source.datasets, source.routines = {}, ()
+            source.datasets, source.routines, source.objects = {}, (), ()
             return
         try:
             datasets = {}
-            routines = ()
+            routines, objects = (), ()
             origin_index = None
             if source.kind == "d1-live":
                 with source.con.operation() as operation:
                     datasets = source.con.schema(operation)
-                source.datasets, source.routines = datasets, routines
+                source.datasets, source.routines, source.objects = datasets, routines, objects
                 return
             if source.kind == "postgres-live":
                 by_oid = {}
+                names_by_oid = {}
                 origin_index = {}
                 # A savepoint inside an existing transaction isolates discovery
                 # failures without committing or rolling back the user's work.
@@ -328,12 +439,14 @@ def refresh_source_schema(source: DataSource) -> None:
                     for oid, namespace, name, doc, column, dtype, column_doc, temporary, enum_values, kind, attnum in cursor:
                         key = relation_name(namespace, name)
                         item = datasets.setdefault(key, {"columns": [], "doc": doc or "", "rows": None,
-                                                          "foreign_keys": [], "temp": bool(temporary)})
+                                                          "foreign_keys": [], "temp": bool(temporary),
+                                                          "kind": _PG_RELATION_KINDS[kind], "indexes": []})
                         if column is not None:
                             item["columns"].append(ColumnDef(column, dtype, column_doc or "",
                                                              tuple(enum_values) if enum_values is not None else None))
                             origin_index[oid, attnum] = (key, column)
                         by_oid[oid] = item
+                        names_by_oid[oid] = key
                     cursor.execute(_PG_FKS)
                     keys = {}
                     for oid, constraint, namespace, target, column, target_column in cursor:
@@ -344,7 +457,19 @@ def refresh_source_schema(source: DataSource) -> None:
                         entry[2].append(target_column)
                     for (oid, _), (target, columns, target_columns) in keys.items():
                         by_oid[oid]["foreign_keys"].append(ForeignKey(tuple(columns), target, tuple(target_columns)))
+                    cursor.execute(_PG_PARTITIONS)
+                    for child, parent in cursor:
+                        if child in by_oid and parent in by_oid:
+                            by_oid[child]["partition_parent"] = names_by_oid[parent]
+                    cursor.execute(_PG_INDEXES)
+                    for oid, namespace, name, method, key_count, unique, primary, valid, partial, immediate, columns in cursor:
+                        if oid in by_oid:
+                            by_oid[oid]["indexes"].append(IndexDef(
+                                relation_name(namespace, name), method, tuple(columns[:key_count]),
+                                tuple(columns[key_count:]), unique, primary, valid, partial, immediate,
+                            ))
                     routines = _postgres_routines(cursor)
+                    objects = _postgres_objects(cursor)
             elif source.kind == "parquet":
                 rows = source.con.execute("""
                     SELECT table_schema, table_name, column_name, data_type
@@ -362,7 +487,9 @@ def refresh_source_schema(source: DataSource) -> None:
             for item in datasets.values():
                 item["columns"] = tuple(item["columns"])
                 item["foreign_keys"] = tuple(item["foreign_keys"])
-            source.datasets, source.routines = datasets, routines
+                if "indexes" in item:
+                    item["indexes"] = tuple(item["indexes"])
+            source.datasets, source.routines, source.objects = datasets, routines, objects
             if origin_index is not None:
                 source._pg_origin_catalog = (source.con, datasets, origin_index)
         except EngineError:

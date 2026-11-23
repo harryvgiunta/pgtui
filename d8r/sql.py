@@ -49,6 +49,7 @@ class RoutineDef:
     parameter_types: tuple[str, ...] = ()
     columns: tuple[ColumnDef, ...] = ()
     min_args: int | None = None  # None when the catalog does not expose defaults.
+    oid: int | None = field(default=None, repr=False, compare=False)  # Live PostgreSQL only.
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "parameters", tuple(self.parameters))
@@ -68,15 +69,61 @@ class ForeignKey:
 
 
 @dataclass(frozen=True)
+class IndexDef:
+    name: str
+    method: str
+    keys: tuple[str | None, ...]  # NULL catalog attribute numbers denote expressions.
+    included: tuple[str, ...] = ()
+    unique: bool = False
+    primary: bool = False
+    valid: bool = True
+    partial: bool = False
+    immediate: bool = True
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "keys", tuple(self.keys))
+        object.__setattr__(self, "included", tuple(self.included))
+
+    @property
+    def detail(self) -> str:
+        keys = ", ".join(quote_identifier(key) if key is not None else "(expression)" for key in self.keys)
+        label = "primary key" if self.primary else "unique index" if self.unique else "index"
+        detail = f"{label} · {self.method} ({keys})"
+        if self.included:
+            detail += " INCLUDE (" + ", ".join(map(quote_identifier, self.included)) + ")"
+        flags = [name for flag, name in ((self.partial, "partial"), (not self.valid, "invalid"),
+                                        (self.unique and not self.immediate, "deferrable")) if flag]
+        return " · ".join((detail, *flags))
+
+
+@dataclass(frozen=True)
+class CatalogObject:
+    """A named PostgreSQL object that is not an ordinary query relation."""
+
+    name: str
+    kind: str
+    detail: str = ""
+    doc: str = ""
+    columns: tuple[ColumnDef, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "columns", tuple(self.columns))
+
+
+@dataclass(frozen=True)
 class TableDef:
     name: str
     doc: str = ""
     columns: tuple[ColumnDef, ...] = ()
     foreign_keys: tuple[ForeignKey, ...] = ()
+    kind: str = "table"
+    indexes: tuple[IndexDef, ...] = ()
+    partition_parent: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "columns", tuple(self.columns))
         object.__setattr__(self, "foreign_keys", tuple(self.foreign_keys))
+        object.__setattr__(self, "indexes", tuple(self.indexes))
 
 
 @dataclass(frozen=True)
@@ -100,6 +147,7 @@ class SchemaContext:
     fns: tuple[FnDef, ...] = ()
     default_schema: str | None = None
     routines: tuple[RoutineDef, ...] = ()
+    objects: tuple[CatalogObject, ...] = ()
     pool: tuple[PoolColumn, ...] = field(init=False)
     _fns_by_name: Mapping[str, FnDef] = field(init=False, repr=False, compare=False)
     _fks_by_table: Mapping[str, tuple[ForeignKey, ...]] = field(init=False, repr=False, compare=False)
@@ -108,6 +156,7 @@ class SchemaContext:
         object.__setattr__(self, "tables", tuple(self.tables))
         object.__setattr__(self, "fns", tuple(self.fns))
         object.__setattr__(self, "routines", tuple(self.routines))
+        object.__setattr__(self, "objects", tuple(self.objects))
         object.__setattr__(self, "_fns_by_name", MappingProxyType(_registry(self.fns)))
         columns: dict[str, tuple[ColumnDef, list[str]]] = {}
         for table in self.tables:

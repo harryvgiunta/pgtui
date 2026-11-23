@@ -34,7 +34,7 @@ from d8r.dbt import DbtError, DbtProject, has_query_jinja
 
 from d8r.engine import (
     DataSource, EngineError, add_d1_source, add_parquet_source, add_postgres_source,
-    cancel_source, close_source, column_values, execute_sql, export_query_csv, load,
+    cancel_source, close_source, column_values, execute_sql, explain_sql, export_query_csv, load,
     preflight_source, refresh_source_schema, transaction_open,
 )
 from d8r.sql import (
@@ -101,7 +101,8 @@ def tables_of(source: DataSource) -> list[TableDef]:
     """Build the completion snapshot from cached metadata, without database IO."""
     return [TableDef(name=name, doc=entry.get("doc", ""),
                      columns=tuple(entry["columns"]),
-                     foreign_keys=tuple(entry.get("foreign_keys", ())))
+                     foreign_keys=tuple(entry.get("foreign_keys", ())), kind=entry.get("kind", "table"),
+                     indexes=tuple(entry.get("indexes", ())), partition_parent=entry.get("partition_parent"))
             for name, entry in source.datasets.items()]
 
 
@@ -937,10 +938,12 @@ class Session:
             return
         hydrated = self._hydrated_schemas.get(source.id)
         if (hydrated is not None and hydrated[0] is source and hydrated[1] is snapshot
-                and hydrated[2] is source.datasets and source.routines is snapshot.routines):
+                and hydrated[2] is source.datasets and source.routines is snapshot.routines
+                and source.objects is snapshot.objects):
             return
         source.datasets = snapshot.datasets()
         source.routines = snapshot.routines
+        source.objects = snapshot.objects
         source.default_schema = snapshot.default_schema
         source.server_version = snapshot.server_version
         self._hydrated_schemas[source.id] = (source, snapshot, source.datasets)
@@ -975,6 +978,7 @@ class Session:
             tables=tuple(tables_of(source)), fns=tuple(self.fns.values()),
             default_schema=source.default_schema or source.postgres.get("schema"),
             routines=source.routines,
+            objects=source.objects,
         )
         self._schema_snapshots[source.id] = (source, source.datasets, self.schema)
 
@@ -985,6 +989,7 @@ class Session:
         cached = self._schema_snapshots.get(source.id)
         if (cached is not None and cached[0] is source and cached[1] is source.datasets
                 and cached[2].routines is source.routines
+                and cached[2].objects is source.objects
                 and cached[2].fns == tuple(self.fns.values())
                 and cached[2].default_schema == (source.default_schema or source.postgres.get("schema"))):
             self.schema = cached[2]
@@ -1293,6 +1298,35 @@ class Session:
                           " · server syntax/schema not validated")
         return outcome
 
+    def _render_dbt_sql(self, doc: str, source: DataSource, dbt_home: str) -> str:
+        directory = dbt_home or self.dbt_project_dir
+        if not directory:
+            raise DbtError("Set a project home in Settings → Workspace Settings before running dbt Jinja.")
+        target = source.postgres or self.saved_source_profile(source.id) or {}
+        return DbtProject(directory, dialect=source.dialect).render_query(doc, database=target.get("database", ""))
+
+    def explain_query(self, source: DataSource, doc: str, *, dbt_home: str = "", cancel_event: Event) -> dict:
+        """Plan one query in the worker, without updating rows or Run history."""
+        if has_query_jinja(doc, dialect=source.dialect):
+            if not self.dbt_enabled:
+                raise EngineError("dbt is disabled in Settings → Workspace Settings.")
+            try:
+                doc = self._render_dbt_sql(doc, source, dbt_home)
+            except (DbtError, OSError) as exc:
+                raise EngineError(str(exc)) from None
+        document = parse_sql(doc, self.functions_for(source.id), dialect=source.dialect)
+        if document.errors:
+            first = document.errors[0]
+            raise EngineError(f"line {first.line}: {first.message}")
+        if len(document.statements) != 1:
+            raise EngineError("Select one read-only query to explain.")
+        if cancel_event.is_set():
+            raise EngineError("Query planning cancelled")
+        result = explain_sql(source, document.statements[0])
+        if cancel_event.is_set():
+            raise EngineError("Query planning cancelled")
+        return result
+
     def run(self, doc: str, record: bool = True) -> RunOutcome:
         """Execute the document and return its first outcome; use run_all for all."""
         return self.run_all(doc, record=record)[0]
@@ -1319,11 +1353,7 @@ class Session:
                 message = "dbt is disabled in Settings → Workspace Settings. Nothing was executed."
                 return [RunOutcome(status=message, error=message, doc=doc)]
             try:
-                directory = dbt_home or self.dbt_project_dir
-                if not directory:
-                    raise DbtError("Set a project home in Settings → Workspace Settings before running dbt Jinja.")
-                target = source.postgres or self.saved_source_profile(source.id) or {}
-                native = DbtProject(directory, dialect=source.dialect).render_query(doc, database=target.get("database", ""))
+                native = self._render_dbt_sql(doc, source, dbt_home)
             except (DbtError, OSError) as exc:
                 message = str(exc)
                 return [RunOutcome(status=f"not executed · {message}", error=message, doc=doc)]

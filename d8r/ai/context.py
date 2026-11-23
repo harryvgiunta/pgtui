@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING
 from d8r.engine import EngineError, execute_sql, explain_sql, prepare_sql, sample_rows, transaction_open
 from d8r.sql import FnDef, SqlError, format_parameters, is_identifier, parse_parameters, parse_sql, validate_function
 
+from .catalog import index_metadata
+
 if TYPE_CHECKING:
     from d8r.dbt_edits import DbtDraft
     from d8r.tui.session import Session
@@ -225,8 +227,8 @@ class AIContext:
         self.tools = [
             _tool("schema", "Read cached metadata, without database execution. Discover table names and column counts "
                   "with no arguments or a table/column name substring query. Use an exact returned table name "
-                  "for typed columns; with table, query filters column names. Pass next_offset as offset with "
-                  "the same table/query to continue.",
+                  "for typed columns and PostgreSQL index/partition metadata; with table, query filters column names. "
+                  "Pass next_offset as offset with the same table/query to continue.",
                   {"table": {"type": "string"}, "query": {"type": "string"},
                    "offset": {"type": "integer", "minimum": 0, "maximum": 2**31 - 1}}),
             _tool("sample_rows", f"Read at most {self.sample_rows} rows and 20 columns from one registered table; optional exact columns projection, otherwise the first 20. Never run arbitrary code.",
@@ -644,7 +646,10 @@ class AIContext:
             page, next_offset, omitted = _schema_page(details, offset, SCHEMA_COLUMN_LIMIT)
             tables.append({"name": table_name, "description": entry.get("doc", "")[:512],
                            "columns": page, "column_count": len(columns)})
-            note = "Cached column metadata only. Use query to filter column names across this table."
+            if self.source.dialect == "postgres":
+                tables[0].update(kind=entry.get("kind", "table"), partition_parent=entry.get("partition_parent"),
+                                 **index_metadata(entry.get("indexes", ())))
+            note = "Cached metadata only. Use query to filter column names across this table."
         return {"source": self.source_id, "dialect": self.source.dialect,
                 "server_version": self.source.server_version, "tables": tables,
                 "connected": self.session.source_connected(self.source_id),

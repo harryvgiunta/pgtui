@@ -7,6 +7,7 @@ import json
 import re
 
 from d8r.sql import SchemaContext, format_parameters, relation_parts
+from .catalog import index_metadata
 from .client import AIConfig, AIError, parse_headers, run_turn
 
 MAX_INSERT_CHARS = 2048
@@ -116,6 +117,8 @@ def _request_data(request: CompletionRequest) -> dict:
         "columns_truncated": len(table.columns) > 80,
         "foreign_keys": [{"columns": list(key.columns), "target": key.target_table,
                           "target_columns": list(key.target_columns)} for key in table.foreign_keys[:16]],
+        **({"kind": table.kind, "partition_parent": table.partition_parent, **index_metadata(table.indexes)}
+           if request.dialect == "postgres" else {}),
     } for table in tables]
     packet["tables_truncated"] = len(request.schema.tables) > len(tables)
     packet["visible_relations"] = [{"name": relation.name, "reference": relation.reference,

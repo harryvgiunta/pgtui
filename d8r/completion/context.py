@@ -169,6 +169,7 @@ class _Scope:
     # Cursor offsets at which the next legal part of a WITH declaration changes.
     cte_steps: list[tuple[int, str]] = field(default_factory=list)
     insert_open: int | None = None
+    conflict: int | None = None
     projection_span: tuple[int, int] | None = None
 
 
@@ -644,7 +645,7 @@ class _Model:
                     expect = False
                     i += 1
                     continue
-                relation = self.relation(name, ctes)
+                relation = self.relation(name, () if insert_target else ctes)
                 i = after
                 if i < hi and self.tokens[i].text == "(" and not insert_target:
                     close = min(self.pairs.get(i, hi), hi)
@@ -674,12 +675,15 @@ class _Model:
             expect = False
         scope.relations = _merge(tuple(local), outer, self.dialect)
         top = list(self.top(main, hi))
+        if self.dialect == "postgres" and self.upper(main) == "INSERT":
+            scope.conflict = next((i for i in top if self.upper(i) == "ON" and self.upper(i + 1) == "CONFLICT"), None)
         select = next((i for i in top if self.upper(i) == "SELECT"), None)
         returning = next((i for i in top if self.upper(i) == "RETURNING"), None)
         projection = returning if returning is not None else select
         insert_select = self.upper(main) == "INSERT" and select is not None
         if insert_select:
-            child = self.query(select, returning if returning is not None else hi, ctes, (), depth + 1)
+            stop = min(i for i in (returning, scope.conflict, hi) if i is not None)
+            child = self.query(select, stop, ctes, (), depth + 1)
             scope.children.append(child)
             scope.relations = tuple(local[:1])
             scope.sources = scope.sources[:1]
@@ -840,6 +844,23 @@ class _Model:
         return clause, anchor
 
 
+def _catalog_slot(model: _Model, scope: _Scope, previous: int) -> str:
+    """Recognize a PostgreSQL object-name slot, not arbitrary expression words."""
+    if previous >= scope.lo and model.upper(previous) == "COLLATE":
+        return "catalog_collation"
+    command, kind = model.upper(scope.lo), model.upper(scope.lo + 1)
+    if (command not in {"ALTER", "DROP", "REINDEX"}
+            or (command == "REINDEX" and kind != "INDEX")
+            or kind not in {"INDEX", "COLLATION", "TYPE", "DOMAIN", "SEQUENCE", "EXTENSION"}):
+        return ""
+    pos = scope.lo + 2
+    if kind == "INDEX" and command in {"DROP", "REINDEX"} and model.upper(pos) == "CONCURRENTLY":
+        pos += 1
+    if model.upper(pos) == "IF" and model.upper(pos + 1) == "EXISTS":
+        pos += 2
+    return "catalog_" + kind.lower() if previous + 1 == pos else ""
+
+
 def _active(scope: _Scope, offset: int) -> _Scope:
     for child in scope.children:
         if child.start <= offset <= child.end:
@@ -967,6 +988,7 @@ def analyze(document: str, offset: int, schema: SchemaContext, *, dialect: str =
             clause = "set_expression"
     qualifier = ""
     qualifier_start = start
+    previous = before[-1] if before else scope.lo - 1
     if before and tokens[before[-1]].text == ".":
         stop, at = before[-1], before[-1] - 1
         while at >= scope.lo and tokens[at].kind in _IDS:
@@ -977,6 +999,7 @@ def analyze(document: str, offset: int, schema: SchemaContext, *, dialect: str =
         if at >= scope.lo:
             qualifier = document[tokens[at].start:tokens[stop].start]
             qualifier_start = tokens[at].start
+            previous = at - 1
     relations = scope.relations
     if clause in {"insert_columns", "update_set"}:
         relations = tuple(r for r in relations if not r.outer)[:1]
@@ -1038,8 +1061,8 @@ def analyze(document: str, offset: int, schema: SchemaContext, *, dialect: str =
                 relations, clause = tuple(inputs), "identifier"
             break
     # A cast type follows :: even when the type token is only partly typed.
-    if before and (tokens[before[-1]].text == "::" or (
-        len(before) > 1 and tokens[before[-1]].text == tokens[before[-2]].text == ":")):
+    if previous >= scope.lo and (tokens[previous].text == "::" or (
+        previous > scope.lo and tokens[previous].text == tokens[previous - 1].text == ":")):
         clause = "type"
     if not containing and not blocked:
         last = before[-1] if before else scope.lo - 1
@@ -1055,6 +1078,15 @@ def analyze(document: str, offset: int, schema: SchemaContext, *, dialect: str =
                     join_target = replace(join_target, reference=join_target.name)
         elif not qualifier and not quote and token != "*":
             clause = model.expression_slot(clause, anchor, last)
+    conflict_table = None
+    if dialect == "postgres" and not blocked:
+        if slot := _catalog_slot(model, scope, previous):
+            clause = slot
+        if scope.conflict is not None and scope.sources and not qualifier:
+            if previous == scope.conflict + 1 and start == end:
+                clause, conflict_table = "conflict_target", scope.sources[0].relation.table
+            elif previous == scope.conflict + 2 and tokens[previous].text == "(":
+                clause, conflict_table = "conflict_keys", scope.sources[0].relation.table
     value_field = None
     rhs = before[-1] if before else -1
     # IN lists retain their field across commas; nested calls retain their own context.
@@ -1116,4 +1148,4 @@ def analyze(document: str, offset: int, schema: SchemaContext, *, dialect: str =
     return Context(start, end, token, qualifier, quote, clause, blocked, relations, scope.ctes, scope.outputs,
                    join_target, join_left, call, value_field, token if value_field else "", literal,
                    tuple(used), statement_start, statement_end, identifiers,
-                   group_outputs, group_expressions, group_prefix, group_slot, statement_relation_start)
+                   group_outputs, group_expressions, group_prefix, group_slot, statement_relation_start, conflict_table)

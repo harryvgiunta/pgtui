@@ -28,6 +28,7 @@ from .session import Session
 
 ACTIONS: tuple[tuple[str, str, str], ...] = (
     ("Run", "ctrl+enter · execute the document", "run"),
+    ("Explain query", "inspect a PostgreSQL plan without running the query", "explain"),
     ("SQL preview", "ctrl+k · expand functions without executing", "compile"),
     ("Data source…", "ctrl+o · PostgreSQL, Cloudflare D1 or local Parquet", "add-source"),
     ("Functions…", "open the SQL function library", "fn"),
@@ -118,6 +119,7 @@ def view_for(session: Session, doc: str, line: str, column: int, *,
         entries = [Entry(label, detail=detail, action=name, kind="action")
                    for label, detail, name in ACTIONS
                    if (session.dbt_enabled or name not in _DBT_ACTIONS)
+                   and (name != "explain" or (source.dialect == "postgres" and query_history))
                    and (token.casefold() in label.casefold() or token.casefold() in name.casefold())]
         return View(start, token, entries, "command", end) if entries else None
     if commands_only:

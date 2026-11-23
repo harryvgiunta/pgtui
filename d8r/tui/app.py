@@ -47,11 +47,13 @@ from d8r.dbt import DbtError, DbtProject, has_query_jinja
 from d8r.dbt_edits import DbtDraft, add_description
 from d8r.dbt_files import DbtFile, DbtFiles, file_revision, reference_at
 from d8r.dbt_rename import DbtRenamePlan
-from d8r.engine import POSTGRES_VERSION, DataSource, EngineError
+from d8r.engine import POSTGRES_VERSION, DataSource, EngineError, postgres_definition
 from d8r.sql import ColumnDef, format_parameters
 from d8r.themes import COZY_PASTEL
 
 from .add_source import AddSourceModal
+from .catalog import (CatalogDefinitionScreen, DefinitionLink, add_catalog_groups, definition_leaf,
+                      expand_catalog_group)
 from .connection import ConnectionProgress, build_saved_source, saved_source_label
 from .dbt import DbtExplorer, DbtModelScreen, DbtRenameScreen, DbtTestScreen
 from .dbt_authoring import DbtAuthoring
@@ -61,7 +63,7 @@ from .ai import AIChats, AIPanel, AITarget, ConversationTabs, DeleteOptionList
 from .palette import CommandPalette, EditorPane
 from .query_editor import QueryTextArea
 from .page_details import PageDetails
-from .results import ResultsTable
+from .results import PlanTree, ResultsTable
 from .session import RunOutcome, Session
 from .settings import CompletionKeyScreen, SettingsScreen, binding_tooltip
 from .fn import FnEditor, FnExplorer, HINT as FUNCTION_HINT
@@ -295,6 +297,7 @@ class D8RApp(App):
         self._data_tab_seq = 0
         self._results_closed = not any(self.session.pane_visibility[name] for name in self.TAB_PANES)
         self._main_outcome: RunOutcome | None = None
+        self._plan_tree: PlanTree | None = None
         self._workspace_outputs: dict[str, tuple[RunOutcome | None, str, bool]] = {}
 
     def get_default_screen(self) -> Screen:
@@ -319,7 +322,7 @@ class D8RApp(App):
                     with TabPane("Schema", id="tab-schema"):
                         with Vertical(id="schema-pane"):
                             yield Button("Refresh schema", id="refresh-schema", compact=True,
-                                         tooltip="Reload tables, columns and routines from the active source")
+                                         tooltip="Reload catalog metadata from the active source")
                             yield Tree(Text("datasets"), id="schema-tree")
                     with TabPane("Pages", id="tab-pages"):
                         with Horizontal(id="page-actions"):
@@ -350,6 +353,8 @@ class D8RApp(App):
                         with Horizontal(id="document-actions"):
                             yield Button("Run SQL", id="run-query", compact=True,
                                          tooltip=binding_tooltip(self.BINDINGS, "run") + " · Page reads; execute writes once")
+                            yield Button("Explain", id="explain-query", compact=True,
+                                         tooltip=r"\explain · PostgreSQL estimates only; no ANALYZE")
                             yield Button("New Query", id="query-new", compact=True,
                                          tooltip=binding_tooltip(self.BINDINGS, "new_query") + " · Keep the current draft")
                             yield Button("Ask AI", id="open-ai", compact=True)
@@ -595,6 +600,8 @@ class D8RApp(App):
     def _load_source_workspace(self, page: dict | None = None) -> None:
         """Restore this source's last page and function draft without executing."""
         self.query_one(FindBar).close(restore_focus=False)
+        if self._workspace_key != self.session.source_key():
+            self._remove_plan_tab()
         self._workspace_key = self.session.source_key()
         with self.prevent(Select.Changed):
             self.query_one("#source-select", Select).set_options(self._source_options())
@@ -1024,6 +1031,7 @@ class D8RApp(App):
         running = self._cancel_run is not None
         self.query_one("#cancel-query", Button).display = running
         self.query_one("#run-query", Button).disabled = running
+        self.query_one("#explain-query", Button).disabled = running
         self.query_one("#refresh-schema", Button).disabled = running
         self.query_one("#reconnect-source", Button).display = not self.session.source_connected()
         source = self.session.source
@@ -1049,19 +1057,25 @@ class D8RApp(App):
         tree.clear()
         root = tree.root
         root.expand()
-        datasets = self.session.source.datasets
+        source = self.session.source
+        datasets = source.datasets
+        self._partition_children = {}
         for name, entry in datasets.items():
-            label = dataset_label(name, entry["rows"])
-            if entry.get("temp"):
-                label.append(Text("  temp", style="dim italic"))
-            node = root.add(
-                label,
-                data={"kind": "dataset", "name": name},
-                allow_expand=True,
-            )
-            # A placeholder keeps the node expandable; expanding replaces it
-            # with the columns the schema registry holds for that dataset.
-            node.add_leaf(Text("…", style="dim"), data={"kind": "placeholder"})
+            if (parent := entry.get("partition_parent")) in datasets:
+                self._partition_children.setdefault(parent, []).append(name)
+            else:
+                self._add_dataset_node(root, name, entry)
+        add_catalog_groups(root, source)
+
+    @staticmethod
+    def _add_dataset_node(parent, name: str, entry: dict) -> None:
+        label = dataset_label(name, entry["rows"])
+        if (kind := entry.get("kind", "table")) != "table":
+            label.append(Text("  " + kind, style="dim"))
+        if entry.get("temp"):
+            label.append(Text("  temp", style="dim italic"))
+        parent.add(label, data={"kind": "dataset", "name": name})
+
     def _schema_updated(self, source: DataSource) -> None:
         for palette in self.query(CommandPalette):
             palette.close()
@@ -1219,7 +1233,7 @@ class D8RApp(App):
         # never throws away a result the user pinned or a run still holding.
         self.query_one("#result-tabs").display = not self.function_mode and (
             any(self.pane_visible(name) for name in self.TAB_PANES)
-            or (any(tab["source"] == self._workspace_key for tab in self._data_tabs.values())
+            or ((self._plan_tree is not None or any(tab["source"] == self._workspace_key for tab in self._data_tabs.values()))
                 and not self._results_closed)
         )
         self.query_one("#output-controls").display = self.query_one("#result-tabs").display
@@ -1504,6 +1518,46 @@ class D8RApp(App):
             self.notify(self.session.workspace_error, title="History could not be saved", severity="error", timeout=15)
         self._open_data_tabs(outcomes[1:])
 
+    @on(Button.Pressed, "#explain-query")
+    def action_explain(self) -> None:
+        """Inspect an estimate for the selected SQL or current draft."""
+        if self.function_mode or self._modal_open() or self.ai_panel.has_focus_within:
+            return
+        if self.editor.file_format != "sql" or self.editor.read_only:
+            return
+        source = self.session.source
+        if source.dialect != "postgres" or not self.session.source_connected():
+            self._set_status("Connect to PostgreSQL to inspect query plans.")
+            return
+        document, dbt_home, page = self.editor.selected_text or self.editor.text, self._dbt_home, self._document_identity
+        self.palette.close()
+        self.submit_sql(source, "Explain query", lambda target, stop: self.session.explain_query(
+            target, document, dbt_home=dbt_home, cancel_event=stop),
+            lambda target, result: self._publish_query_plan(target, page, result), reconnect=False)
+
+    def _publish_query_plan(self, source: DataSource, page: str, result: dict) -> None:
+        if self.session.source is not source or self._document_identity != page or self.function_mode:
+            self._set_status("Plan discarded · query target changed")
+            return
+        tabs = self.query_one("#result-tabs", TabbedContent)
+        if self._plan_tree is None:
+            self._plan_tree = PlanTree(Text("Estimated plan"), id="plan-tree")
+            tabs.add_pane(TabPane("Plan", self._plan_tree, id="tab-plan"), before="tab-sql")
+        tree = self._plan_tree
+
+        def reveal() -> None:
+            if self._plan_tree is not tree or self.session.source is not source:
+                return
+            tree.show_plan(result)
+            self._results_closed = False
+            tabs.active = "tab-plan"
+            self._fit_result_tabs()
+            self._set_status("Plan withheld · output limit exceeded" if result["truncated"] else "Estimated plan · query not executed")
+            if not self._modal_open():
+                tree.focus()
+
+        self.call_after_refresh(reveal)
+
     def action_compile(self) -> None:
         """Expand local functions only; native SQL grammar is checked on Run."""
         if self.function_mode or self._modal_open() or self.ai_panel.has_focus_within:
@@ -1702,6 +1756,7 @@ class D8RApp(App):
             self.query_one("#page-details-toggle", Button).label = "Show Page Details"
         for selector in ("#run-query", "#format-query", "#query-sections", "#page-details-toggle"):
             self.query_one(selector, Button).display = sql and not editor.read_only
+        self.query_one("#explain-query", Button).display = sql and not editor.read_only and self.session.dialect == "postgres"
         self.query_one("#open-ai", Button).display = not editor.read_only
         self.query_one("#dbt-file-diff", Button).display = bool(link)
         self.query_one("#dbt-rename-model", Button).display = bool(link) and suffix in {".sql", ".py"}
@@ -2258,6 +2313,9 @@ class D8RApp(App):
     def action_export_results(self) -> None:
         if self._modal_open():
             return
+        if self.query_one("#result-tabs", TabbedContent).active == "tab-plan":
+            self._set_status("A query plan has no rows to export.")
+            return
         self.palette.close()
         self._active_results_table().action_export()
 
@@ -2483,7 +2541,10 @@ class D8RApp(App):
     def _sync_result_controls(self) -> None:
         active = self.query_one("#result-tabs", TabbedContent).active
         tab = self._data_tabs.get(active)
-        self.query_one("#results-actions").display = active == "tab-results" or tab is not None
+        plan = active == "tab-plan"
+        self.query_one("#results-actions").display = active == "tab-results" or tab is not None or plan
+        for selector in ("#results-copy", "#results-pin", "#results-export"):
+            self.query_one(selector, Button).display = not plan
         pin = self.query_one("#results-pin", Button)
         pinned = tab is not None and tab["pinned"]
         pin.label = "Unpin" if pinned else "Pin"
@@ -2567,10 +2628,19 @@ class D8RApp(App):
 
     def _remove_data_tab(self, tab_id: str) -> None:
         self._data_tabs.pop(tab_id, None)
+        self._remove_result_pane(tab_id)
+
+    def _remove_plan_tab(self) -> None:
+        if self._plan_tree is not None:
+            self._plan_tree = None
+            self._remove_result_pane("tab-plan")
+
+    def _remove_result_pane(self, tab_id: str) -> None:
         tabs = self.query_one("#result-tabs", TabbedContent)
         if tabs.active == tab_id:
             # Move off the tab before unmounting; a batch can remove several neighbours.
-            tabs.active = next((key for key in (*self.TAB_PANES.values(), *self._data_tabs)
+            plan_tabs = ("tab-plan",) if self._plan_tree is not None else ()
+            tabs.active = next((key for key in (*self.TAB_PANES.values(), *self._data_tabs, *plan_tabs)
                                 if tabs.get_tab(key).display), "")
         tabs.remove_pane(tab_id)
 
@@ -2585,6 +2655,9 @@ class D8RApp(App):
         elif active in self._data_tabs:
             self._remove_data_tab(active)
             self._sync_data_tabs()
+            self._fit_result_tabs()
+        elif active == "tab-plan":
+            self._remove_plan_tab()
             self._fit_result_tabs()
         else:
             return
@@ -2661,9 +2734,12 @@ class D8RApp(App):
 
     @on(Tree.NodeExpanded, "#schema-tree")
     def _dataset_expanded(self, event: Tree.NodeExpanded) -> None:
-        """Load a dataset's columns from the session snapshot, once."""
+        """Populate expanded catalog branches without database I/O."""
         node = event.node
         data = node.data if isinstance(node.data, dict) else {}
+        if data.get("kind") == "catalog_group":
+            expand_catalog_group(node)
+            return
         if data.get("kind") != "dataset" or data.get("loaded"):
             if data.get("kind") == "column" and not data.get("loaded"):
                 self._inspect_column(node)
@@ -2677,7 +2753,33 @@ class D8RApp(App):
                 child = node.add(column_label(column), data={"kind": "column", "name": column.name,
                                                            "dataset": data["name"]}, allow_expand=True)
                 child.add_leaf(Text("Expand to load distinct values", style="dim"), data={"kind": "placeholder"})
+            if table.indexes:
+                indexes = node.add(Text(f"Indexes ({len(table.indexes)})"), data={"kind": "schema_group", "name": "Indexes"})
+                for index in table.indexes:
+                    definition_leaf(indexes, Text.assemble(index.name, ("  " + index.detail, "dim")),
+                                    DefinitionLink("index", index.name, index.name))
+            if children := self._partition_children.get(table.name):
+                partitions = node.add(Text(f"Partitions ({len(children)})"), data={"kind": "schema_group", "name": "Partitions"})
+                for child in children:
+                    self._add_dataset_node(partitions, child, self.session.source.datasets[child])
+            if self.session.source.dialect == "postgres":
+                label = "View query" if table.kind in {"view", "materialized view"} else "Definition"
+                definition_leaf(node, Text(label), DefinitionLink(table.kind, table.name, table.name))
         data["loaded"] = True
+
+    def _open_catalog_definition(self, link: DefinitionLink) -> None:
+        source = self.session.source
+        if not self.session.source_connected():
+            self._set_status("Reconnect to PostgreSQL before opening a definition.")
+            return
+
+        def show(target: DataSource, text: str) -> None:
+            if target is self.session.source and not self._modal_open():
+                self._set_status("Definition loaded · nothing executed from the definition")
+                self.push_screen(CatalogDefinitionScreen(link, text))
+
+        self.submit_sql(source, "Catalog definition", lambda target, stop: postgres_definition(
+            target, link.kind, link.name, oid=link.oid), show, reconnect=False)
 
     def _inspect_column(self, node) -> None:
         source = self.session.source
@@ -2833,18 +2935,25 @@ class D8RApp(App):
         node.data["loaded"] = self.session.value_cache_enabled
 
     @on(Tree.NodeSelected, "#schema-tree")
-    def _column_selected(self, event: Tree.NodeSelected) -> None:
-        """Insert a selected column using its table's current document alias."""
+    def _schema_selected(self, event: Tree.NodeSelected) -> None:
+        """Select a catalog action or insert a relation/column at the caret."""
         data = event.node.data if isinstance(event.node.data, dict) else {}
+        if data.get("kind") == "definition":
+            root = event.node
+            while root.parent is not None:
+                root = root.parent
+            if root is self.query_one("#schema-tree", Tree).root:
+                self._open_catalog_definition(data["link"])
+            return
+        if data.get("kind") in {"schema_group", "catalog_group"} or event.node.is_root:
+            event.node.toggle()
+            return
         editor = self.function_editor.query_one("#fn-body", TextArea) if self.function_mode else self.editor
         palette = self.function_editor.query_one(CommandPalette) if self.function_mode else self.palette
         if data.get("kind") == "dataset":
             if palette.accept_table(data["name"]):
                 self._set_status(f"inserted {data['name']}")
                 return
-            event.node.toggle()
-            return
-        if event.node.is_root:
             event.node.toggle()
             return
         if data.get("kind") != "column" or editor.read_only:
@@ -2896,6 +3005,7 @@ class D8RApp(App):
         actions = {
             "run": self.action_run,
             "compile": self.action_compile,
+            "explain": self.action_explain,
             "dbt": self.action_dbt,
             "dbt-lineage": self.action_dbt_lineage,
             "dbt-problems": self.action_dbt_problems,
