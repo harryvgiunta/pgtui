@@ -24,6 +24,8 @@ _PLAN_CHARS = 64000
 # UPDATE/MERGE and other writes remain prohibited independently.
 _WRITE_WORDS = frozenset("INSERT UPDATE DELETE MERGE INTO CREATE ALTER DROP TRUNCATE COPY CALL DO EXECUTE PREPARE GRANT REVOKE VACUUM ANALYZE REFRESH LOCK RESET".split())
 _QUERY_WORDS = frozenset(("SELECT", "WITH", "VALUES", "TABLE"))
+_DML_WORDS = frozenset(("INSERT", "UPDATE", "DELETE", "MERGE"))
+_NATIVE_VALUE_WORDS = _QUERY_WORDS | {"INSERT"}
 _DUCK_EXTERNAL = frozenset(("COPY", "EXPORT", "IMPORT", "ATTACH", "DETACH", "LOAD", "INSTALL", "EXTENSION", "PREPARE", "EXECUTE", "CALL"))
 _UNSAFE_FUNCTIONS = frozenset(("set_config", "nextval", "setval", "pg_notify", "pg_stat_file", "pg_file_rename", "pg_file_unlink", "pg_file_write", "pg_promote", "http", "system", "shell", "exec"))
 _UNSAFE_PREFIXES = ("lo_", "dblink", "http_", "pg_read_", "pg_write_", "pg_ls_", "pg_advisory_", "pg_try_advisory_", "pg_log_", "pg_logical_", "pg_replication_", "pg_create_", "pg_drop_", "pg_backup_", "pg_wal_", "pg_stat_reset", "pg_reload_", "pg_rotate_", "pg_terminate_", "pg_cancel_", "pg_switch_")
@@ -63,6 +65,50 @@ def _page_read_by_default(words):
     locks = (["UPDATE"], ["NO", "KEY", "UPDATE"], ["SHARE"], ["KEY", "SHARE"])
     return not any(words[i + 1:i + 1 + len(clause)] == clause
                    for i, word in enumerate(words) if word == "FOR" for clause in locks)
+
+
+def _observable_native_read(words):
+    """Classify successful native results for completion, not for query guards."""
+    if not words or words[0] not in _QUERY_WORDS or "INTO" in words:
+        return False
+    if "WITH" not in words:
+        return True
+    for i, word in enumerate(words):
+        if word in _DML_WORDS:
+            if word == "UPDATE" and (words[i - 1:i] == ["FOR"]
+                                     or words[max(0, i - 3):i] == ["FOR", "NO", "KEY"]):
+                continue  # A row lock, not a modifying CTE.
+            return False
+    return True
+
+
+def _observable_insert_returning(tokens):
+    # Only plain INSERT, not a CTE, upsert or an INSERT OR REPLACE variant.
+    if [token.text.upper() for token in tokens[:2]] != ["INSERT", "INTO"]:
+        return False
+    depth = 0
+    returning = False
+    for i in range(2, len(tokens)):
+        token = tokens[i]
+        text = token.text.upper()
+        if token.kind == "word":
+            if text in _DML_WORDS or text == "CONFLICT":
+                return False
+            if text == "RETURNING" and depth == 0:
+                returning = True
+        if returning:
+            # OLD can denote a previous row even when quoted, parenthesized,
+            # expanded with .*, or renamed by RETURNING WITH (OLD AS ...).
+            if text in {"OLD", '"OLD"'} or token.kind == "parameter":
+                return False
+            # Do not try to decode PostgreSQL U&"..." identifiers as aliases.
+            if text == "U" and i + 1 < len(tokens) and tokens[i + 1].text == "&":
+                return False
+        if text == "(":
+            depth += 1
+        elif text == ")":
+            depth -= 1
+    return returning
 
 
 def _pg_previewable(con, words, tokens):
@@ -111,7 +157,7 @@ def _pg_fetch_page(cursor, sql, cap, offset):
                 control.execute(f"CLOSE {name}")
 
 
-def _pg_result(con, sql, cap, *, server_cursor, offset):
+def _pg_result(con, sql, cap, *, server_cursor, offset, origin_index):
     with con.cursor() as cursor:
         if server_cursor:
             _pg_fetch_page(cursor, sql, cap, offset)
@@ -119,6 +165,14 @@ def _pg_result(con, sql, cap, *, server_cursor, offset):
             cursor.execute(sql, prepare=False)
         if cursor.description:
             columns = [column.name for column in cursor.description]
+            result = cursor.pgresult
+            if result is not None and origin_index:
+                # Only positive relation/attribute pairs from discovery are in
+                # the index. Zero, system columns and unknown pairs miss it.
+                origins = tuple(origin_index.get((result.ftable(i), result.ftablecol(i)))
+                                for i in range(len(columns)))
+            else:
+                origins = (None,) * len(columns)
             dtypes = []
             for column in cursor.description:
                 info = con.adapters.types.get(column.type_code)
@@ -128,8 +182,9 @@ def _pg_result(con, sql, cap, *, server_cursor, offset):
             rows = [list(row) for row in buffered[:cap]]
         else:
             columns, dtypes, rows = [], [], []
+            origins = ()
             total = max(0, cursor.rowcount)
-        return columns, dtypes, rows, total, cursor.statusmessage or "OK"
+        return columns, dtypes, rows, total, cursor.statusmessage or "OK", origins
 
 
 def _pg_explain(con, sql):
@@ -183,6 +238,9 @@ def execute_sql(source: DataSource, sql: str, *, max_rows=10000, readonly=False,
     retaining an open transaction between pages or rewriting the query.
     ``page_reads`` selects guarded paging for reads while preserving native
     writes and caller-owned transactions. ``readonly`` always requires a read.
+    Results report the applied guard in ``readonly`` and whether the rows are
+    eligible for value observation in ``can_observe_values``. PostgreSQL also
+    reports per-column ``origins`` from its live catalog and result metadata.
 
     Read-only PostgreSQL transactions are database protection, not a sandbox for
     privileged server extensions or arbitrary side effects of installed functions.
@@ -340,29 +398,57 @@ def _execute_statement(source, sql, *, max_rows, readonly, timeout, explain=Fals
                 else:
                     count = _cursor_to_csv(source.con.sql(sql), csv_writer, cap, expired)
                 return {"total": count}
+            backend_result = {}
             if source.kind == "postgres-live":
+                # Native commands can change the meaning of an OID/attribute
+                # pair before the next catalog discovery, even outside Session.
+                if (first in {"ALTER", "CREATE", "DROP", "DO", "CALL", "DISCARD",
+                              "COMMIT", "END", "ROLLBACK", "ABORT"}
+                        or (first in _QUERY_WORDS and "INTO" in words)):
+                    source._pg_origin_catalog = None
+                origin_index = None
+                if source._pg_origin_catalog is not None:
+                    con, datasets, index = source._pg_origin_catalog
+                    if con is source.con and datasets is source.datasets:
+                        origin_index = index
+                # A session with legacy backslash quoting may disagree with
+                # the lexer about what is SQL versus string text. No lookup:
+                # libpq already tracks the setting at the start of execution.
+                native_syntax = (not readonly and not user_transaction and first in _NATIVE_VALUE_WORDS
+                                 and source.con.info.parameter_status("standard_conforming_strings") == "on")
                 server_cursor = readonly or _pg_previewable(source.con, words, tokens)
                 # Never use WITH HOLD (commit would spool the remaining rows),
                 # nor a savepoint that would mask an error in the user's transaction.
                 transaction = source.con.transaction() if server_cursor and not (readonly or user_transaction) else nullcontext()
                 with transaction:
-                    columns, dtypes, rows, total, status = _pg_result(
-                        source.con, sql, cap, server_cursor=server_cursor, offset=offset)
+                    columns, dtypes, rows, total, status, origins = _pg_result(
+                        source.con, sql, cap, server_cursor=server_cursor, offset=offset, origin_index=origin_index)
                 pageable = server_cursor and not user_transaction
+                backend_result["origins"] = origins
+                native_result = native_syntax and not transaction_open(source)
+                native_read = native_result and (server_cursor or status.startswith("SELECT "))
+                native_insert = native_result and status.startswith("INSERT ") and source.con.autocommit
             else:
                 columns, dtypes, rows, total, status = _duck_result(source.con, sql, cap, statement_type, offset)
                 pageable = statement_type == "SELECT" and not user_transaction
+                native_read = statement_type == "SELECT"
+                native_insert = statement_type == "INSERT"
                 if statement_type == "TRANSACTION" and not readonly:
                     if first in {"BEGIN", "START"}:
                         source._transaction = True
                     elif first in {"COMMIT", "END", "ROLLBACK", "ABORT"}:
                         source._transaction = False
+            can_observe_values = bool(columns) and not user_transaction and (
+                own_transaction or (native_read and _observable_native_read(words))
+                or (native_insert and _observable_insert_returning(tokens))
+            )
             if expired.is_set():
                 raise EngineError("Query deadline exceeded")
             schema_changed = not readonly and (first in {"CREATE", "ALTER", "DROP", "COMMENT", "GRANT", "REVOKE", "SECURITY", "DO", "CALL", "COMMIT", "END", "ROLLBACK", "ABORT"})
             return {"columns": columns, "dtypes": dtypes, "rows": rows, "total": total,
                     "ms": (perf_counter() - started) * 1000, "sql": sql,
-                    "status": status, "schema_changed": schema_changed, "pageable": pageable}
+                    "status": status, "schema_changed": schema_changed, "pageable": pageable,
+                    "readonly": own_transaction, "can_observe_values": can_observe_values, **backend_result}
         except EngineError:
             raise
         except Exception as exc:

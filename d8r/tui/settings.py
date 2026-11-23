@@ -187,8 +187,8 @@ class SettingsScreen(ModalScreen[None]):
             "menus": "Show or hide workspace panes without changing your document.",
             "theme": "Choose a palette with Enter or a click. Colors change immediately and are saved for next time. "
                      "Nord is the default palette.",
-            "values": "The schema explorer caches explicitly requested column values in memory. "
-                      "Completion uses cached metadata only and never queries while typing. "
+            "values": "Completion uses bounded samples from query results and explicit distinct reads. "
+                      "Only Ctrl+Space or explorer inspection can fetch missing values. "
                       "Values never go to disk and are cleared at exit. Changing these settings clears cached values.",
             "sources": "Connect PostgreSQL, Cloudflare D1 or a local Parquet file. SQL dialect and engine version follow the selected source.",
             "workspace": "Create a dbt project with the setup assistant, or enable dbt for this data source to open an existing project. Disabling dbt suspends project files and tooling without deleting drafts or settings.",

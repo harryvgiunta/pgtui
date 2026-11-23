@@ -340,6 +340,113 @@ def test_postgres_capped_writes_and_volatile_calls_complete_once(postgres_source
     assert execute_sql(source, "SELECT count(*) FROM changes")["rows"] == [[10]]
 
 
+def test_postgres_result_origins_follow_native_ordinals(postgres_source, monkeypatch):
+    import psycopg
+
+    source = postgres_source
+    execute_sql(source, 'CREATE TEMP TABLE origin_items (discard_me int, "MixedCase" int, label text)')
+    execute_sql(source, 'ALTER TABLE origin_items DROP COLUMN discard_me')
+    execute_sql(source, "INSERT INTO origin_items VALUES (1, 'seed')")
+    execute_sql(source, 'CREATE TEMP VIEW origin_view AS SELECT "MixedCase" AS "ViewCol" FROM origin_items')
+    refresh_source_schema(source)
+    table = next(key for key in source.datasets if key.endswith('."origin_items"'))
+    view = next(key for key in source.datasets if key.endswith('."origin_view"'))
+    # Use the driver to create an unmapped relation without replacing the live snapshot.
+    source.con.execute("CREATE TEMP TABLE origin_late AS SELECT 8 AS n")
+
+    sent = []
+    original_execute = psycopg.Cursor.execute
+
+    def record(cursor, query, *args, **kwargs):
+        sent.append(query)
+        return original_execute(cursor, query, *args, **kwargs)
+
+    monkeypatch.setattr(psycopg.Cursor, "execute", record)
+    fetched = execute_sql(source, 'SELECT t."MixedCase" AS same, v."ViewCol" AS same, '
+                          "t.label || '' AS same, t.ctid AS same, x.n AS same "
+                          'FROM origin_items t CROSS JOIN origin_view v CROSS JOIN origin_late x',
+                          page_reads=True)
+    assert fetched["columns"] == ["same"] * 5
+    assert fetched["origins"] == ((table, "MixedCase"), (view, "ViewCol"), None, None, None)
+    assert fetched["status"] == "FETCH 1"
+    assert fetched["readonly"] and fetched["can_observe_values"]
+    assert [query.split()[0] for query in sent] == ["BEGIN", "SELECT", "DECLARE", "FETCH", "CLOSE"]
+
+    sent.clear()
+    sql = ("INSERT INTO origin_items VALUES (2, 'new') "
+           'RETURNING label AS same, "MixedCase" AS same, "MixedCase" + 1 AS same')
+    returned = execute_sql(source, sql, page_reads=True)
+    assert returned["columns"] == ["same"] * 3 and returned["rows"] == [["new", 2, 3]]
+    assert returned["origins"] == ((table, "label"), (table, "MixedCase"), None)
+    assert not returned["readonly"] and returned["can_observe_values"]
+    assert sent == [sql]
+
+
+def test_postgres_result_origins_require_current_discovery(postgres_source):
+    source = postgres_source
+    execute_sql(source, "CREATE TEMP TABLE origin_rename (n int)")
+    refresh_source_schema(source)
+    table = next(key for key in source.datasets if key.endswith('."origin_rename"'))
+    assert execute_sql(source, "TABLE origin_rename")["origins"] == ((table, "n"),)
+    source.datasets = dict(source.datasets)
+    assert execute_sql(source, "TABLE origin_rename")["origins"] == (None,)
+
+    refresh_source_schema(source)
+    assert execute_sql(source, "TABLE origin_rename")["origins"] == ((table, "n"),)
+    execute_sql(source, 'ALTER TABLE origin_rename RENAME COLUMN n TO "NewName"')
+    assert execute_sql(source, "TABLE origin_rename")["origins"] == (None,)
+    refresh_source_schema(source)
+    assert execute_sql(source, "TABLE origin_rename")["origins"] == ((table, "NewName"),)
+
+
+def test_postgres_value_observation_respects_command_and_transaction(postgres_source):
+    source = postgres_source
+    execute_sql(source, "CREATE TEMP TABLE observable_rows (n int PRIMARY KEY)")
+    assert not execute_sql(source, "INSERT INTO observable_rows VALUES (1)")["can_observe_values"]
+    for sql in ("SELECT n FROM observable_rows", "TABLE observable_rows", "VALUES (1)",
+                "WITH r AS (SELECT n FROM observable_rows) SELECT n FROM r",
+                "SELECT n FROM observable_rows FOR UPDATE"):
+        result = execute_sql(source, sql)
+        assert not result["readonly"] and result["can_observe_values"]
+
+    for sql in ("WITH put AS (INSERT INTO observable_rows VALUES (2) RETURNING n) SELECT n FROM put",
+                "SELECT n INTO TEMP TABLE observable_copy FROM observable_rows",
+                "UPDATE observable_rows SET n = 3 WHERE n = 2 RETURNING n",
+                "INSERT INTO observable_rows VALUES (1) ON CONFLICT (n) DO UPDATE SET n = 1 RETURNING n",
+                "DELETE FROM observable_rows WHERE n = 3 RETURNING n"):
+        result = execute_sql(source, sql)
+        assert not result["readonly"] and not result["can_observe_values"]
+
+    execute_sql(source, "BEGIN")
+    for sql in ("INSERT INTO observable_rows VALUES (4) RETURNING n", "TABLE observable_rows"):
+        result = execute_sql(source, sql, page_reads=True)
+        assert not result["readonly"] and not result["can_observe_values"]
+    execute_sql(source, "ROLLBACK")
+    assert execute_sql(source, "TABLE observable_rows")["rows"] == [[1]]
+
+
+@pytest.mark.parametrize("projection", ["old.n", '"old".n', "(old).n", "WITH (OLD AS prior) prior.n",
+                                        r'U&"ol\0064".n'])
+def test_postgres_insert_old_values_are_not_observable(postgres_source, projection):
+    source = postgres_source
+    if source.con.info.server_version < 180000:
+        pytest.skip("RETURNING OLD and NEW were added in PostgreSQL 18")
+    execute_sql(source, "CREATE TEMP TABLE observable_old (n int)")
+    result = execute_sql(source, f"INSERT INTO observable_old VALUES (1) RETURNING {projection}")
+    assert result["rows"] == [[None]]
+    assert not result["readonly"] and not result["can_observe_values"]
+
+
+def test_postgres_insert_can_observe_explicit_new_values(postgres_source):
+    source = postgres_source
+    if source.con.info.server_version < 180000:
+        pytest.skip("RETURNING OLD and NEW were added in PostgreSQL 18")
+    execute_sql(source, "CREATE TEMP TABLE observable_new (n int)")
+    result = execute_sql(source, "INSERT INTO observable_new VALUES (1) RETURNING WITH (NEW AS fresh) fresh.n")
+    assert result["rows"] == [[1]]
+    assert not result["readonly"] and result["can_observe_values"]
+
+
 def test_postgres_preview_does_not_own_user_transaction(postgres_source):
     source = postgres_source
     execute_sql(source, "BEGIN")

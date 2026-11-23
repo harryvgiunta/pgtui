@@ -185,8 +185,13 @@ async def test_where_values_are_bounded_on_demand_and_undoable(request, source_f
 
 
 @async_test
-async def test_where_real_edit_fetches_without_explorer(parquet_source):
+async def test_where_real_edit_is_offline_and_uses_executed_values(parquet_source, monkeypatch):
     session = Session({parquet_source.id: parquet_source})
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Typing a predicate must not query distinct values")
+
+    monkeypatch.setattr("d8r.tui.session.column_values", forbidden)
     app = D8RApp(session)
     async with app.run_test(size=(150, 48)) as pilot:
         text = "SELECT * FROM data d WHERE d.label = "
@@ -196,9 +201,21 @@ async def test_where_real_edit_fetches_without_explorer(parquet_source):
         await pilot.pause()
         await app.workers.wait_for_complete()
         await pilot.pause()
-        assert any(entry.kind == "value" and entry.insert == "'alpha'" for entry in app.palette.view.entries)
-        assert app.editor.text == text + "'a"
+        assert session.cached_values(parquet_source, "data", "label") is None
         assert not session.history
+
+        await load_sql(app, pilot, "SELECT label AS s FROM data WHERE id = 2")
+        await pilot.press("f5")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert session.history[0].rows == 1
+
+        text = "WITH q AS (SELECT label FROM data) SELECT * FROM q WHERE q.label = "
+        await load_sql(app, pilot, text)
+        await pilot.press("'", "b")
+        await pilot.pause()
+        assert any(entry.kind == "value" and entry.insert == "'beta'" for entry in app.palette.view.entries)
+        assert app.editor.text == text + "'b"
 
 
 def test_typed_functions_persist_and_quality_install_is_atomic(parquet_source, tmp_path, monkeypatch):

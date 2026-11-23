@@ -38,6 +38,10 @@ class DataSource:
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
     _transaction: bool = field(default=False, repr=False, compare=False)
     routines: tuple[RoutineDef, ...] = ()
+    # Origins belong to this exact live connection and discovery snapshot.
+    _pg_origin_catalog: tuple[object, dict[str, dict], dict[tuple[int, int], tuple[str, str]]] | None = field(
+        default=None, init=False, repr=False, compare=False,
+    )
 
 
 def load() -> dict[str, DataSource]:
@@ -185,7 +189,7 @@ SELECT c.oid, n.nspname, c.relname, obj_description(c.oid, 'pg_class'),
        (SELECT pg_catalog.array_agg(e.enumlabel::text ORDER BY e.enumsortorder)
         FROM pg_catalog.pg_enum e
         WHERE e.enumtypid = CASE WHEN column_type.typtype = 'd'
-                               THEN column_type.typbasetype ELSE a.atttypid END)
+                               THEN column_type.typbasetype ELSE a.atttypid END), c.relkind, a.attnum
 FROM pg_catalog.pg_class c
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
@@ -301,12 +305,14 @@ def _duckdb_routines(con) -> tuple[RoutineDef, ...]:
 
 def refresh_source_schema(source: DataSource) -> None:
     with source._lock:
+        source._pg_origin_catalog = None
         if source.con is None:
             source.datasets, source.routines = {}, ()
             return
         try:
             datasets = {}
             routines = ()
+            origin_index = None
             if source.kind == "d1-live":
                 with source.con.operation() as operation:
                     datasets = source.con.schema(operation)
@@ -314,17 +320,19 @@ def refresh_source_schema(source: DataSource) -> None:
                 return
             if source.kind == "postgres-live":
                 by_oid = {}
+                origin_index = {}
                 # A savepoint inside an existing transaction isolates discovery
                 # failures without committing or rolling back the user's work.
                 with source.con.transaction(), source.con.cursor() as cursor:
                     cursor.execute(_PG_COLUMNS)
-                    for oid, namespace, name, doc, column, dtype, column_doc, temporary, enum_values in cursor:
+                    for oid, namespace, name, doc, column, dtype, column_doc, temporary, enum_values, kind, attnum in cursor:
                         key = relation_name(namespace, name)
                         item = datasets.setdefault(key, {"columns": [], "doc": doc or "", "rows": None,
                                                           "foreign_keys": [], "temp": bool(temporary)})
                         if column is not None:
                             item["columns"].append(ColumnDef(column, dtype, column_doc or "",
                                                              tuple(enum_values) if enum_values is not None else None))
+                            origin_index[oid, attnum] = (key, column)
                         by_oid[oid] = item
                     cursor.execute(_PG_FKS)
                     keys = {}
@@ -355,6 +363,8 @@ def refresh_source_schema(source: DataSource) -> None:
                 item["columns"] = tuple(item["columns"])
                 item["foreign_keys"] = tuple(item["foreign_keys"])
             source.datasets, source.routines = datasets, routines
+            if origin_index is not None:
+                source._pg_origin_catalog = (source.con, datasets, origin_index)
         except EngineError:
             raise
         except Exception as exc:
@@ -385,6 +395,7 @@ def _discard_connection(source: DataSource) -> None:
     """Retire an unusable handle under the source lock. Do not cancel or retry."""
     con, source.con = source.con, None
     source._transaction = False
+    source._pg_origin_catalog = None
     if con is not None:
         try:
             con.close()
@@ -480,6 +491,7 @@ def close_source(source: DataSource) -> None:
     with source._lock:
         con, source.con = source.con, None
         source._transaction = False
+        source._pg_origin_catalog = None
         if con is not None:
             try:
                 con.close()

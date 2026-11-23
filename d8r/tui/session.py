@@ -11,17 +11,24 @@ from __future__ import annotations
 import json
 import re
 import time
-from collections.abc import Iterator
+from collections import OrderedDict
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
+from datetime import date, datetime, time as clock_time
+from decimal import Decimal
+from itertools import chain
+from math import isfinite
 from pathlib import Path
+from sys import getsizeof
 from threading import Event, RLock
 from typing import TextIO
 from uuid import UUID, uuid4
 
 from d8r.ai.client import AIConfig
 from d8r.completion.context import analyze
+from d8r.completion.lineage import projection_origins
 from d8r.credentials import CredentialError
 from d8r.dbt import DbtError, DbtProject, has_query_jinja
 
@@ -40,6 +47,49 @@ from d8r.schema_cache import SchemaCacheStore, SchemaSnapshot, capture_schema
 
 PREVIEW_ROW_CAP = 10000
 """Maximum buffered preview rows; never an implicit SQL LIMIT or full count."""
+
+# A preview must not retain arbitrarily wide objects after its grid closes.
+_SAMPLE_CACHE_BYTES = 4 * 1024 * 1024
+_SAMPLE_COLUMN_BYTES = 256 * 1024
+_SAMPLE_CELL_BYTES = 4096
+_SAMPLE_COLUMNS = 256
+_SAMPLE_TYPES = frozenset((type(None), bool, int, float, Decimal, str, bytes,
+                           date, datetime, clock_time))
+_ValueKey = tuple[str, str, str]
+_Values = tuple[list[object], bool]
+
+
+@dataclass(frozen=True)
+class _ValueSample:
+    result: _Values
+    size: int
+
+
+def _sample_values(values: Iterable[object], limit: int, budget: int, capped: bool) -> _ValueSample:
+    retained: list[object] = []
+    seen: set[tuple[type, object]] = set()
+    size = 0
+    for value in values:
+        kind = type(value)
+        if kind not in _SAMPLE_TYPES:
+            continue  # Unsupported literal types, including mutable row objects.
+        cost = getsizeof(value) + 8  # Scalar and list slot.
+        if cost > _SAMPLE_CELL_BYTES:
+            capped = True
+            continue
+        if ((kind is float and not isfinite(value)) or (kind is Decimal and not value.is_finite())
+                or (kind is str and "\x00" in value)):
+            continue
+        key = (kind, value)
+        if key in seen:
+            continue
+        if len(retained) == limit or size + cost > budget:
+            capped = True
+            break
+        retained.append(value)
+        seen.add(key)
+        size += cost
+    return _ValueSample((retained, capped), size)
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +214,9 @@ class Session:
         # connection until its real work finishes. Headless
         # callers keep the synchronous run API and need no reservation.
         self.busy: str = ""
-        self._value_cache: dict[tuple[str, str, str], tuple[DataSource, tuple[list[object], bool]]] = {}
+        self._value_cache: dict[_ValueKey, tuple[DataSource, _Values]] = {}
+        self._value_samples: OrderedDict[_ValueKey, tuple[DataSource, _ValueSample]] = OrderedDict()
+        self._value_sample_bytes = 0
         self._value_cache_lock = RLock()
         self.value_cache_epoch = 0
         # Definitions load without parsing bodies or connecting to their source.
@@ -1055,27 +1107,47 @@ class Session:
 
     @property
     def cached_value_columns(self) -> int:
-        """The number of successful column reads retained only in memory."""
+        """The number of columns with in-memory samples or distinct reads."""
         with self._value_cache_lock:
-            return len(self._value_cache)
+            return len(self._value_cache.keys() | self._value_samples.keys())
 
     def clear_value_cache(self, source_id: str | None = None) -> None:
         """Forget values and prevent reads already in flight from republishing them."""
         with self._value_cache_lock:
             if source_id is None:
                 self._value_cache.clear()
+                self._value_samples.clear()
+                self._value_sample_bytes = 0
             else:
                 target = self.source_key(source_id)
                 self._value_cache = {
                     key: entry for key, entry in self._value_cache.items()
                     if key[0] != target
                 }
+                for key in tuple(self._value_samples):
+                    if key[0] == target:
+                        self._forget_value_sample(key)
             self.value_cache_epoch += 1
 
-    def cached_values(
-        self, source: DataSource, dataset: str, column: str,
-    ) -> tuple[list[object], bool] | None:
-        """Read the shared typed value cache without touching a connection."""
+    def _forget_value_sample(self, key: _ValueKey) -> None:
+        entry = self._value_samples.pop(key, None)
+        if entry is not None:
+            self._value_sample_bytes -= entry[1].size
+
+    def cached_values(self, source: DataSource, dataset: str, column: str) -> _Values | None:
+        """Read completion values without touching a connection."""
+        with self._value_cache_lock:
+            if not self.value_cache_enabled:
+                return None
+            key = (self._source_identity(source), dataset, column)
+            sample = self._value_samples.get(key)
+            if sample is not None and sample[0].dialect == source.dialect:
+                return sample[1].result
+            entry = self._value_cache.get(key)
+            return None if entry is None or entry[0].dialect != source.dialect else entry[1]
+
+    def cached_distinct_values(self, source: DataSource, dataset: str, column: str) -> _Values | None:
+        """Only explicit distinct reads satisfy the explorer's column inspection."""
         with self._value_cache_lock:
             if not self.value_cache_enabled:
                 return None
@@ -1089,7 +1161,7 @@ class Session:
         with self._value_cache_lock:
             if epoch is not None and epoch != self.value_cache_epoch:
                 raise EngineError("Value cache changed before this read started.")
-            cached = self.cached_values(source, dataset, column)
+            cached = self.cached_distinct_values(source, dataset, column)
             if cached is not None:
                 return cached
             limit = self.value_cache_limit
@@ -1099,8 +1171,53 @@ class Session:
         with self._value_cache_lock:
             if (enabled and self.value_cache_enabled and epoch == self.value_cache_epoch
                     and self.sources.get(source.id) is source):
-                self._value_cache[(self._source_identity(source), dataset, column)] = (source, values)
+                key = (self._source_identity(source), dataset, column)
+                self._value_cache[key] = (source, values)
+                self._forget_value_sample(key)
         return values
+
+    def _observe_result_values(self, source: DataSource, outcome: RunOutcome,
+                               origins: tuple[tuple[str, str] | None, ...], catalog: dict,
+                               *, epoch: int, limit: int) -> None:
+        if len(origins) != len(outcome.columns):
+            return
+        identity = self._source_identity(source)
+        slots: dict[_ValueKey, list[int]] = {}
+        for ordinal, origin in enumerate(origins):
+            if origin is not None:
+                slots.setdefault((identity, *origin), []).append(ordinal)
+        with self._value_cache_lock:
+            if self.value_cache_epoch != epoch:
+                return
+            distinct = {key: self._value_cache[key] for key in slots if key in self._value_cache}
+
+        # Build from the buffered rows outside the lock, in row/ordinal order.
+        # Keep previous explicit reads available after the new observations.
+        budget = _SAMPLE_CACHE_BYTES
+        samples = {}
+        for key, ordinals in slots.items():
+            previous = distinct.get(key)
+            values, capped = previous[1] if previous and previous[0].dialect == source.dialect else ((), False)
+            observed = (row[i] for row in outcome.rows for i in ordinals)
+            sample = _sample_values(chain(observed, values), limit, min(budget, _SAMPLE_COLUMN_BYTES),
+                                    outcome.capped or capped)
+            if sample.result[0]:
+                samples[key] = sample
+                budget -= sample.size
+                if not budget or len(samples) == _SAMPLE_COLUMNS:
+                    break
+        with self._value_cache_lock:
+            if (not self.value_cache_enabled or self.value_cache_epoch != epoch
+                    or self.sources.get(source.id) is not source or source.datasets is not catalog):
+                return
+            for key, sample in samples.items():
+                self._forget_value_sample(key)
+                while (len(self._value_samples) >= _SAMPLE_COLUMNS
+                       or self._value_sample_bytes + sample.size > _SAMPLE_CACHE_BYTES):
+                    _, (_, evicted) = self._value_samples.popitem(last=False)
+                    self._value_sample_bytes -= evicted.size
+                self._value_samples[key] = (source, sample)
+                self._value_sample_bytes += sample.size
 
 
     # -- building sources (the add-source modal's engine edge) --------------
@@ -1264,6 +1381,10 @@ class Session:
         source = self.source if source is None else source
         if size is None:
             size = min(self.default_rows or PREVIEW_ROW_CAP, PREVIEW_ROW_CAP)
+        catalog = source.datasets
+        with self._value_cache_lock:
+            value_epoch = self.value_cache_epoch if self.value_cache_enabled else None
+            value_limit = self.value_cache_limit
         try:
             result = execute_sql(source, sql, max_rows=size, readonly=readonly, offset=offset, page_reads=page_reads)
         except Exception as exc:
@@ -1272,8 +1393,15 @@ class Session:
                 self.refresh_schema()
             return RunOutcome(status=message, error=message, source=source.id,
                               dialect=source.dialect, sql=sql, doc=doc)
-        if not readonly and not result["schema_changed"]:
-            self.clear_value_cache(self._source_identity(source))
+        publish_epoch = None
+        if not result["schema_changed"]:
+            with self._value_cache_lock:
+                if self.sources.get(source.id) is source:
+                    current = value_epoch == self.value_cache_epoch
+                    if not result.get("readonly", readonly):
+                        self.clear_value_cache(source.id)
+                    if current and source.datasets is catalog:
+                        publish_epoch = self.value_cache_epoch
         schema_warning = ""
         if result["schema_changed"]:
             try:
@@ -1282,7 +1410,8 @@ class Session:
             except Exception as exc:
                 # The SQL already succeeded; a metadata failure must not invite
                 # retrying a write or conceal its successful result/history.
-                self.clear_value_cache(self._source_identity(source))
+                if self.sources.get(source.id) is source:
+                    self.clear_value_cache(source.id)
                 schema_warning = "schema not refreshed: " + self.execution_error(
                     exc, operation="Schema refresh",
                 )
@@ -1296,6 +1425,13 @@ class Session:
         outcome.status = " · ".join(part for part in (
             result["status"], self._status_for(outcome), schema_warning,
         ) if part)
+        if publish_epoch is not None and outcome.rows and result.get("can_observe_values"):
+            origins = result.get("origins")
+            if origins is None and source.dialect in {"sqlite", "duckdb"}:
+                origins = projection_origins(outcome.sql, source.dialect, catalog, outcome.columns)
+            if origins is not None:
+                self._observe_result_values(source, outcome, origins, catalog,
+                                            epoch=publish_epoch, limit=value_limit)
         if record:
             self._record_history(HistoryEntry(
                 at=time.strftime("%Y-%m-%d %H:%M:%S%z"), source=source.id,

@@ -225,7 +225,6 @@ class CommandPalette(OptionList):
         self._last_document = ""
         self._edit_serial = 0
         self._accepting = False
-        self._values_snapshot: tuple | None = None
         self._close_generation = 0
 
     @property
@@ -323,8 +322,6 @@ class CommandPalette(OptionList):
                  and serial > getattr(editor, "programmatic_edit_serial", 0))
         self._edit_serial = serial
         self.cancel_ai()
-        self._values_snapshot = (self._snapshot() if self.local_completion is None
-                                 and typed and not self._accepting and self._eligible() else None)
         self.queue_sync()
         if typed and not self._accepting and self.session.ai_completion and self._eligible(ai=True):
             self.request_ai(automatic=True)
@@ -351,7 +348,6 @@ class CommandPalette(OptionList):
 
     def sync(self, *, manual: bool = False) -> None:
         self._sync_pending = False
-        values_snapshot, self._values_snapshot = self._values_snapshot, None
         self._guard_ai()
         editor = self.editor
         if editor is None:
@@ -384,9 +380,8 @@ class CommandPalette(OptionList):
             view = view_for(self.session, editor.text, line, column, parameters=self._parameters(),
                             row=row, query_history=self.workspace_actions, manual=manual,
                             commands_only=self._sql_muted or getattr(editor, "dbt_template", False))
-            if (view is not None and view.phase == "argument" and view.value_field is not None
-                    and not self.session.busy and self.session.value_cache_enabled
-                    and (manual or values_snapshot is not None and values_snapshot == self._snapshot())):
+            if (manual and view is not None and view.phase == "argument" and view.value_field is not None
+                    and not self.session.busy and self.session.value_cache_enabled):
                 value_field = view.value_field
                 source = self.session.source
                 if (value_field.table and value_field.column
@@ -430,7 +425,7 @@ class CommandPalette(OptionList):
         return self.local_completion is None and self._eligible() and self._snapshot() == snapshot
 
     def values_ready(self, snapshot: tuple, source, table: str, column: str) -> bool:
-        """Publish a finished cache read after typing, but never after retarget/dismissal."""
+        """Publish an explicit read even if typing continued, never after retarget/dismissal."""
         if self.local_completion is not None or not self._eligible():
             return False
         current = self._snapshot()
@@ -447,7 +442,6 @@ class CommandPalette(OptionList):
         field = context.value_field
         if context.blocked or field is None or (field.table, field.column) != (table, column):
             return False
-        self._values_snapshot = None
         self.sync()
         return True
 
@@ -645,7 +639,6 @@ class CommandPalette(OptionList):
 
     def close(self) -> None:
         self._close_generation += 1
-        self._values_snapshot = None
         self.cancel_ai()
         self._hide()
 

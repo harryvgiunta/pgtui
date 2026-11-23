@@ -2682,7 +2682,7 @@ class D8RApp(App):
     def _inspect_column(self, node) -> None:
         source = self.session.source
         data = node.data
-        cached = self.session.cached_values(source, data["dataset"], data["name"])
+        cached = self.session.cached_distinct_values(source, data["dataset"], data["name"])
         if cached is not None:
             self._render_distinct_values(node, *cached)
             return
@@ -2698,10 +2698,10 @@ class D8RApp(App):
         )
 
     async def _column_values(self, source: DataSource, dataset: str, column: str) -> tuple[list[object], bool]:
-        """One in-flight explicit explorer request per source/column."""
+        """One in-flight explicit distinct request per source/column."""
         if self._closing or self.session.sources.get(source.id) is not source:
             raise RuntimeError("The value source has changed.")
-        cached = self.session.cached_values(source, dataset, column)
+        cached = self.session.cached_distinct_values(source, dataset, column)
         if cached is not None:
             return cached
         key = (id(source), dataset, column, self.session.value_cache_epoch)

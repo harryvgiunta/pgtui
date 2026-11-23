@@ -21,6 +21,7 @@ import httpx
 
 from d8r.sql import ColumnDef, ForeignKey, cte_declarations, lex_sql, relation_name
 from .datasources import DataSource, EngineError, _sql_error_message
+from .execute import _observable_insert_returning, _observable_native_read
 
 _API = "https://api.cloudflare.com/client/v4"
 MAX_RESPONSE_BYTES = 50_000_000
@@ -440,8 +441,13 @@ def execute_d1(source, sql, statement, *, cap, readonly, timeout, prepare_only=F
                     native += f" OFFSET {offset}"
             columns, rows, changes = con.raw(native, operation)
             total = min(len(rows), cap + 1) if columns else changes
+            guarded = bool(readonly)
+            can_observe_values = bool(columns) and (
+                guarded or _observable_native_read(words) or _observable_insert_returning(tokens)
+            )
             result = {"columns": columns, "dtypes": ["" for _ in columns], "rows": rows[:cap],
                       "total": total, "ms": (perf_counter() - started) * 1000, "sql": sql,
                       "status": first or "OK", "pageable": readonly,
+                      "readonly": guarded, "can_observe_values": can_observe_values,
                       "schema_changed": not readonly and first in {"CREATE", "ALTER", "DROP", "REINDEX"}}
         return result

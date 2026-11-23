@@ -443,17 +443,16 @@ older builds did not write a durable snapshot that could be recovered retroactiv
   same rule. Unknown or ambiguous input relations do not supply guessed columns.
   These suggestions use cached metadata only.
 - PostgreSQL enum/domain labels come from catalog metadata, without reading rows.
-  For other WHERE values, a real predicate edit or Ctrl+Space requests a bounded,
-  read-only `SELECT DISTINCT ... LIMIT ...` in the background if the column is not
-  cached. The value cache setting and per-column limit control these reads; values
-  remain memory-only and are reused offline within the same session, including
-  through an offline source handoff. Restart starts with no cached row values.
-  Reconnect, successful SQL execution, settings changes and Clear cache invalidate
-  value pools. Startup, document loads and caret-only movement never fetch values.
-  Busy connections do not block local suggestions. Pausing IntelliSense, blur, and
-  retargeting prevent late reads from reopening a popup; typing within the same
-  predicate uses its current literal. Explorer expansion shares the same cache and in-flight read.
-  Limits bound returned values, not scan cost.
+  Other predicate values can come from rows already returned by Run. Only proven
+  source columns contribute samples; aliases keep the source column identity.
+  Samples are bounded, source-scoped observations, not complete column domains.
+  On a cache miss, **Ctrl+Space** can request a bounded, read-only `SELECT DISTINCT`
+  in the background. Explorer expansion always uses an explicit distinct read,
+  never a filtered result sample. Typing, caret movement, tab switches and restore
+  never fetch values. Busy connections do not block cached suggestions.
+  Values stay in memory and are cleared at exit, on reconnect, on schema refresh,
+  after writes, and when the value cache settings change. **Clear cache** also
+  revokes in-flight value publications. Limits bound retained values, not scan cost.
 
 The popup shows kind, type, provenance and documentation. Long details and AI edit
 previews scroll with Alt+Up/Down while keyboard focus stays in the editor. Local
