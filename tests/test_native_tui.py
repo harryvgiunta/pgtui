@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from functools import wraps
+from textual import events
 from textual.widgets import Button, DataTable, Input, Select, Static, Tab, TabbedContent, TextArea
 
 from d8r.tui.add_source import AddSourceModal
@@ -96,6 +97,56 @@ async def test_sql_completion_run_results_and_multiple_tabs(parquet_source):
         assert "DuckDB" in str(app.query_one("#source-version", Static).content)
         footer = str(app.query_one("#status", Static).content)
         assert "3 results" in footer and "3 rows" not in footer
+
+
+@async_test
+async def test_source_menu_does_not_swallow_editor_or_run_clicks(parquet_source):
+    session = Session({parquet_source.id: parquet_source})
+    app = D8RApp(session)
+    async with app.run_test(size=(80, 24)) as pilot:
+        async def click_at(x, y):
+            # Textual's Pilot.click bypasses App's MouseDown/MouseUp synthesis.
+            for event in (events.MouseDown, events.MouseUp):
+                app.post_message(event(None, x, y, 0, 0, 1, False, False, False))
+                await pilot.pause()
+
+        picker = app.query_one("#source-select", Select)
+        editor = app.editor
+        editor.load_text("SELECT 42")
+        await pilot.pause()
+
+        await click_at(*picker.region.offset)
+        assert picker.expanded
+        await click_at(editor.region.x + editor.gutter.left + editor.gutter_width + 4,
+                       editor.region.y + editor.gutter.top)
+        assert not picker.expanded
+        assert app.focused is editor
+        assert editor.cursor_location == (0, 4)
+
+        await click_at(*picker.region.offset)
+        assert picker.expanded
+        run = app.query_one("#run-query", Button)
+        await click_at(*run.region.offset)
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        results = app.query_one("#results-table", ResultsTable)
+        assert not picker.expanded
+        assert session.active_id == parquet_source.id
+        assert results.raw_rows == ((42,),)
+
+        editor.load_text("SELECT 43")
+        await click_at(*picker.region.offset)
+        assert picker.expanded
+        await pilot.press("f5")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert not picker.expanded
+        assert app.focused is editor
+        assert results.raw_rows == ((43,),)
+
+        await click_at(*picker.region.offset)
+        await pilot.press("home", "enter")
+        assert isinstance(app.screen, AddSourceModal)
 
 
 @async_test

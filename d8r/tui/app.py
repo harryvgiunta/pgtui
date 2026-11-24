@@ -40,6 +40,7 @@ from textual.widgets import (
     TextArea,
     Tree,
 )
+from textual.widgets._select import SelectCurrent, SelectOverlay
 from textual.widgets.option_list import Option
 
 from d8r.ai.context import AIProposal
@@ -186,6 +187,20 @@ def dataset_label(name: str, rows: int | None) -> Text:
     """Remote schemas need not scan whole tables just to populate the explorer."""
     detail = "row count not loaded" if rows is None else f"{rows} rows"
     return Text.assemble((name, "bold"), "  ", (detail, "dim"))
+
+
+class _WorkspaceSourceOverlay(SelectOverlay):
+    def suppress_click(self) -> None:
+        # On blur, only suppress a click back on the trigger, which would reopen
+        # the menu. Clicks on the editor and toolbar must reach their targets.
+        if self.screen.focused is self.parent:
+            super().suppress_click()
+
+
+class _WorkspaceSourceSelect(Select[str | None]):
+    def compose(self) -> ComposeResult:
+        yield SelectCurrent(self.prompt)
+        yield _WorkspaceSourceOverlay(type_to_search=self._type_to_search).data_bind(compact=Select.compact)
 
 
 class HistoryPreview(Static):
@@ -365,13 +380,6 @@ class D8RApp(App):
             with Vertical(id="work-bench"):
                 with Vertical(id="editor-slot"):
                     with Vertical(id="query-header"):
-                        with Horizontal(id="query-targets"):
-                            yield Select(
-                                self._source_options(), allow_blank=False,
-                                value=self.session.active_id, id="source-select",
-                                tooltip="Switch source workspace",
-                            )
-                            yield Static("", id="source-version", markup=False)
                         with Horizontal(id="document-actions"):
                             yield Button("Run SQL", id="run-query", compact=True,
                                          tooltip=binding_tooltip(self.BINDINGS, "run") + " · Page reads; execute writes once")
@@ -382,6 +390,15 @@ class D8RApp(App):
                             yield Button("Ask AI", id="open-ai", compact=True)
                             yield Button("Show Page Details", id="page-details-toggle", compact=True)
                             yield Button("Reconnect", id="reconnect-source", compact=True)
+                        # Keep actions above the popup, and the left edge of the
+                        # editor clear when the right-aligned picker is open.
+                        with Horizontal(id="query-targets"):
+                            yield Static("", id="source-version", markup=False)
+                            yield _WorkspaceSourceSelect(
+                                self._source_options(), allow_blank=False,
+                                value=self.session.active_id, id="source-select",
+                                tooltip="Switch source workspace",
+                            )
                         yield PageDetails(self, id="page-details")
                         yield Static("", id="dbt-file-path", markup=False)
                     with Horizontal(id="editor-tools"):
@@ -1413,6 +1430,11 @@ class D8RApp(App):
             if paged_read is None:
                 self.function_editor.action_preview()
             return
+        picker = self.query_one("#source-select", Select)
+        if picker.expanded:
+            if picker.has_focus_within:
+                self.editor.focus(scroll_visible=False)
+            picker.expanded = False
         if not self._can_query_workspace():
             return
         dbt_home = self._dbt_home

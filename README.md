@@ -81,6 +81,10 @@ Statements execute in document order and stop at the first failure. PostgreSQL a
 DuckDB support explicit transactions; D1 does not keep transactions across HTTP
 requests. A failed statement does not undo earlier committed work.
 
+The workspace source picker sits on the right below the query toolbar. Clicking
+**Run SQL** or clicking in the editor outside the open menu dismisses the picker
+without swallowing the click.
+
 SQL failures include actionable hints for syntax, ambiguous references, missing
 objects, grouping, and type/function mismatches. PostgreSQL diagnostics retain a
 validated SQLSTATE and character position when available. Hints explain repairs
