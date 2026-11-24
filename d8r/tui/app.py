@@ -5,11 +5,13 @@ SQL expansion belongs to d8r.sql; the selected native engine owns grammar.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 from time import monotonic
 from collections.abc import Callable
 from copy import deepcopy
+from dataclasses import dataclass
 from threading import Event
 from pathlib import Path
 from typing import TypeVar
@@ -43,12 +45,15 @@ from textual.widgets.option_list import Option
 from d8r.ai.context import AIProposal
 from d8r.ai.dbt import DbtAIContext
 from d8r.completion.engine import function_insertion
-from d8r.dbt import DbtError, has_query_jinja
+from d8r.dbt import DbtCompileRequired, DbtError, has_query_jinja
 from d8r.dbt_edits import DbtDraft, add_description
 from d8r.dbt_files import DbtFile, DbtFiles, file_revision, reference_at
+from d8r.dbt_preview import dbt_preview_query
 from d8r.dbt_profiles import DbtTargetSettings
 from d8r.dbt_rename import DbtRenamePlan
-from d8r.dbt_run import DbtModelCommand, prepare_dbt_run
+from d8r.dbt_run import (DbtModelCommand, DbtRun, DbtRunResult, dbt_artifact_current,
+                         discover_dbt_project, prepare_dbt_run)
+from d8r.dbt_vars import PROJECT_YAML
 from d8r.engine import POSTGRES_VERSION, DataSource, EngineError, postgres_definition
 from d8r.sql import ColumnDef, format_parameters
 from d8r.themes import COZY_PASTEL
@@ -57,7 +62,8 @@ from .add_source import AddSourceModal
 from .catalog import (CatalogDefinitionScreen, DefinitionLink, add_catalog_groups, definition_leaf,
                       expand_catalog_group)
 from .connection import ConnectionProgress, build_saved_source, saved_source_label
-from .dbt import DbtExplorer, DbtModelScreen, DbtRenameScreen, DbtRunScreen, DbtTestScreen
+from .dbt import (DbtExplorer, DbtModelScreen, DbtRenameScreen, DbtRunOptions, DbtRunOptionsScreen,
+                  DbtRunScreen, DbtRunSelection, DbtTestScreen, DbtVarsScreen)
 from .dbt_authoring import DbtAuthoring
 from .dbt_setup import DbtSetupScreen
 from .editor_tools import FindBar, format_editor
@@ -75,6 +81,18 @@ from . import splash
 
 KEY_HINTS = "ctrl+enter run · F8 cancel · ctrl+f find · ctrl+k SQL preview · ctrl+space complete · F4 AI complete · ctrl+comma settings · \\ actions · ctrl+q quit"
 T = TypeVar("T")
+
+
+@dataclass
+class _CompiledDbt:
+    workspace: str
+    file: str
+    revision: str
+    settings: DbtTargetSettings
+    runtime_path: str
+    run: DbtRun
+    result: DbtRunResult
+    stale: bool = False
 
 
 
@@ -274,6 +292,8 @@ class D8RApp(App):
         # A loaded page or conversion preview is not itself an edit to a project file.
         self._dbt_autosave_text = ""
         self.dbt_authoring = DbtAuthoring(self)
+        self._compiled_dbt: _CompiledDbt | None = None
+        self._last_dbt_run: tuple[str, DbtRun, DbtRunResult, Callable[[str], None] | None] | None = None
         self._workspace_editor: TextArea | None = None
         self._workspace_timer = None
         self._workspace_edited = 0.0
@@ -380,16 +400,27 @@ class D8RApp(App):
                         yield Button("Inspect", id="dbt-inspect", compact=True,
                                      tooltip=binding_tooltip(self.BINDINGS, "dbt_inspect"))
                         yield Button("Problems", id="dbt-problems-button", compact=True)
+                        yield Button("dbt Compile", id="dbt-compile-model", compact=True)
                         with Horizontal(id="dbt-view-controls"):
                             yield Static("SQL", classes="dbt-switch-label")
-                            yield Switch(id="dbt-toggle", animate=False, tooltip="Convert the draft without running SQL")
+                            yield Switch(id="dbt-toggle", animate=False,
+                                         tooltip="Switch between dbt source and SQL; confirm compile when required")
                             yield Static("dbt", classes="dbt-switch-label")
                     yield FindBar(id="sql-find")
-                    with EditorPane(id="editor-pane"):
-                        yield QueryTextArea(self._initial_document, dialect=self.session.source.dialect,
-                                            show_line_numbers=True, id="editor")
-                        yield CommandPalette(self.session, id="palette", markup=False,
-                                             template_completion=self.dbt_authoring.complete)
+                    with Horizontal(id="dbt-compile-split"):
+                        with EditorPane(id="editor-pane"):
+                            yield QueryTextArea(self._initial_document, dialect=self.session.source.dialect,
+                                                show_line_numbers=True, id="editor")
+                            yield CommandPalette(self.session, id="palette", markup=False,
+                                                 template_completion=self.dbt_authoring.complete)
+                        with Vertical(id="dbt-compiled-pane"):
+                            yield Static("", id="dbt-compiled-status", markup=False)
+                            yield TextArea("", read_only=True, soft_wrap=False, id="dbt-compiled-sql")
+                            with Horizontal(id="dbt-compiled-actions"):
+                                yield Button("Preview Model", id="dbt-preview-model", compact=True)
+                                yield Button("Preview CTE", id="dbt-preview-cte", compact=True,
+                                             tooltip="Preview the top-level CTE at the source editor's caret")
+                                yield Button("Close", id="dbt-close-compiled", compact=True)
                     yield FnEditor(self, id="function-editor")
                 with PaneSplitter("#editor-slot", "height", "editor", min_size=8,
                                   min_remaining=5, id="editor-splitter"):
@@ -468,7 +499,8 @@ class D8RApp(App):
         self._workspace_ready = True
         self.dbt_authoring.request()
         self.ai_panel.target_changed()
-        self._set_status(f"ready · {self.session.active_id} · {self.session.dialect}")
+        label = self.session.source.display if self._workspace_key.startswith("dbt:") else self.session.active_id
+        self._set_status(f"ready · {label} · {self.session.dialect}")
         if self.session.memory_error:
             self._set_status(self.session.memory_error)
             self.notify(self.session.memory_error, title="Saved data could not be loaded", severity="error", timeout=15)
@@ -482,6 +514,7 @@ class D8RApp(App):
         self._flush_workspace()
         self._refresh_pages()
         self.call_after_refresh(self._restore_startup_view)
+        self.set_interval(1, self._check_dbt_compile_view)
 
     def _restore_startup_view(self) -> None:
         """Restore the selected local draft, then reconnect only its saved target."""
@@ -1035,7 +1068,8 @@ class D8RApp(App):
         self.query_one("#run-query", Button).disabled = running
         self.query_one("#explain-query", Button).disabled = running
         self.query_one("#refresh-schema", Button).disabled = running
-        self.query_one("#reconnect-source", Button).display = not self.session.source_connected()
+        self.query_one("#reconnect-source", Button).display = (
+            not self._workspace_key.startswith("dbt:") and not self.session.source_connected())
         source = self.session.source
         self.editor.dialect = source.dialect
         self._sync_dbt_controls()
@@ -1229,7 +1263,7 @@ class D8RApp(App):
         self.query_one("#explorer-slot").display = self.session.pane_visibility["schema"]
         self.query_one("#fn-param-guide").display = self.function_mode
         self.query_one("#query-header").display = not self.function_mode
-        self.query_one("#editor-pane").display = not self.function_mode
+        self.query_one("#dbt-compile-split").display = not self.function_mode
         self.function_editor.display = self.function_mode
         # Data tabs are part of the strip too: hiding Results, SQL and History
         # never throws away a result the user pinned or a run still holding.
@@ -1290,7 +1324,8 @@ class D8RApp(App):
             self.exit()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        if self.screen_stack and isinstance(self.screen, (CompletionKeyScreen, DbtTestScreen, DbtRenameScreen, DbtRunScreen)):
+        if self.screen_stack and isinstance(self.screen, (CompletionKeyScreen, DbtTestScreen, DbtRenameScreen,
+                                                          DbtRunScreen, DbtRunOptionsScreen)):
             return False  # Keep workspace shortcuts out of the modal editor.
         if action == "dbt_definition":
             return (self._workspace_ready and not self.function_mode and not self._modal_open()
@@ -1356,6 +1391,8 @@ class D8RApp(App):
 
     def action_run_or_chat(self) -> None:
         """The app's priority key sends chat when its input owns focus."""
+        if self._modal_open():
+            raise SkipAction()
         focused = self.screen.focused
         if focused is not None:
             for widget in (focused, *focused.ancestors):
@@ -1799,6 +1836,8 @@ class D8RApp(App):
         self.query_one("#dbt-rename-model", Button).display = bool(link) and suffix in {".sql", ".py"}
         self.query_one("#dbt-inspect", Button).display = bool(link) and sql
         self.query_one("#dbt-problems-button", Button).display = bool(link) and suffix in {".sql", ".yml", ".yaml"}
+        self.query_one("#dbt-compile-model", Button).display = bool(link) and sql
+        self._sync_dbt_compile_view()
         convert = enabled and sql
         self.query_one("#dbt-view-controls").display = convert
         self.query_one("#dbt-editor-tools").display = bool(link) or convert
@@ -1817,8 +1856,8 @@ class D8RApp(App):
     def _dbt_switch_changed(self, event: Switch.Changed) -> None:
         self.action_dbt(event.value)
 
-    def action_dbt(self, to_dbt: bool | None = None) -> None:
-        """Convert explicitly to SQL or normalized dbt without running or saving it."""
+    def action_dbt(self, to_dbt: bool | None = None, *, compiled_sql: str | None = None) -> None:
+        """Switch views offline, or offer a dbt compile when a saved model needs one."""
         if (not self._workspace_ready or not self.session.dbt_enabled or self._modal_open()
                 or self.function_mode or self.editor.file_format != "sql"):
             return
@@ -1869,11 +1908,14 @@ class D8RApp(App):
             else:
                 jinja = document
                 project = self.session.dbt_project(directory)
-                if not path and not render_only and document == views.get("jinja") and project.artifact_key == artifact_key:
+                if (compiled_sql is None and not path and not render_only and document == views.get("jinja")
+                        and project.artifact_key == artifact_key):
                     sql = views["sql"]
                 else:
                     sql, reversible = project.preview_query(document, database=self._dbt_conversion_target()["database"],
-                                                            path=path)
+                                                            path=path, compiled_only=compiled_sql is not None)
+                    if compiled_sql is not None and sql != compiled_sql:
+                        raise DbtError("The compiled SQL changed before the switch. Try switching again.")
                     render_only = not reversible
                 artifact_key = project.artifact_key
             next_view = "jinja" if to_dbt else "sql"
@@ -1884,6 +1926,9 @@ class D8RApp(App):
             self._set_status(str(exc))
             self._sync_dbt_controls()
             editor.focus()
+            if (isinstance(exc, DbtCompileRequired) and not to_dbt and compiled_sql is None and path
+                    and directory == self.session.dbt_project_dir):
+                self._compile_dbt_model(switch_reason=exc.reason)
             return
         # Persist prior edits, not the representation change itself. Edits made
         # in a native preview become writable once they are converted back.
@@ -1910,35 +1955,290 @@ class D8RApp(App):
         self._sync_dbt_controls()
         if saved:
             mode = "dbt Jinja" if to_dbt else "Native SQL (read-only preview)" if render_only else "Native SQL"
-            self._set_status(f"{mode} · nothing executed{note}")
+            suffix = " · dbt compile completed" if compiled_sql is not None else " · nothing executed"
+            self._set_status(f"{mode}{suffix}{note}")
 
-    def _run_dbt_model(self, command: DbtModelCommand) -> None:
-        if (not self._workspace_ready or self._closing or not self.session.dbt_enabled
-                or self._modal_open() or self.function_mode or self.refuse_busy("Run dbt")):
-            return
+    def _dbt_action_allowed(self, label: str) -> bool:
+        return (self._workspace_ready and not self._closing and self.session.dbt_enabled
+                and not self.function_mode and not self._modal_open() and not self.refuse_busy(label))
+
+    def _dbt_model_input(self) -> tuple[str, str, str, str] | None:
         link = self._dbt_file
         home = self.session.dbt_project_dir
         if not link or link["project_dir"] != home:
             self._set_status("Open a model from this workspace's configured dbt project first.")
-            return
-        path = link["path"]
+            return None
         self._flush_workspace()
-        revision = self._dbt_file["revision"]
+        path, revision = link["path"], self._dbt_file["revision"]
         text = self.editor.text
         views = self._dbt_views
         if text == views.get("sql"):
             text = views["jinja"]
         if not revision or file_revision(text) != revision:
             self._set_status(f"Save {path} before running dbt. Check for unsaved edits or a disk conflict.")
+            return None
+        return home, path, revision, text
+
+    def _show_dbt_run(self, prepare: Callable[[str], DbtRun] | None, *, repeat: Callable[[str], None] | None = None,
+                      accept: Callable[[DbtRun, DbtRunResult], None] | None = None,
+                      completed: tuple[DbtRun, DbtRunResult] | None = None, compile_reason: str = "",
+                      run_label: str = "", vars_override: str = "") -> None:
+        home, workspace = self.session.dbt_project_dir, self._workspace_key
+        settings = self.session.dbt_target_settings(home), self.session.dbt_runtime_path
+
+        def closed(selection: DbtRunSelection | None) -> None:
+            if (selection is None or self._closing or self._workspace_key != workspace or not self.session.dbt_enabled
+                    or self.session.dbt_project_dir != home
+                    or settings != (self.session.dbt_target_settings(home), self.session.dbt_runtime_path)):
+                return
+            self._set_status(selection.message)
+            if completed is None:
+                self.dbt_authoring.invalidate()
+            run, result = selection.run, selection.result
+            if run and result is not None and run.verb in {"run", "build", "test"}:
+                self._last_dbt_run = (workspace, run, result, repeat)
+            if selection.jump is not None and selection.jump.path:
+                self.open_dbt_file(home, selection.jump.path, row=selection.jump.row)
+            elif selection.rerun and repeat is not None:
+                self.call_later(repeat, selection.vars_override)
+            elif run and result is not None and result.exit_code == 0 and accept is not None:
+                accept(run, result)
+
+        self.palette.close()
+        self.push_screen(DbtRunScreen(prepare, sql_source=self.session.source.display, auto_close=accept is not None,
+                                      completed=completed, can_rerun=repeat is not None,
+                                      compile_reason=compile_reason, run_label=run_label,
+                                      vars_override=vars_override), closed)
+
+    def _run_dbt_model(self, command: DbtModelCommand, vars_override: str = "") -> None:
+        if not self._dbt_action_allowed("Run dbt") or not (model := self._dbt_model_input()):
             return
-        settings = self.session.dbt_target_settings(home)
+        home, path, revision, _ = model
+        self._run_saved_dbt_model(command, home, path, revision, vars_override)
 
-        def closed(status: str | None) -> None:
-            if status:
-                self._set_status(status)
+    def _run_saved_dbt_model(self, command: DbtModelCommand, home: str, path: str, revision: str,
+                             vars_override: str) -> None:
+        if not self._dbt_action_allowed("Run dbt") or home != self.session.dbt_project_dir:
+            return
+        settings, runtime = self.session.dbt_target_settings(home), self.session.dbt_runtime_path
+        workspace = self._workspace_key
+
+        def repeat(overrides: str) -> None:
+            if workspace != self._workspace_key or home != self.session.dbt_project_dir:
+                return
+            if self._dbt_file and self._dbt_file["path"] == path:
+                self._run_dbt_model(command, overrides)
+            else:
+                self._run_saved_dbt_model(command, home, path, revision, overrides)
+
+        self._show_dbt_run(lambda overrides: prepare_dbt_run(home, path, revision, settings, command,
+                                                            runtime_path=runtime, vars_override=overrides),
+                           repeat=repeat, run_label=command.replace("-", " ").title(), vars_override=vars_override)
+
+    def action_dbt_debug(self) -> None:
+        if self._dbt_action_allowed("dbt debug") and (home := self.session.dbt_project_dir):
+            settings, runtime = self.session.dbt_target_settings(home), self.session.dbt_runtime_path
+            self._show_dbt_run(lambda _: prepare_dbt_run(home, "", "", settings, "debug", runtime_path=runtime))
+
+    def action_dbt_selection(self) -> None:
+        if not self._dbt_action_allowed("Run dbt selection") or not (home := self.session.dbt_project_dir):
+            return
+        workspace = self._workspace_key
+
+        def selected(options: DbtRunOptions | None) -> None:
+            if (options is None or workspace != self._workspace_key or home != self.session.dbt_project_dir
+                    or not self._dbt_action_allowed("Run dbt selection")):
+                return
+            self._flush_workspace()
+            settings, runtime = self.session.dbt_target_settings(home), self.session.dbt_runtime_path
+            self._show_dbt_run(lambda overrides: prepare_dbt_run(
+                home, "", "", settings, options.command, runtime_path=runtime, named_selector=options.selector,
+                state_path=options.state_path, defer=options.defer, vars_override=overrides),
+                repeat=lambda _: selected(options), vars_override=options.vars_override)
+
+        self.palette.close()
+        self.push_screen(DbtRunOptionsScreen(home), selected)
+
+    def action_dbt_vars(self) -> None:
+        if not self._dbt_action_allowed("Edit dbt project variables"):
+            return
+        if not (home := self.session.dbt_project_dir):
+            self._set_status("Open a dbt project home first.")
+            return
+        workspace = self._workspace_key
+        self._flush_workspace()
+        if any(link["path"] == PROJECT_YAML and file_revision(text) != link["revision"]
+               for _, link, text in self._linked_dbt_pages(home, all_sources=True)):
+            self._set_status("Save or reload your dbt_project.yml draft before editing project variables.")
+            return
+
+        def saved(content: DbtFile | None) -> None:
+            if (content is None or self._closing or workspace != self._workspace_key
+                    or not self.session.dbt_enabled or home != self.session.dbt_project_dir):
+                return
+            updates = {}
+            for page, link, text in self._linked_dbt_pages(home, all_sources=True):
+                if link["path"] == PROJECT_YAML and file_revision(text) == link["revision"]:
+                    updates[page["id"]] = {**page, "document": content.text,
+                                           "dbt_file": {**link, "revision": content.revision}}
+            if current := updates.get(self._document_identity):
+                caret = self.editor.cursor_location
+                self._dbt_file = current["dbt_file"]
+                self.editor.load_text(content.text)
+                self.editor.move_cursor(caret)
+                self._dbt_autosave_text = self.editor.text
+                self.ai_panel.target_changed()
+            if updates:
+                pages = [updates.get(page["id"], page) for page in self.session.workspace["pages"]]
+                self._capture_workspace()
+                self.save_workspace(pages=pages, **self._workspace_snapshot)
+            self._mark_dbt_compile_stale(home)
+            self._sync_dbt_controls()
             self.dbt_authoring.invalidate()
+            self._set_status("Saved dbt project variables · nothing executed")
 
-        self.push_screen(DbtRunScreen(lambda: prepare_dbt_run(home, path, revision, settings, command)), closed)
+        self.palette.close()
+        self.push_screen(DbtVarsScreen(home), saved)
+
+    def action_dbt_results(self) -> None:
+        if not self._dbt_action_allowed("View dbt results"):
+            return
+        if self._last_dbt_run is not None:
+            workspace, run, result, repeat = self._last_dbt_run
+            if workspace == self._workspace_key and str(run.root) == self.session.dbt_project_dir:
+                self._show_dbt_run(None, repeat=repeat, completed=(run, result))
+                return
+        self._set_status("No dbt run results for this workspace yet.")
+
+    @on(Button.Pressed, "#dbt-compile-model")
+    def action_dbt_compile(self) -> None:
+        self._compile_dbt_model()
+
+    def _compile_dbt_model(self, *, preview: str = "", switch_reason: str = "") -> None:
+        if not self._dbt_action_allowed("Compile dbt") or not (model := self._dbt_model_input()):
+            return
+        home, path, revision, source = model
+        page = self._document_identity
+        settings, runtime = self.session.dbt_target_settings(home), self.session.dbt_runtime_path
+
+        def compiled(run: DbtRun, result: DbtRunResult) -> None:
+            if not result.compiled_sql or not self._dbt_file or self._dbt_file["path"] != path:
+                return
+            if switch_reason:
+                if (self._document_identity != page or self.editor.text != source
+                        or not dbt_artifact_current(run, result.artifact_revision)):
+                    self._set_status("The source or artifacts changed during compile. Switch to SQL again.")
+                    return
+                self.action_dbt(False, compiled_sql=result.compiled_sql)
+                return
+            self._set_compiled_dbt(_CompiledDbt(self._workspace_key, path, revision, settings, runtime, run, result))
+            if preview:
+                self.call_later(self._preview_dbt_model, preview == "cte")
+
+        self._show_dbt_run(lambda overrides: prepare_dbt_run(home, path, revision, settings, "compile",
+                                                            runtime_path=runtime, vars_override=overrides),
+                           accept=compiled, compile_reason=switch_reason, run_label="" if switch_reason else "Compile")
+
+    def _set_compiled_dbt(self, snapshot: _CompiledDbt | None) -> None:
+        self._compiled_dbt = snapshot
+        self.query_one("#dbt-compiled-sql", TextArea).load_text(snapshot.result.compiled_sql if snapshot else "")
+        self._sync_dbt_compile_view()
+
+    def _sync_dbt_compile_view(self) -> None:
+        snapshot = self._compiled_dbt
+        pane = self.query_one("#dbt-compiled-pane", Vertical)
+        link = self._dbt_file
+        home = self.session.dbt_project_dir
+        pane.display = bool(self.session.dbt_enabled and snapshot and link and self._workspace_key == snapshot.workspace
+                            and link["path"] == snapshot.file and link["project_dir"] == home == str(snapshot.run.root))
+        if not pane.display or snapshot is None:
+            return
+        document = self.editor.text
+        views = self._dbt_views
+        if document == views.get("sql"):
+            document = views["jinja"]
+        snapshot.stale |= (snapshot.settings != self.session.dbt_target_settings(home)
+                           or snapshot.runtime_path != self.session.dbt_runtime_path
+                           or file_revision(document) != snapshot.revision)
+        target = snapshot.run.target
+        self.query_one("#dbt-compiled-status", Static).update(
+            "Compiled SQL · " + (f"{target.profile}/{target.name}" if target else "dbt target")
+            + (" · variable overrides" if snapshot.run.vars_override else "")
+            + (" · stale — recompile" if snapshot.stale else ""))
+
+    async def _check_dbt_compile_view(self) -> None:
+        snapshot = self._compiled_dbt
+        if not snapshot or snapshot.stale or self.function_mode or self._modal_open() or self._closing:
+            return
+        if not self.query_one("#dbt-compiled-pane", Vertical).display:
+            return
+        current = await asyncio.to_thread(dbt_artifact_current, snapshot.run, snapshot.result.artifact_revision)
+        if not self._closing and self._compiled_dbt is snapshot and not current:
+            snapshot.stale = True
+            self._sync_dbt_compile_view()
+
+    def _mark_dbt_compile_stale(self, home: str) -> None:
+        if (snapshot := self._compiled_dbt) is not None and str(snapshot.run.root) == home:
+            snapshot.stale = True
+
+    @on(Button.Pressed, "#dbt-close-compiled")
+    def _close_dbt_compile_view(self) -> None:
+        self._set_compiled_dbt(None)
+        self.editor.focus()
+
+    @on(Button.Pressed, "#dbt-preview-model")
+    def action_dbt_preview_model(self) -> None:
+        self._preview_dbt_model(False)
+
+    @on(Button.Pressed, "#dbt-preview-cte")
+    def action_dbt_preview_cte(self) -> None:
+        self._preview_dbt_model(True)
+
+    def _preview_dbt_model(self, cte: bool) -> None:
+        if not self._dbt_action_allowed("Preview dbt") or not (model := self._dbt_model_input()):
+            return
+        home, path, revision, source = model
+        caret = None
+        if cte:
+            if source != self.editor.text:
+                self._set_status("Switch back to the dbt source and place the caret in a top-level CTE.")
+                return
+            caret = self.editor.document.get_index_from_location(self.editor.cursor_location)
+        snapshot = self._compiled_dbt
+        self._sync_dbt_compile_view()
+        if not snapshot or snapshot.stale or not self.query_one("#dbt-compiled-pane", Vertical).display:
+            self._compile_dbt_model(preview="cte" if cte else "model")
+            return
+        limit = min(self.session.default_rows or 50, 100)
+        target = snapshot.run.target
+        dialect = {"postgres": "postgres", "duckdb": "duckdb", "sqlite": "sqlite"}.get(
+            target.adapter if target else "", self.session.dialect)
+        try:
+            sql, label = dbt_preview_query(snapshot.result.compiled_sql, dialect, source=source, caret=caret)
+        except DbtError as exc:
+            self._set_status(str(exc))
+            return
+
+        def prepare(vars_override: str) -> DbtRun:
+            if not dbt_artifact_current(snapshot.run, snapshot.result.artifact_revision):
+                raise DbtError("The compiled artifacts changed. Recompile the model before previewing.")
+            run = prepare_dbt_run(home, path, revision, snapshot.settings, "show", runtime_path=snapshot.runtime_path,
+                                  preview_sql=sql, limit=limit, vars_override=vars_override)
+            if run.runtime.argv != snapshot.run.runtime.argv or run.target != target:
+                raise DbtError("The dbt runtime or target changed. Recompile the model before previewing.")
+            return run
+
+        def previewed(run: DbtRun, result: DbtRunResult) -> None:
+            if not result.preview_available:
+                return
+            columns = list(result.preview[0]) if result.preview else []
+            rows = [[row.get(column) for column in columns] for row in result.preview]
+            status = f"{label} preview · dbt target {run.target.name if run.target else 'default'} · {len(rows)} row(s) · limit {limit}"
+            self._render_results(RunOutcome(status=status, ok=True, columns=columns, rows=rows, total=len(rows)))
+            self.set_pane("results", True)
+            self._set_status(status)
+
+        self._show_dbt_run(prepare, accept=previewed, vars_override=snapshot.run.vars_override)
 
     def _dbt_workspace_settings(self, *, source_key: str | None = None, **changes) -> bool:
         workspaces = deepcopy(self.session.workspace["source_workspaces"])
@@ -1970,13 +2270,18 @@ class D8RApp(App):
             self._set_status(f"dbt {'enabled' if enabled else 'disabled'} for this workspace")
         return saved
 
-    def set_dbt_project_dir(self, path: str, *, target_settings: DbtTargetSettings | None = None) -> bool:
+    def set_dbt_project_dir(self, path: str, *, target_settings: DbtTargetSettings | None = None,
+                            runtime_path: str | None = None) -> bool:
         if not self.session.dbt_enabled:
             return False
+        if self._workspace_key.startswith("dbt:") and path != self.session.dbt_project_dir:
+            raise DbtError("Open another project with pgtui <directory> to keep project workspaces separate.")
         self._capture_workspace()
         settings = target_settings or self.session.dbt_target_settings(path)
+        if runtime_path is None:
+            runtime_path = self.session.dbt_runtime_path if path == self.session.dbt_project_dir else ""
         saved = self._dbt_workspace_settings(dbt_project_dir=path, dbt_profiles_path=settings.profiles_path,
-                                             dbt_target_override=settings.override)
+                                             dbt_target_override=settings.override, dbt_runtime_path=runtime_path)
         self._sync_dbt_availability()
         self.dbt_authoring.invalidate()
         return saved
@@ -1984,7 +2289,7 @@ class D8RApp(App):
     def link_new_dbt_project(self, source_key: str, path: str) -> bool:
         self._capture_workspace()
         return self._dbt_workspace_settings(source_key=source_key, dbt_project_dir=path, dbt_enabled=True,
-                                            dbt_profiles_path="", dbt_target_override="")
+                                            dbt_profiles_path="", dbt_target_override="", dbt_runtime_path="")
 
     def show_dbt_explorer(self, panel: str | None = None) -> None:
         if not self.session.dbt_enabled:
@@ -2094,6 +2399,8 @@ class D8RApp(App):
                 link["revision"] = result.revision
         if current := updates.get(self._document_identity):
             self._dbt_file = current["dbt_file"]
+        if saved:
+            self._mark_dbt_compile_stale(home)
         pages = [updates.pop(page["id"], page) for page in pages] + list(updates.values())
         self._capture_workspace()
         stored = self.save_workspace(pages=pages, **self._workspace_snapshot)
@@ -2204,6 +2511,7 @@ class D8RApp(App):
 
     def finish_dbt_rename(self, home: str, plan: DbtRenamePlan, saved: dict[str, DbtFile]) -> None:
         """Retarget open/saved pages before the next autosave can see an old filename."""
+        self._mark_dbt_compile_stale(home)
         updated = {edit.path: edit.destination for edit in plan.edits}
         pages = []
         for item in self.session.workspace["pages"]:
@@ -2348,6 +2656,7 @@ class D8RApp(App):
             return
         new = not link["revision"]
         self._dbt_file = {**link, "revision": saved.revision}
+        self._mark_dbt_compile_stale(link["project_dir"])
         if not self._closing:
             self._sync_dbt_controls()
             self.dbt_authoring.invalidate()
@@ -2821,9 +3130,14 @@ class D8RApp(App):
                 self._sync_source_select()
                 return False
             self._load_source_workspace()
-            self._set_status(f"{self.session.active_id} workspace restored · nothing executed")
+            label = self.session.source.display if key.startswith("dbt:") else self.session.active_id
+            self._set_status(f"{label} workspace restored · nothing executed")
         if open_function:
             self._open_fn()
+        if key.startswith("dbt:"):
+            self._cancel_connection()
+            self.show_dbt_explorer()
+            return True
         if not self.session.source_connected(source_id):
             self.reconnect_source(source_id, self._source_added)
         else:
@@ -3109,6 +3423,13 @@ class D8RApp(App):
             "dbt-run-with-deps": lambda: self._run_dbt_model("run-with-deps"),
             "dbt-build": lambda: self._run_dbt_model("build"),
             "dbt-test": lambda: self._run_dbt_model("test"),
+            "dbt-debug": self.action_dbt_debug,
+            "dbt-compile": self.action_dbt_compile,
+            "dbt-preview": self.action_dbt_preview_model,
+            "dbt-preview-cte": self.action_dbt_preview_cte,
+            "dbt-selection": self.action_dbt_selection,
+            "dbt-vars": self.action_dbt_vars,
+            "dbt-results": self.action_dbt_results,
             "dbt-lineage": self.action_dbt_lineage,
             "dbt-problems": self.action_dbt_problems,
             "dbt-references": self.action_dbt_references,
@@ -3133,10 +3454,19 @@ class D8RApp(App):
             action()
 
 
-def main() -> None:
-    """`python -m d8r` — optionally show the entry screen, then run one session."""
-    session = Session()
-    if session.entry_screen and splash.should_play():
+def main(argv: list[str] | None = None) -> None:
+    """Open one native SQL session or an explicitly selected local dbt project."""
+    parser = argparse.ArgumentParser(prog="pgtui")
+    parser.add_argument("project", nargs="?", help="Open a dbt project directory (or a subdirectory)")
+    args = parser.parse_args(argv)
+    dbt_root = None
+    if args.project is not None:
+        try:
+            dbt_root = discover_dbt_project(args.project)
+        except DbtError as exc:
+            parser.error(str(exc))
+    session = Session(dbt_root=dbt_root)
+    if dbt_root is None and session.entry_screen and splash.should_play():
         splash.play()
     D8RApp(session).run()
 

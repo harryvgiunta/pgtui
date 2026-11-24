@@ -816,12 +816,14 @@ def _workspace_document(value: object) -> dict:
             workspace.setdefault("dbt_enabled", bool(workspace["dbt_project_dir"]))
             workspace.setdefault("dbt_profiles_path", "")
             workspace.setdefault("dbt_target_override", "")
+            workspace.setdefault("dbt_runtime_path", "")
         _record(workspace, {"document_id", "function_draft", "active_view", "dbt_project_dir", "dbt_enabled",
-                            "dbt_profiles_path", "dbt_target_override"},
+                            "dbt_profiles_path", "dbt_target_override", "dbt_runtime_path"},
                 "source workspace")
         _text(workspace["dbt_project_dir"], "dbt project directory")
         _text(workspace["dbt_profiles_path"], "dbt profiles path")
         _text(workspace["dbt_target_override"], "dbt target override")
+        _text(workspace["dbt_runtime_path"], "dbt runtime path")
         if type(workspace["dbt_enabled"]) is not bool:
             raise ValueError("invalid workspace dbt setting")
         _text(workspace["document_id"], "source workspace document_id")

@@ -265,7 +265,7 @@ class SettingsScreen(ModalScreen[None]):
                     label,
                     "active" if source_id == self.session.active_id else
                     f"{len(self.session.sources[source_id].datasets)} tables" if source_id in self.session.sources else
-                    "select to reconnect",
+                    "project only" if source_id.startswith("dbt:") else "select to reconnect",
                     "source",
                     source_id,
                 )
@@ -277,6 +277,7 @@ class SettingsScreen(ModalScreen[None]):
                 Row("Open & Save Project Home", self.session.dbt_project_dir or "not configured", "dbt"),
                 Row("Path to dbt Profiles", options.profiles_path or "dbt profile discovery", "dbt", "dbt-profiles-path"),
                 Row("Workspace Default Target Override", options.override or "use profile default", "dbt", "dbt-target-override"),
+                Row("dbt Runtime Override", self.session.dbt_runtime_path or "auto-detect dbt Core", "dbt", "dbt-runtime-path"),
             ] if self.session.dbt_enabled else []
             return [*existing, Row("New dbt Project with AI", "interview, preview and link a new project", "dbt-setup")]
         if self.menu == "ai":

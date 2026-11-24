@@ -6,6 +6,7 @@ import json
 import shutil
 import socket
 import subprocess
+import sys
 
 import httpx
 import pytest
@@ -21,7 +22,7 @@ from d8r.dbt_rename import apply_rename, plan_rename
 from d8r.engine import DataSource
 from d8r.sql import SchemaContext
 from d8r.tui.app import D8RApp
-from d8r.tui.dbt import DbtExplorer
+from d8r.tui.dbt import DbtExplorer, DbtRunScreen
 from d8r.tui.session import Session
 from tests.test_dbt_exchange import manifest, node, project, put, source
 
@@ -169,6 +170,65 @@ def test_mixed_switch_normalizes_and_does_not_save_a_sql_preview(tmp_path):
             await pilot.pause(app._WORKSPACE_SAVE_INTERVAL + 0.1)
             assert "-- edited in SQL preview" in model.read_text()
             assert model.read_text().count("{{ source('landing', 'orders') }}") == 2
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["fresh-checkout", "legacy-artifacts"])
+def test_switch_compiles_a_ref_that_navigation_already_resolves(tmp_path, monkeypatch, legacy):
+    root = project(tmp_path, extra={"profile": "demo", "config-version": 2})
+    put(root, "profiles.yml", """demo:
+  target: dev
+  outputs:
+    dev: {type: postgres, host: 127.0.0.1, port: 1, user: nobody,
+          password: unused, dbname: warehouse, schema: dev_schema, threads: 1}
+""")
+    monkeypatch.setenv("DBT_PROFILES_DIR", str(root))
+    monkeypatch.setenv("DBT_POPULATE_CACHE", "false")  # Stock Core can compile these models without a server.
+    upstream = "select 1 as id\n"
+    raw = "select * from {{ ref('upstream') }}\n"
+    put(root, "models/upstream.sql", upstream)
+    model = put(root, "models/consumer.sql", raw)
+    if legacy:
+        manifest(root, {"model.demo.upstream": node("upstream", '"warehouse"."legacy"."upstream"')})
+    artifact = root / "target/dev/manifest.json"
+
+    async def scenario():
+        app = D8RApp(workspace(tmp_path))
+        async with app.run_test(size=(145, 55)) as pilot:
+            tree = await open_home(app, pilot, root)
+            assert app.set_dbt_project_dir(str(root), runtime_path=sys.prefix)
+            await select(tree, pilot, ("file", "models/consumer.sql"))
+            page = app._document_identity
+            await follow(app, pilot, 0, raw.index("upstream"))
+            assert app.editor.text == upstream
+            app.open_page(page)
+            await pilot.pause()
+            switch = app.query_one("#dbt-toggle", Switch)
+            assert await pilot.click(switch)
+            async with asyncio.timeout(15):
+                while (not isinstance(app.screen, DbtRunScreen)
+                       or not app.screen.query_one("#dbt-switch-compile", Button).display):
+                    await pilot.pause(0.05)
+            assert not artifact.exists() and app.editor.text == raw
+            await pilot.press("escape")
+            assert not artifact.exists() and app.editor.text == raw and switch.value
+
+            await pilot.pause(0.25)
+            assert await pilot.click(switch)
+            async with asyncio.timeout(15):
+                while not app.screen.query_one("#dbt-switch-compile", Button).display:
+                    await pilot.pause(0.05)
+            assert await pilot.click("#dbt-switch-compile")
+            async with asyncio.timeout(20):
+                while isinstance(app.screen, DbtRunScreen):
+                    await pilot.pause(0.1)
+            assert '"warehouse"."dev_schema"."upstream"' in app.editor.text
+            assert app.editor.read_only and not switch.value and not app.session.history
+            assert model.read_bytes() == raw.encode()
+            await pilot.click(switch)
+            assert switch.value and app.editor.text == raw and not app.editor.read_only
+            assert model.read_bytes() == raw.encode()
 
     asyncio.run(scenario())
 

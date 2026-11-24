@@ -18,8 +18,10 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, time as clock_time
 from decimal import Decimal
+from hashlib import sha256
 from itertools import chain
 from math import isfinite
+from os.path import normcase
 from pathlib import Path
 from sys import getsizeof
 from threading import Event, RLock
@@ -209,6 +211,7 @@ class Session:
 
     def __init__(
         self, sources: dict[str, DataSource] | None = None, *, data_dir: Path | None = None,
+        dbt_root: Path | None = None,
     ) -> None:
         self.sources: dict[str, DataSource] = load() if not sources else dict(sources)
         self.active_id: str = next(iter(self.sources))
@@ -322,6 +325,28 @@ class Session:
         selected_workspace = source_workspaces[self.workspace["source"]]
         self.workspace["function_draft"] = deepcopy(selected_workspace["function_draft"])
         self.workspace["active_view"] = selected_workspace["active_view"]
+        if dbt_root is not None:
+            self._start_dbt_workspace(dbt_root)
+
+    def _start_dbt_workspace(self, root: Path) -> None:
+        """Restore a project-only workspace without rebinding a native SQL source."""
+        key = "dbt:" + sha256(normcase(str(root)).encode("utf-8")).hexdigest()
+        workspace = self.workspace
+        workspace["sources"][key] = {"id": key, "display": f"dbt · {root.name}",
+                                     "kind": "disconnected", "path": ""}
+        self.restore_source(key)
+        state = workspace["source_workspaces"].setdefault(key, {
+            "document_id": "", "function_draft": None, "active_view": "workspace",
+        })
+        state.update(dbt_project_dir=str(root), dbt_enabled=True)
+        page = next((item for item in workspace["pages"]
+                     if item["source"] == key and item["id"] == state["document_id"]), None)
+        workspace.update(source=key, dialect=self.dialect, explorer_tab="dbt", active_view="workspace",
+                         document=page["document"] if page else "",
+                         document_id=page["id"] if page else uuid4().hex,
+                         cursor=page["cursor"] if page else [0, 0],
+                         function_draft=deepcopy(state["function_draft"]))
+        self.pane_visibility["schema"] = True
 
     @property
     def dbt_project_dir(self) -> str:
@@ -340,6 +365,11 @@ class Session:
         if state.get("dbt_project_dir") != home:
             return DbtTargetSettings()
         return DbtTargetSettings(state.get("dbt_profiles_path", ""), state.get("dbt_target_override", ""))
+
+    @property
+    def dbt_runtime_path(self) -> str:
+        state = self.workspace["source_workspaces"].get(self.source_key(), {})
+        return state.get("dbt_runtime_path", "")
 
     def dbt_project(self, directory: str, source: DataSource | None = None) -> DbtProject:
         source = self.source if source is None else source
@@ -872,7 +902,7 @@ class Session:
         ] + [
             (f"{source['display']} · disconnected", key)
             for key, source in self.workspace["sources"].items()
-            if source["kind"] in {"parquet", "d1-live"} and key not in registered
+            if (source["kind"] in {"parquet", "d1-live"} or key.startswith("dbt:")) and key not in registered
             and not any(self._d1_profile_id(profile) == key for profile in self.d1_profiles)
         ]
 

@@ -40,6 +40,14 @@ class DbtError(ValueError):
     """An actionable project or conversion error, safe to show in the form."""
 
 
+class DbtCompileRequired(DbtError):
+    """The current saved model needs a fresh dbt compile to show SQL."""
+
+    def __init__(self, reason: str, hint: str = "") -> None:
+        self.reason = reason.rstrip(". ") + "."
+        super().__init__(f"{self.reason} {hint}" if hint else self.reason)
+
+
 class _NeedsCompiled(DbtError):
     """The offline context could not resolve a dbt template."""
 
@@ -332,7 +340,8 @@ class DbtProject:
             raise DbtError("dbt exchange supports PostgreSQL, SQLite and DuckDB SQL only.")
         self.root = _safe_root(directory)
         self.dialect = dialect
-        self.project = _yaml(self._read("dbt_project.yml"), self.root / "dbt_project.yml")
+        project_yaml = self._read("dbt_project.yml")
+        self.project = _yaml(project_yaml, self.root / "dbt_project.yml")
         self.name = self.project.get("name")
         if not _literal(self.name):
             raise DbtError("dbt_project.yml needs a literal project name.")
@@ -373,12 +382,12 @@ class DbtProject:
                 raise
             self.artifact_issue = str(exc)
             self.manifest = {}
-        self.artifact_key = ""
+        key = (sha256(project_yaml.encode("utf-8")).hexdigest(),
+               self.manifest.get("metadata", {}).get("invocation_id", ""))
         if target:
-            invocation = self.manifest.get("metadata", {}).get("invocation_id", "")
-            key = (str(target.profiles_dir), target.profile, target.name, target.adapter, target.database,
-                   artifact_dir.as_posix(), invocation)
-            self.artifact_key = sha256(json.dumps(key).encode("utf-8")).hexdigest()
+            key += (str(target.profiles_dir), target.profile, target.name, target.adapter, target.database,
+                    artifact_dir.as_posix())
+        self.artifact_key = sha256(json.dumps(key).encode("utf-8")).hexdigest()
         self.relations: list[_Relation] = []
         self.nodes: list[dict] = []
         self._index()
@@ -494,15 +503,22 @@ class DbtProject:
         sql, _ = self.preview_query(jinja, database=database, path=path)
         return sql
 
-    def preview_query(self, jinja: str, *, database: str, path: str = "") -> tuple[str, bool]:
+    def preview_query(self, jinja: str, *, database: str, path: str = "",
+                      compiled_only: bool = False) -> tuple[str, bool]:
         """Return native SQL and whether literal conversion can preserve the template."""
-        try:
-            sql = self._simple_import(jinja, {}, database=database)
-        except _NeedsCompiled:
-            sql = self._render_advanced(jinja, database, path)
+        if compiled_only:
+            sql = self._compiled_for_model(path, jinja, database)
+            if sql is None:
+                raise DbtCompileRequired("No current compiled SQL for this model", self._artifact_help())
             reversible = False
         else:
-            reversible = has_query_jinja(jinja, dialect=self.dialect)
+            try:
+                sql = self._simple_import(jinja, {}, database=database)
+            except _NeedsCompiled:
+                sql = self._render_advanced(jinja, database, path)
+                reversible = False
+            else:
+                reversible = has_query_jinja(jinja, dialect=self.dialect)
         if has_query_jinja(sql, dialect=self.dialect):
             raise DbtError("The rendered SQL still contains Jinja outside of SQL strings or comments.")
         self._query_tokens(sql)
@@ -541,13 +557,16 @@ class DbtProject:
             raise
         except (ArithmeticError, LookupError, RecursionError, TypeError, ValueError) as exc:
             reason = f"Jinja evaluation failed ({type(exc).__name__})."
-        if path:
-            self._path(path)
-            node = self._node_for_path(path)
-            compiled = self._compiled(path, jinja, node, database=database)
-            if compiled is not None:
-                return compiled
-        raise DbtError(f"{reason.rstrip('. ')}. {self._artifact_help()}")
+        compiled = self._compiled_for_model(path, jinja, database)
+        if compiled is not None:
+            return compiled
+        raise DbtCompileRequired(reason, self._artifact_help())
+
+    def _compiled_for_model(self, path: str, raw: str, database: str) -> str | None:
+        if not path:
+            return None
+        self._path(path)
+        return self._compiled(path, raw, self._node_for_path(path), database=database)
 
     def query_views(self, document: str, *, database: str, schema: str = "") -> tuple[str, str]:
         """Render to SQL first, then normalize every convertible relation for dbt."""
@@ -685,7 +704,10 @@ class DbtProject:
                             item.version is None or item.version == item.latest_version)]
         values = {item.relation for item in matches}
         if len(values) != 1:
-            raise _NeedsCompiled(f"Cannot resolve {kind}{tuple(args)!r} unambiguously. Supply a current manifest with relation_name, or an actual compiled artifact.")
+            call = f"{kind}({', '.join(map(repr, args))})"
+            if not values:
+                raise _NeedsCompiled(f"No compiled relation for {call} on this dbt target.")
+            raise DbtError(f"{call} maps to multiple SQL relations in the selected artifacts.")
         relation = values.pop()
         if self.dialect == "postgres" and database:
             parts = relation_parts(relation, dialect=self.dialect)
@@ -703,13 +725,13 @@ class DbtProject:
     @staticmethod
     def _artifact_input(text: str) -> str:
         # dbt strips outer whitespace and normalizes file newlines when reading SQL.
-        return text.replace("\r\n", "\n").replace("\r", "\n").strip()
+        return text.removeprefix("\ufeff").replace("\r\n", "\n").replace("\r", "\n").strip()
 
     def _compiled(self, path: str, raw: str, node: dict | None, *, database: str = "") -> str | None:
         if node is not None:
             recorded = node.get("raw_code", node.get("raw_sql"))
             if isinstance(recorded, str) and self._artifact_input(recorded) != self._artifact_input(raw):
-                raise DbtError("The manifest is stale for this draft. Compile the current dbt file and reload.")
+                raise DbtCompileRequired("The manifest is stale for this draft", self._artifact_help())
             if self.dialect == "postgres" and database:
                 relation = node.get("relation_name")
                 parts = relation_parts(relation, dialect=self.dialect) if isinstance(relation, str) else None
@@ -718,6 +740,9 @@ class DbtProject:
                     raise DbtError("The compiled artifact belongs to another database; refresh the project's target manifest.")
             compiled = node.get("compiled_code", node.get("compiled_sql"))
             if isinstance(recorded, str) and isinstance(compiled, str) and compiled.strip():
+                manifest = self._path((self.target / "manifest.json").relative_to(self.root).as_posix())
+                if manifest.stat().st_mtime_ns < self._path("dbt_project.yml").stat().st_mtime_ns:
+                    raise DbtCompileRequired("The manifest predates dbt_project.yml", self._artifact_help())
                 return compiled
         if self.dbt_target:
             # A standalone compiled file carries no invocation or target provenance.
@@ -727,9 +752,11 @@ class DbtProject:
         if artifact.is_file():
             model_path = self._path(path)
             if not model_path.is_file() or self._artifact_input(self._read(path)) != self._artifact_input(raw):
-                raise DbtError("The compiled SQL file does not match the current draft. Compile the current dbt file and reload.")
+                raise DbtCompileRequired("The compiled SQL file does not match the current draft", self._artifact_help())
             if artifact.stat().st_mtime_ns < model_path.stat().st_mtime_ns:
-                raise DbtError("The compiled SQL file predates this dbt file. Compile it and reload.")
+                raise DbtCompileRequired("The compiled SQL file predates this dbt file", self._artifact_help())
+            if artifact.stat().st_mtime_ns < self._path("dbt_project.yml").stat().st_mtime_ns:
+                raise DbtCompileRequired("The compiled SQL file predates dbt_project.yml", self._artifact_help())
             return self._read(artifact.relative_to(self.root).as_posix())
         return None
 

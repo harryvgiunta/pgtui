@@ -21,6 +21,8 @@ Already available:
   GROUP BY proposals from known projections.
 - Schema browsing, source-scoped query pages and reusable SQL functions, results
   selection, and CSV export.
+- Open an existing dbt Core project with `pgtui .`; compile and preview models,
+  then jump from failed build or test results to the source file.
 - Optional AI chat and inline SQL proposals, with explicit acceptance controls.
 
 Forked from anyql/D8R; original MIT attribution is retained.
@@ -275,13 +277,17 @@ SQLite database or `dbt-sqlite` is not a substitute.
 
 ### Open and edit an existing project
 
-In **Settings → Workspace Settings**, turn on **Enable dbt**, then choose
-**Open & Save Project Home** and select the directory containing `dbt_project.yml`.
-You can also change the directory from **Project Home** in the dbt explorer.
-New source workspaces default to off; existing configured projects stay enabled.
-Both settings are per data source. Turning dbt off hides its tools and stops
-project-file autosave. Saved file drafts remain readable in **Pages**; ordinary
-SQL pages keep their native IntelliSense and execution tools.
+With `pgtui` installed, run **`pgtui .`** from a dbt checkout or any of its
+subdirectories. From the PGTUI checkout use `uv run pgtui <project-directory>`.
+PGTUI finds the nearest `dbt_project.yml`, opens the dbt explorer, and restores
+that project's own workspace and drafts. It starts without a native SQL
+connection and does not run dbt at startup.
+
+To link dbt to an existing **data-source workspace** instead, enable dbt in
+**Settings → Workspace Settings**, then choose **Open & Save Project Home** and
+select the project directory. **Project Home** in the dbt explorer opens the
+same settings. Turning dbt off hides its tools and stops project-file autosave;
+saved drafts remain readable in **Pages**.
 
 **Path to dbt Profiles** accepts a private `profiles.yml` file or its directory.
 Leave it blank to use `DBT_PROFILES_DIR`, the project directory, or `~/.dbt`,
@@ -291,8 +297,16 @@ override uses the `target:` under the profile named in `dbt_project.yml`.
 that the effective target exists without connecting or running dbt. If the
 default is templated, select a literal output as the override.
 
-To generate compiled SQL without running a model, compile each target into its
-own directory from the project home. For example:
+**dbt Runtime Override** takes a dbt executable or the directory of a Python
+environment with dbt installed. Absolute paths and paths relative to the
+project are supported. Leave it blank to try the project's `.venv` or `venv`,
+then the active virtualenv or Conda environment, then `PATH`, and finally the
+bundled dbt Core environment. An invalid override does not fall back to another
+runtime. Commands inherit your shell environment; PGTUI does not source
+activation scripts.
+
+Use **dbt Compile** in PGTUI, or generate equivalent target-specific artifacts
+from the project home. For example:
 
 ```sh
 dbt compile --profiles-dir "<profiles-directory>" --profile analytics --target stage --target-path target/stage --write-json
@@ -372,6 +386,22 @@ Indexing and both rename commands honor `.dbtignore` and project-local
 regardless of Git tracking status. Apply rechecks ignore rules and the input
 inventory before writing.
 
+### Compile and preview with dbt
+
+Open a saved SQL model, choose **dbt Compile** (`\dbt-compile`), then confirm
+**Compile**. PGTUI runs the workspace's `dbt compile` and opens read-only compiled SQL next to the
+editable model. It verifies the output belongs to that invocation, target and
+saved model; changes to the draft, project config, profile or artifact files can
+mark the view **stale**. Recompile to refresh the view without replacing Jinja.
+
+**Preview Model** (`\dbt-preview`) and **Preview CTE** (`\dbt-preview-cte`)
+use `dbt show` against the dbt target, not PGTUI's native SQL connection.
+For a CTE, place the caret inside its declaration in the source model. Preview
+requires an unambiguous top-level CTE and compiles first if there is no current
+compiled view. Results are bounded to at most 100 rows and do not enter native
+SQL history. A row limit does not bound scan cost. Compile and preview can
+connect to the warehouse and evaluate project code; use trusted projects.
+
 ### Run a model with dbt
 
 In a dbt-enabled workspace, open a SQL model from the configured project and
@@ -384,14 +414,41 @@ type `\dbt` in the editor to find these actions:
 | `\dbt-build` | `dbt build --select model` |
 | `\dbt-test` | `dbt test --select model` |
 
-PGTUI saves the open model before running bundled dbt Core from the project
-home. dbt uses the workspace target override, or the profile default if no
-override is set, without switching PGTUI's SQL connection. These actions can
-write to the target and execute project hooks; run them only in trusted projects.
+PGTUI saves the open model before running dbt Core in the workspace's selected
+runtime. dbt uses the workspace target override, or the profile default, without
+switching PGTUI's native SQL connection. These actions can write to the target
+and execute hooks. Use `\dbt-debug` to check the project setup and connection.
 
-The dialog shows the target, result and path to dbt's local log. **F8** or
-**Esc** cancels a running process; already committed changes may remain. dbt
-writes artifacts to `<target-path>/<target>` (default `target/<target>`).
+The dialog shows progress, the runtime and target, and per-node results from the
+run's artifacts. Failed nodes are listed first; select one and press **Enter**
+to open its SQL or YAML when the file is local. **Ctrl+R** reruns the selection.
+Use `\dbt-results` to reopen the last report in this workspace. Full dbt output
+stays in dbt's local log. **F8** or **Esc** cancels the process; already committed
+changes may remain. Artifacts are written to `<target-path>/<target>` (default
+`target/<target>`).
+
+Use `\dbt-selection` to run, build, or test a named selector from `selectors.yml`.
+You can pass a local state directory containing `manifest.json` and optionally
+enable deferral. Keep the state directory separate from the active target's
+output directory so the run cannot overwrite its baseline.
+
+### Project variables and per-run overrides
+
+Open **dbt Explorer → Actions → Edit Project Variables** or use `\dbt-vars`
+to review the `vars:` mapping in `dbt_project.yml`. Edit the YAML values (including
+nested package-specific mappings) and press **Ctrl+S** to save. Cancel leaves the
+file unchanged. Saving variables does not run dbt.
+
+Model run, build, test, and compile dialogs and `\dbt-selection` accept an optional
+**Variable overrides** YAML mapping, for example `{lookback_days: 7}`. Leave it blank
+to use project defaults. PGTUI passes overrides as `--vars` without saving them to
+the project or carrying them into a new run. **Ctrl+R** retains the overrides when
+rerunning a report. Do not enter secrets: dbt can record values in its logs and artifacts.
+
+Runs with overrides write artifacts under `<target-path>/<target>/.pgtui-vars` so
+they do not replace the default artifacts. Model and CTE previews use the same
+variables as their compiled SQL; recompile to change them. The offline SQL switch
+and native Run continue to use project defaults.
 
 ### SQL ↔ dbt switch
 
@@ -404,13 +461,13 @@ materialize the model, or execute hooks.
 Offline rendering handles `{% set %}`, `{% if %}`, `{% for %}`, Jinja comments
 and whitespace control, and `var()` values from `dbt_project.yml`. `ref()` and
 `source()` use manifest relation names; literal sources also work from YAML.
-For features that need dbt's runtime, such as `is_incremental()` or package
-macros, use `dbt compile` for the intended target. PGTUI can use the linked
-file's matching compiled artifact and rejects artifacts it can tell are stale.
+If a linked SQL model needs dbt to resolve a `ref()`, render a macro, or replace
+stale compiled SQL, the switch offers **Compile & Switch** on the workspace's
+dbt target. This can connect to the warehouse and evaluate project macros; it only
+starts when confirmed. **Ctrl+K** remains an offline preview.
 
-Switching views is undoable and does not itself run or save the file. SQL
-previews of blocks, expressions, and compiled artifacts are read-only so
-switching back restores the original template. Literal relation conversions
+Switching views is undoable. Compiled SQL is read-only, and switching back
+restores the original Jinja without rewriting the model. Literal conversions
 remain editable: switch back to dbt to normalize mapped relations and autosave
 edits to a templated model.
 

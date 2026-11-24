@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from difflib import unified_diff
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -14,7 +16,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.suggester import SuggestFromList
-from textual.widgets import Button, Input, OptionList, Static, TabbedContent, TabPane, TextArea, Tree
+from textual.widgets import Button, Input, OptionList, Select, Static, Switch, TabbedContent, TabPane, TextArea, Tree
 from textual.widgets.option_list import Option
 
 from d8r.dbt import DbtError
@@ -26,7 +28,10 @@ from d8r.dbt_git import git_diff
 from d8r.dbt_profiles import DbtTargetSettings
 from d8r.dbt_references import DbtReferences
 from d8r.dbt_rename import DbtRenamePlan, apply_rename, plan_rename
-from d8r.dbt_run import DbtRun
+from d8r.dbt_run import (
+    DbtModelCommand, DbtNodeResult, DbtRun, DbtRunResult, dbt_named_selectors, find_dbt_runtime,
+)
+from d8r.dbt_vars import read_project_vars, save_project_vars, validate_run_vars
 from .dbt_authoring import DbtLineage, DbtProblems
 from .dbt_completion import DbtTestCompletion, model_columns
 from .editing import DraftTextArea
@@ -69,61 +74,261 @@ class DbtDialog(ModalScreen):
         self.query_one("#dbt-message", Static).update(text)
 
 
+@dataclass(frozen=True)
+class DbtRunSelection:
+    run: DbtRun | None
+    result: DbtRunResult | None
+    message: str
+    jump: DbtNodeResult | None = None
+    rerun: bool = False
+    vars_override: str = field(default="", repr=False)
+
+
 class DbtRunScreen(DbtDialog):
-    """Run the saved model off the UI loop, with a cancellable process lifetime."""
+    """Run dbt on saved files, or inspect results from a previous run."""
 
-    BINDINGS = [Binding("f8", "cancel", "Cancel dbt", show=False)]
+    BINDINGS = [
+        Binding("f8", "cancel", "Cancel dbt", show=False),
+        Binding("ctrl+enter", "submit_run", "Run dbt", show=False),
+        Binding("ctrl+r", "rerun", "Rerun selection", show=False),
+    ]
+    DEFAULT_CSS = """
+    DbtRunScreen #dbt-run-nodes { max-height: 14; }
+    DbtRunScreen #dbt-run-actions { margin-bottom: 1; }
+    DbtRunScreen #dbt-run-actions Button { width: 1fr; min-width: 0; }
+    DbtRunScreen .dbt-run-vars { height: auto; }
+    DbtRunScreen #dbt-run-vars { height: 6; margin: 0; }
+    """
+    _PAGE_SIZE = 60
+    _FAILURES = {"error", "fail", "failed", "runtime error", "runtime_error"}
 
-    def __init__(self, prepare: Callable[[], DbtRun]) -> None:
+    def __init__(self, prepare: Callable[[str], DbtRun] | None, *, sql_source: str,
+                 auto_close: bool = False, completed: tuple[DbtRun, DbtRunResult] | None = None,
+                 can_rerun: bool = True, compile_reason: str = "", run_label: str = "",
+                 vars_override: str = "") -> None:
         super().__init__()
+        if prepare is None and completed is None:
+            raise ValueError("DbtRunScreen needs a command or a completed result.")
         self._prepare = prepare
-        self._execution: asyncio.Task[str] | None = None
-        self._result: str | None = None
+        self._sql_source = sql_source
+        self._auto_close = auto_close
+        self._completed = completed
+        self._can_rerun = can_rerun
+        self._compile_reason = compile_reason
+        self._run_label = run_label
+        self._vars_override = vars_override
+        self._approval = asyncio.Event() if compile_reason else None
+        self._prepared: DbtRun | None = None
+        self._execution: asyncio.Task[DbtRunSelection] | None = None
+        self._selection: DbtRunSelection | None = None
+        self._result_nodes: list[DbtNodeResult] = []
+        self._first = 0
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(classes="dbt-dialog"):
-            yield Static("Run dbt on saved project files")
+            yield Static("dbt command · saved project files")
             yield Static("", id="dbt-run-target", markup=False)
-            yield Static("Checking the saved model and workspace target…", id="dbt-message", markup=False)
-            yield Button("Cancel", id="dbt-run-dismiss", variant="primary")
+            yield Static(f"Native SQL connection (separate from dbt): {self._sql_source}", markup=False)
+            if self._run_label:
+                with Vertical(classes="dbt-run-vars", id="dbt-run-inputs"):
+                    yield Static("Variable overrides (--vars) · YAML mapping, e.g. {lookback_days: 7}. "
+                                 "Leave blank to use project defaults. Do not enter secrets.", markup=False)
+                    yield DraftTextArea(self._vars_override, id="dbt-run-vars")
+            yield Static("" if self._run_label else "Checking the project and workspace target…",
+                         id="dbt-message", markup=False)
+            with Horizontal(classes="dbt-buttons", id="dbt-run-actions"):
+                if self._run_label:
+                    yield Button(self._run_label, id="dbt-run-start", variant="primary", compact=True)
+                yield Button("Cancel", id="dbt-run-dismiss", variant="primary", compact=True)
+                if self._approval is not None:
+                    approve = Button("Compile & Switch", id="dbt-switch-compile", variant="primary", compact=True)
+                    approve.display = False
+                    yield approve
+                rerun = Button("Rerun (Ctrl+R)", id="dbt-run-rerun", compact=True,
+                               tooltip="Rerun the same selection")
+                rerun.display = False
+                yield rerun
+            help_text = Static("", id="dbt-run-help", markup=False)
+            help_text.display = False
+            yield help_text
+            nodes = OptionList(id="dbt-run-nodes", markup=False)
+            nodes.display = False
+            yield nodes
 
     def on_mount(self) -> None:
-        self._execution = asyncio.create_task(self._run())
-        self._execution.add_done_callback(self._finished)
+        if self._completed is not None:
+            run, result = self._completed
+            self._show_command(run)
+            self._show_result(self._outcome(run, result))
+        elif not self._run_label:
+            self._start()
 
-    async def _run(self) -> str:
-        try:
-            run = await asyncio.to_thread(self._prepare)
-            self.query_one("#dbt-run-target", Static).update(
-                f"dbt {run.verb} --select {run.selector}\n"
-                f"Project: {run.root}\nProfile: {run.target.profile} · Target: {run.target.name}\n"
-                f"Log: {run.log_dir / 'dbt.log'}")
-            self._message("Running dbt…")
-            code = await run.execute()
-        except DbtError as exc:
-            return f"dbt not started · {exc}"
-        except OSError:
-            return "dbt not started · Could not read the project files. Check their permissions."
-        return (f"dbt {run.verb} failed (exit {code}) · see dbt.log for details" if code
-                else f"dbt {run.verb} completed · see dbt.log for results")
+    def _start(self) -> None:
+        if self._prepare is not None:
+            self._message("Checking the project and workspace target…")
+            self._execution = asyncio.create_task(self._run(self._prepare, self._vars_override))
+            self._execution.add_done_callback(self._finished)
 
-    def _finished(self, task: asyncio.Task[str]) -> None:
-        if self._execution is not task or not self.app.is_running or self.app.screen is not self:
+    @on(Button.Pressed, "#dbt-run-start")
+    def action_submit_run(self) -> None:
+        if not self._run_label or self._execution is not None or self._selection is not None:
             return
-        self._result = ("dbt cancelled · changes already committed may remain" if task.cancelled()
-                        else task.result())
-        self._message(self._result)
+        editor = self.query_one("#dbt-run-vars", DraftTextArea)
+        try:
+            self._vars_override = validate_run_vars(editor.text)
+        except DbtError as exc:
+            self._message(str(exc))
+            editor.focus()
+            return
+        self.query_one("#dbt-run-inputs").display = False
+        self.query_one("#dbt-run-start", Button).display = False
+        self.query_one("#dbt-run-dismiss", Button).focus()
+        self._start()
+
+    def _show_command(self, run: DbtRun) -> None:
+        target = (f"{run.target.profile} / {run.target.name}" if run.target
+                  else "Not resolved from project profiles")
+        selection = f"\nSelection: {run.selector}" if run.selector else ""
+        variables = "\nPer-run variable overrides applied" if run.vars_override else ""
+        logs = "Temporary for this preview" if run.verb == "show" else str(run.log_dir / "dbt.log")
+        self.query_one("#dbt-run-target", Static).update(
+            f"Command: dbt {run.verb}{selection}\nRuntime: {run.runtime.label}\n"
+            f"dbt profile / target: {target}{variables}\nProject: {run.root}\nLog: {logs}")
+
+    def _progress(self, text: str) -> None:
+        task = self._execution
+        if text and task is not None and not task.cancelling() and self.is_mounted:
+            # The runtime sends only classified progress, never subprocess output.
+            self._message(text)
+
+    async def _run(self, prepare: Callable[[str], DbtRun], vars_override: str) -> DbtRunSelection:
+        try:
+            run = await asyncio.to_thread(prepare, vars_override)
+            self._prepared = run
+            self._show_command(run)
+            if self._approval is not None:
+                self._message(f"{self._compile_reason}\n"
+                              "Compile can connect to the dbt target and evaluate project macros. "
+                              "It will not run or build the model.")
+                approve = self.query_one("#dbt-switch-compile", Button)
+                approve.display = True
+                await self._approval.wait()
+                approve.display = False
+            self._message("Running dbt… (Esc or F8 cancels)")
+            return self._outcome(run, await run.execute(self._progress))
+        except DbtError as exc:
+            return DbtRunSelection(self._prepared, None, f"dbt could not run · {exc}")
+        except OSError:
+            return DbtRunSelection(self._prepared, None, "Could not access the dbt project files. Check permissions.")
+
+    @staticmethod
+    def _outcome(run: DbtRun, result: DbtRunResult) -> DbtRunSelection:
+        return DbtRunSelection(run, result, result.message or f"dbt {run.verb} · exit {result.exit_code}")
+
+    def _finished(self, task: asyncio.Task[DbtRunSelection]) -> None:
+        if self._execution is not task or not self.app.is_running or not self.is_mounted:
+            return
+        self._execution = None
+        selection = (DbtRunSelection(self._prepared, None, "dbt cancelled · changes already committed may remain.")
+                     if task.cancelled() else task.result())
+        run, result = selection.run, selection.result
+        if (self._auto_close and self.app.screen is self and run and result and result.exit_code == 0
+                and ((run.verb == "show" and result.preview_available)
+                     or (run.verb == "compile" and result.compiled_sql))):
+            self.dismiss(selection)
+        else:
+            self._show_result(selection)
+
+    def _show_result(self, selection: DbtRunSelection) -> None:
+        self._selection = selection
+        result = selection.result
+        summary = selection.message
+        if result is not None:
+            counts = Counter(node.status for node in result.nodes)
+            suffix = f" · {len(result.nodes)} node(s)"
+            if counts:
+                suffix += " (" + ", ".join(f"{status}: {count}" for status, count in sorted(counts.items())) + ")"
+            exit_summary = f"Exit {result.exit_code}{suffix}"
+            summary = f"{exit_summary}\n{result.message}" if result.message else exit_summary
+            self._result_nodes = sorted(result.nodes, key=self._node_order)
+        self._message(summary)
         button = self.query_one("#dbt-run-dismiss", Button)
         button.label = "Close"
         button.disabled = False
-        button.focus()
+        self.query_one("#dbt-run-rerun", Button).display = self._can_rerun
+        if self._result_nodes:
+            self._show_nodes(0)
+            if self.app.screen is self:
+                self.query_one("#dbt-run-nodes", OptionList).focus()
+        elif self.app.screen is self:
+            button.focus()
+
+    @classmethod
+    def _node_order(cls, node: DbtNodeResult) -> int:
+        if node.status.casefold() in cls._FAILURES:
+            return 0 if node.path else 1
+        return 2 if node.path else 3
+
+    def _show_nodes(self, first: int) -> None:
+        self._first = first
+        stop = min(first + self._PAGE_SIZE, len(self._result_nodes))
+        options = [Option("‹ Previous page", id="previous")] if first else []
+        for index in range(first, stop):
+            node = self._result_nodes[index]
+            prompt = Text.assemble((node.status, "bold"), " · ", node.unique_id)
+            if node.path:
+                line = f":{node.row + 1}" if node.row is not None else ""
+                prompt.append(f"\n  ↳ {node.path}{line}")
+            if node.reason:
+                prompt.append(f"\n  {node.reason}")
+            options.append(Option(prompt, id=str(index)))
+        if stop < len(self._result_nodes):
+            options.append(Option("Next page ›", id="next"))
+        listing = self.query_one("#dbt-run-nodes", OptionList)
+        listing.display = True
+        listing.set_options(options)
+        listing.highlighted = int(bool(first))
+        help_text = self.query_one("#dbt-run-help", Static)
+        help_text.display = True
+        help_text.update(
+            f"Nodes {first + 1}–{stop} of {len(self._result_nodes)} · Enter opens nodes with a local file (↳) or changes pages.")
+
+    @on(OptionList.OptionSelected, "#dbt-run-nodes")
+    def _open_node(self, event: OptionList.OptionSelected) -> None:
+        if self._selection is None:
+            return
+        if event.option_id == "previous":
+            self._show_nodes(self._first - self._PAGE_SIZE)
+        elif event.option_id == "next":
+            self._show_nodes(self._first + self._PAGE_SIZE)
+        elif event.option_id is not None:
+            node = self._result_nodes[int(event.option_id)]
+            if node.path:
+                self.dismiss(replace(self._selection, jump=node))
+            else:
+                self.query_one("#dbt-run-help", Static).update(
+                    "This node has no editable file in the current project. Select another node or page.")
+
+    @on(Button.Pressed, "#dbt-run-rerun")
+    def action_rerun(self) -> None:
+        if self._can_rerun and self._selection is not None:
+            run = self._selection.run
+            self.dismiss(replace(self._selection, rerun=True,
+                                 vars_override=run.vars_override if run else self._vars_override))
+
+    @on(Button.Pressed, "#dbt-switch-compile")
+    def _approve_compile(self) -> None:
+        if self._approval is not None:
+            self._approval.set()
 
     @on(Button.Pressed, "#dbt-run-dismiss")
     def action_cancel(self) -> None:
         task = self._execution
-        if task is None or task.done():
-            self.dismiss(self._result)
-        elif not task.cancelling():
+        if task is None:
+            self.dismiss(self._selection)
+        elif self._approval is not None and not self._approval.is_set():
+            self.dismiss(None)
+        elif not task.done() and not task.cancelling():
             self._message("Cancelling dbt…")
             self.query_one("#dbt-run-dismiss", Button).disabled = True
             task.cancel()
@@ -137,7 +342,12 @@ class DbtRunScreen(DbtDialog):
 
 
 class DBTScreen(DbtDialog):
-    """Save the project and its dbt target selection for one source workspace."""
+    """Save the project, target and runtime settings for one source workspace."""
+
+    DEFAULT_CSS = """
+    DBTScreen .dbt-buttons { layout: vertical; }
+    DBTScreen .dbt-buttons Button { width: 100%; min-width: 0; margin-right: 0; }
+    """
 
     def __init__(self, ide: D8RApp, *, focus_field: str = "dbt-project-dir", **kwargs) -> None:
         super().__init__(**kwargs)
@@ -154,16 +364,21 @@ class DBTScreen(DbtDialog):
             yield Input(settings.profiles_path, placeholder="Discover profiles.yml", id="dbt-profiles-path")
             yield Static("Workspace Default Target Override")
             yield Input(settings.override, placeholder="Use the profile default", id="dbt-target-override")
-            yield Static("List Targets to see the profile default and its outputs.", id="dbt-profile-targets", markup=False)
+            yield Static("Check Setup to see the resolved target and available outputs.", id="dbt-profile-targets",
+                         markup=False)
+            yield Static("dbt runtime override (virtual environment directory or executable)")
+            yield Input(self.ide.session.dbt_runtime_path, placeholder="Blank: automatically discover dbt Core",
+                        id="dbt-runtime-path")
+            yield Static("", id="dbt-runtime-status", markup=False)
             yield Static("", id="dbt-message", markup=False)
             with Horizontal(classes="dbt-buttons"):
-                yield Button("Open & Save Project Home", id="dbt-open", variant="primary")
-                yield Button("List Targets", id="dbt-list-targets")
-                yield Button("Close", id="dbt-close")
+                yield Button("Open & Save Project Home", id="dbt-open", variant="primary", compact=True)
+                yield Button("Check Setup", id="dbt-list-targets", compact=True)
+                yield Button("Close", id="dbt-close", compact=True)
 
     def on_mount(self) -> None:
         if self.ide.session.dbt_project_dir:
-            self._list_targets()
+            self._check_setup()
         self.query_one(f"#{self.focus_field}", Input).focus()
 
     def _project(self) -> DbtFiles:
@@ -175,14 +390,36 @@ class DBTScreen(DbtDialog):
         return DbtTargetSettings(self.query_one("#dbt-profiles-path", Input).value.strip(),
                                  self.query_one("#dbt-target-override", Input).value.strip())
 
+    def _runtime_path(self) -> str:
+        return self.query_one("#dbt-runtime-path", Input).value.strip()
+
+    def _check_runtime(self, project: DbtFiles) -> None:
+        status = self.query_one("#dbt-runtime-status", Static)
+        override = self._runtime_path()
+        try:
+            runtime = find_dbt_runtime(project.root, override)
+        except DbtError as exc:
+            status.update(str(exc))
+        except OSError:
+            status.update("Cannot inspect the dbt runtime. Check file permissions.")
+        else:
+            status.update(f"{'Selected' if override else 'Auto-discovered'} runtime: {runtime.label}")
+
     @on(Button.Pressed, "#dbt-list-targets")
-    def _list_targets(self) -> None:
+    def _check_setup(self) -> None:
         target_input = self.query_one("#dbt-target-override", Input)
         target_input.suggester = None
         status = self.query_one("#dbt-profile-targets", Static)
         try:
             project = self._project()
-            profile = self._selection().profile(project.root, project.config)
+        except (DbtError, OSError) as exc:
+            status.update(str(exc))
+            self.query_one("#dbt-runtime-status", Static).update("")
+            return
+        self._check_runtime(project)
+        settings = self._selection()
+        try:
+            profile = settings.profile(project.root, project.config)
         except (DbtError, OSError) as exc:
             status.update(str(exc))
             return
@@ -198,13 +435,19 @@ class DBTScreen(DbtDialog):
         target_input.suggester = SuggestFromList(names)
         outputs = ", ".join(names[:8]) + (" … type to complete" if len(names) > 8 else "")
         default = profile.default or "templated or invalid"
-        status.update(f"Profile {profile.name} · Default: {default} · Outputs: {outputs}"
+        try:
+            target = profile.select(settings.override)
+            resolved = f"dbt target: {target.profile} / {target.name}"
+        except DbtError as exc:
+            resolved = str(exc)
+        status.update(f"{resolved}\nProfile default: {default} · Outputs: {outputs}"
                       + (f" · Suggested: {matched}" if matched else ""))
 
     @on(Button.Pressed, "#dbt-open")
     @on(Input.Submitted, "#dbt-project-dir")
     @on(Input.Submitted, "#dbt-profiles-path")
     @on(Input.Submitted, "#dbt-target-override")
+    @on(Input.Submitted, "#dbt-runtime-path")
     def _open_project(self) -> None:
         try:
             project = self._project()
@@ -212,12 +455,165 @@ class DBTScreen(DbtDialog):
             target = settings.resolve(project.root, project.config)
             if settings.profiles_path and target:
                 settings = DbtTargetSettings(str(target.profiles_dir), settings.override)
-            if not self.ide.set_dbt_project_dir(str(project.root), target_settings=settings):
+            runtime_path = self._runtime_path()
+            if runtime_path:
+                find_dbt_runtime(project.root, runtime_path)
+            if not self.ide.set_dbt_project_dir(str(project.root), target_settings=settings, runtime_path=runtime_path):
                 raise DbtError("Project home could not be saved. Check workspace storage permissions.")
         except (DbtError, OSError) as exc:
             self._message(str(exc))
         else:
             self.dismiss(str(project.root))
+
+
+class DbtVarsScreen(DbtDialog):
+    """Review and explicitly save the project vars mapping without running dbt."""
+
+    BINDINGS = [Binding("ctrl+s", "save", "Save project variables", show=False)]
+    DEFAULT_CSS = """
+    DbtVarsScreen .dbt-dialog { height: 72%; }
+    DbtVarsScreen #dbt-project-vars { height: 1fr; margin: 0 0 1 0; }
+    """
+
+    def __init__(self, home: str) -> None:
+        super().__init__()
+        self._home = home
+        self._before: DbtFile | None = None
+        self._original = ""
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dbt-dialog"):
+            yield Static("dbt Project Variables · dbt_project.yml", markup=False)
+            yield Static("Edit the YAML mapping under vars:. Package-specific variables are nested mappings. "
+                         "Clear the editor to save an empty mapping.", markup=False)
+            yield DraftTextArea(read_only=True, show_line_numbers=True, id="dbt-project-vars")
+            yield Static("Loading project variables…", id="dbt-message", markup=False)
+            with Horizontal(classes="dbt-buttons"):
+                yield Button("Save (Ctrl+S)", id="dbt-vars-save", disabled=True, variant="primary", compact=True)
+                yield Button("Cancel", id="dbt-close", compact=True)
+
+    async def on_mount(self) -> None:
+        try:
+            self._before, self._original = await asyncio.to_thread(lambda: read_project_vars(DbtFiles(self._home)))
+        except (DbtError, OSError) as exc:
+            self._message(str(exc))
+            return
+        editor = self.query_one("#dbt-project-vars", DraftTextArea)
+        editor.load_text(self._original)
+        editor.read_only = False
+        editor.focus()
+        self.query_one("#dbt-vars-save", Button).disabled = False
+        self._message("")
+
+    @on(Button.Pressed, "#dbt-vars-save")
+    async def action_save(self) -> None:
+        editor = self.query_one("#dbt-project-vars", DraftTextArea)
+        if (before := self._before) is None or editor.read_only:
+            return
+        text = editor.text
+        if text == self._original:
+            self.dismiss(None)
+            return
+        button = self.query_one("#dbt-vars-save", Button)
+        editor.read_only = button.disabled = True
+        try:
+            saved = await asyncio.to_thread(lambda: save_project_vars(DbtFiles(self._home), before, text))
+        except (DbtError, OSError) as exc:
+            self._message(str(exc))
+            editor.read_only = button.disabled = False
+            editor.focus()
+        else:
+            self.dismiss(saved if saved != before else None)
+
+
+@dataclass(frozen=True)
+class DbtRunOptions:
+    command: DbtModelCommand
+    selector: str
+    state_path: str
+    defer: bool
+    vars_override: str = field(default="", repr=False)
+
+
+class DbtRunOptionsScreen(DbtDialog):
+    """Choose an explicit dbt command and a selector defined in selectors.yml."""
+
+    DEFAULT_CSS = """
+    DbtRunOptionsScreen #dbt-run-options-state { margin-bottom: 1; }
+    DbtRunOptionsScreen #dbt-run-options-vars { height: 5; margin: 0; }
+    DbtRunOptionsScreen .dbt-buttons Button { width: 1fr; min-width: 0; }
+    """
+    _COMMANDS: tuple[DbtModelCommand, ...] = ("run", "build", "test")
+
+    def __init__(self, home: str) -> None:
+        super().__init__()
+        self.home = home
+        self._selectors: tuple[str, ...] = ()
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(classes="dbt-dialog"):
+            yield Static("Run a named dbt selection")
+            yield Static("Command")
+            yield Select(((command.title(), command) for command in self._COMMANDS), value="build",
+                         allow_blank=False, id="dbt-run-options-command")
+            yield Static("Named selector from selectors.yml")
+            yield Select([], prompt="Choose a named selector", id="dbt-run-options-selector", disabled=True)
+            yield Static("Local state directory (optional)")
+            yield Input(placeholder="Absolute path or relative to the dbt project", id="dbt-run-options-state")
+            yield Static("Defer to the state directory (requires manifest.json)")
+            yield Switch(animate=False, id="dbt-run-options-defer")
+            yield Static("Variable overrides (--vars) · optional YAML mapping. Do not enter secrets.", markup=False)
+            yield DraftTextArea(id="dbt-run-options-vars")
+            yield Static("", id="dbt-message", markup=False)
+            with Horizontal(classes="dbt-buttons"):
+                yield Button("Run Selection", variant="primary", id="dbt-run-options-run", disabled=True, compact=True)
+                yield Button("Close", id="dbt-close", compact=True)
+
+    def on_mount(self) -> None:
+        try:
+            self._selectors = dbt_named_selectors(self.home)
+        except DbtError as exc:
+            self._message(str(exc))
+            return
+        except OSError:
+            self._message("Cannot read selectors.yml. Check the project and file permissions.")
+            return
+        if not self._selectors:
+            self._message("No named selectors found. Add a selector to selectors.yml and reopen this dialog.")
+            return
+        selector = self.query_one("#dbt-run-options-selector", Select)
+        selector.set_options((Text(name), name) for name in self._selectors)
+        selector.disabled = False
+        self.query_one("#dbt-run-options-run", Button).disabled = False
+        selector.focus()
+
+    @on(Button.Pressed, "#dbt-run-options-run")
+    def _submit(self) -> None:
+        command = self.query_one("#dbt-run-options-command", Select).value
+        selector_input = self.query_one("#dbt-run-options-selector", Select)
+        selector = selector_input.value
+        if not isinstance(selector, str) or selector not in self._selectors:
+            self._message("Choose a named selector from selectors.yml.")
+            selector_input.focus()
+            return
+        if command not in self._COMMANDS:
+            self._message("Choose Run, Build or Test.")
+            return
+        state_input = self.query_one("#dbt-run-options-state", Input)
+        state_path = state_input.value.strip()
+        defer = self.query_one("#dbt-run-options-defer", Switch).value
+        if defer and not state_path:
+            self._message("Defer requires a local state directory containing manifest.json.")
+            state_input.focus()
+            return
+        vars_input = self.query_one("#dbt-run-options-vars", DraftTextArea)
+        try:
+            vars_override = validate_run_vars(vars_input.text)
+        except DbtError as exc:
+            self._message(str(exc))
+            vars_input.focus()
+            return
+        self.dismiss(DbtRunOptions(command, selector, state_path, defer, vars_override))
 
 
 class DbtPortScreen(DbtDialog):
@@ -516,6 +912,9 @@ class DbtExplorer(Vertical):
         for key, label in (
             ("test", "Create Data Test"), ("reload", "Reload File from Disk"),
             ("rename", "Rename Open Model"),
+            ("debug", "Debug dbt Connection"), ("selection", "Run Named dbt Selection"),
+            ("results", "Show Last dbt Results"),
+            ("vars", "Edit Project Variables"),
             ("docs", "Generate & Serve Documentation"), ("stop-docs", "Stop Documentation Server"),
         ):
             actions.add_leaf(label, data=("action", key))
@@ -628,6 +1027,14 @@ class DbtExplorer(Vertical):
             self.ide.reload_dbt_file()
         elif value == "rename":
             self.ide.action_dbt_rename()
+        elif value == "debug":
+            self.ide.action_dbt_debug()
+        elif value == "selection":
+            self.ide.action_dbt_selection()
+        elif value == "results":
+            self.ide.action_dbt_results()
+        elif value == "vars":
+            self.ide.action_dbt_vars()
 
     def _docs(self) -> None:
         home = self.ide.session.dbt_project_dir

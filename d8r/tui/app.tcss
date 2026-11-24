@@ -405,8 +405,23 @@ DbtExplorer { height: 1fr; }
 
 /* -- editor + palette --------------------------------------------------- */
 
+#dbt-compile-split { height: 1fr; }
+#dbt-compiled-pane {
+    display: none;
+    height: 1fr;
+    width: 1fr;
+    min-width: 0;
+    border-left: solid $primary;
+}
+#dbt-compiled-status { height: 1; padding: 0 1; text-wrap: nowrap; text-overflow: ellipsis; }
+#dbt-compiled-sql { height: 1fr; border: none; }
+#dbt-compiled-actions { height: 1; }
+#dbt-compiled-actions Button { width: auto; min-width: 0; padding: 0 1; }
+
 #editor-pane {
     height: 1fr;
+    width: 1fr;
+    min-width: 0;
     layers: base overlay;
 }
 
