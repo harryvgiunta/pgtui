@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from difflib import unified_diff
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -25,6 +26,7 @@ from d8r.dbt_git import git_diff
 from d8r.dbt_profiles import DbtTargetSettings
 from d8r.dbt_references import DbtReferences
 from d8r.dbt_rename import DbtRenamePlan, apply_rename, plan_rename
+from d8r.dbt_run import DbtRun
 from .dbt_authoring import DbtLineage, DbtProblems
 from .dbt_completion import DbtTestCompletion, model_columns
 from .editing import DraftTextArea
@@ -65,6 +67,73 @@ class DbtDialog(ModalScreen):
 
     def _message(self, text: str) -> None:
         self.query_one("#dbt-message", Static).update(text)
+
+
+class DbtRunScreen(DbtDialog):
+    """Run the saved model off the UI loop, with a cancellable process lifetime."""
+
+    BINDINGS = [Binding("f8", "cancel", "Cancel dbt", show=False)]
+
+    def __init__(self, prepare: Callable[[], DbtRun]) -> None:
+        super().__init__()
+        self._prepare = prepare
+        self._execution: asyncio.Task[str] | None = None
+        self._result: str | None = None
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(classes="dbt-dialog"):
+            yield Static("Run dbt on saved project files")
+            yield Static("", id="dbt-run-target", markup=False)
+            yield Static("Checking the saved model and workspace target…", id="dbt-message", markup=False)
+            yield Button("Cancel", id="dbt-run-dismiss", variant="primary")
+
+    def on_mount(self) -> None:
+        self._execution = asyncio.create_task(self._run())
+        self._execution.add_done_callback(self._finished)
+
+    async def _run(self) -> str:
+        try:
+            run = await asyncio.to_thread(self._prepare)
+            self.query_one("#dbt-run-target", Static).update(
+                f"dbt {run.verb} --select {run.selector}\n"
+                f"Project: {run.root}\nProfile: {run.target.profile} · Target: {run.target.name}\n"
+                f"Log: {run.log_dir / 'dbt.log'}")
+            self._message("Running dbt…")
+            code = await run.execute()
+        except DbtError as exc:
+            return f"dbt not started · {exc}"
+        except OSError:
+            return "dbt not started · Could not read the project files. Check their permissions."
+        return (f"dbt {run.verb} failed (exit {code}) · see dbt.log for details" if code
+                else f"dbt {run.verb} completed · see dbt.log for results")
+
+    def _finished(self, task: asyncio.Task[str]) -> None:
+        if self._execution is not task or not self.app.is_running or self.app.screen is not self:
+            return
+        self._result = ("dbt cancelled · changes already committed may remain" if task.cancelled()
+                        else task.result())
+        self._message(self._result)
+        button = self.query_one("#dbt-run-dismiss", Button)
+        button.label = "Close"
+        button.disabled = False
+        button.focus()
+
+    @on(Button.Pressed, "#dbt-run-dismiss")
+    def action_cancel(self) -> None:
+        task = self._execution
+        if task is None or task.done():
+            self.dismiss(self._result)
+        elif not task.cancelling():
+            self._message("Cancelling dbt…")
+            self.query_one("#dbt-run-dismiss", Button).disabled = True
+            task.cancel()
+
+    async def on_unmount(self) -> None:
+        task, self._execution = self._execution, None
+        if task is not None:
+            if not task.done() and not task.cancelling():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 class DBTScreen(DbtDialog):

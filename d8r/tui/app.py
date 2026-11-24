@@ -48,6 +48,7 @@ from d8r.dbt_edits import DbtDraft, add_description
 from d8r.dbt_files import DbtFile, DbtFiles, file_revision, reference_at
 from d8r.dbt_profiles import DbtTargetSettings
 from d8r.dbt_rename import DbtRenamePlan
+from d8r.dbt_run import DbtModelCommand, prepare_dbt_run
 from d8r.engine import POSTGRES_VERSION, DataSource, EngineError, postgres_definition
 from d8r.sql import ColumnDef, format_parameters
 from d8r.themes import COZY_PASTEL
@@ -56,7 +57,7 @@ from .add_source import AddSourceModal
 from .catalog import (CatalogDefinitionScreen, DefinitionLink, add_catalog_groups, definition_leaf,
                       expand_catalog_group)
 from .connection import ConnectionProgress, build_saved_source, saved_source_label
-from .dbt import DbtExplorer, DbtModelScreen, DbtRenameScreen, DbtTestScreen
+from .dbt import DbtExplorer, DbtModelScreen, DbtRenameScreen, DbtRunScreen, DbtTestScreen
 from .dbt_authoring import DbtAuthoring
 from .dbt_setup import DbtSetupScreen
 from .editor_tools import FindBar, format_editor
@@ -1289,7 +1290,7 @@ class D8RApp(App):
             self.exit()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        if self.screen_stack and isinstance(self.screen, (CompletionKeyScreen, DbtTestScreen, DbtRenameScreen)):
+        if self.screen_stack and isinstance(self.screen, (CompletionKeyScreen, DbtTestScreen, DbtRenameScreen, DbtRunScreen)):
             return False  # Keep workspace shortcuts out of the modal editor.
         if action == "dbt_definition":
             return (self._workspace_ready and not self.function_mode and not self._modal_open()
@@ -1910,6 +1911,34 @@ class D8RApp(App):
         if saved:
             mode = "dbt Jinja" if to_dbt else "Native SQL (read-only preview)" if render_only else "Native SQL"
             self._set_status(f"{mode} · nothing executed{note}")
+
+    def _run_dbt_model(self, command: DbtModelCommand) -> None:
+        if (not self._workspace_ready or self._closing or not self.session.dbt_enabled
+                or self._modal_open() or self.function_mode or self.refuse_busy("Run dbt")):
+            return
+        link = self._dbt_file
+        home = self.session.dbt_project_dir
+        if not link or link["project_dir"] != home:
+            self._set_status("Open a model from this workspace's configured dbt project first.")
+            return
+        path = link["path"]
+        self._flush_workspace()
+        revision = self._dbt_file["revision"]
+        text = self.editor.text
+        views = self._dbt_views
+        if text == views.get("sql"):
+            text = views["jinja"]
+        if not revision or file_revision(text) != revision:
+            self._set_status(f"Save {path} before running dbt. Check for unsaved edits or a disk conflict.")
+            return
+        settings = self.session.dbt_target_settings(home)
+
+        def closed(status: str | None) -> None:
+            if status:
+                self._set_status(status)
+            self.dbt_authoring.invalidate()
+
+        self.push_screen(DbtRunScreen(lambda: prepare_dbt_run(home, path, revision, settings, command)), closed)
 
     def _dbt_workspace_settings(self, *, source_key: str | None = None, **changes) -> bool:
         workspaces = deepcopy(self.session.workspace["source_workspaces"])
@@ -3076,6 +3105,10 @@ class D8RApp(App):
             "compile": self.action_compile,
             "explain": self.action_explain,
             "dbt": self.action_dbt,
+            "dbt-run": lambda: self._run_dbt_model("run"),
+            "dbt-run-with-deps": lambda: self._run_dbt_model("run-with-deps"),
+            "dbt-build": lambda: self._run_dbt_model("build"),
+            "dbt-test": lambda: self._run_dbt_model("test"),
             "dbt-lineage": self.action_dbt_lineage,
             "dbt-problems": self.action_dbt_problems,
             "dbt-references": self.action_dbt_references,

@@ -291,7 +291,8 @@ override uses the `target:` under the profile named in `dbt_project.yml`.
 that the effective target exists without connecting or running dbt. If the
 default is templated, select a literal output as the override.
 
-Compile each target into its own directory from the project home. For example:
+To generate compiled SQL without running a model, compile each target into its
+own directory from the project home. For example:
 
 ```sh
 dbt compile --profiles-dir "<profiles-directory>" --profile analytics --target stage --target-path target/stage --write-json
@@ -370,6 +371,27 @@ Indexing and both rename commands honor `.dbtignore` and project-local
 `.gitignore` rules (including nested `.gitignore` files). The rules apply
 regardless of Git tracking status. Apply rechecks ignore rules and the input
 inventory before writing.
+
+### Run a model with dbt
+
+In a dbt-enabled workspace, open a SQL model from the configured project and
+type `\dbt` in the editor to find these actions:
+
+| Backslash command | dbt invocation |
+| --- | --- |
+| `\dbt-run` | `dbt run --select model` |
+| `\dbt-run-with-deps` | `dbt run --select +model` (includes upstream models) |
+| `\dbt-build` | `dbt build --select model` |
+| `\dbt-test` | `dbt test --select model` |
+
+PGTUI saves the open model before running bundled dbt Core from the project
+home. dbt uses the workspace target override, or the profile default if no
+override is set, without switching PGTUI's SQL connection. These actions can
+write to the target and execute project hooks; run them only in trusted projects.
+
+The dialog shows the target, result and path to dbt's local log. **F8** or
+**Esc** cancels a running process; already committed changes may remain. dbt
+writes artifacts to `<target-path>/<target>` (default `target/<target>`).
 
 ### SQL ↔ dbt switch
 

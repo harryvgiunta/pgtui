@@ -33,6 +33,10 @@ ACTIONS: tuple[tuple[str, str, str], ...] = (
     ("Data source…", "ctrl+o · PostgreSQL, Cloudflare D1 or local Parquet", "add-source"),
     ("Functions…", "open the SQL function library", "fn"),
     ("dbt", "switch this draft between native SQL and dbt Jinja", "dbt"),
+    ("dbt run model", "run the open model on the workspace target", "dbt-run"),
+    ("dbt run with deps", "run the open model and its upstream dependencies", "dbt-run-with-deps"),
+    ("dbt build model", "build and test the open model on the workspace target", "dbt-build"),
+    ("dbt test model", "run tests selected by the open model", "dbt-test"),
     ("dbt lineage", "follow upstream and downstream models and columns", "dbt-lineage"),
     ("dbt problems", "review this file's live diagnostics", "dbt-problems"),
     ("dbt references", "find usages of the dbt resource or column at the caret", "dbt-references"),
@@ -49,7 +53,7 @@ ACTIONS: tuple[tuple[str, str, str], ...] = (
     ("Settings", "every setting, full screen", "settings"),
 )
 
-_DBT_ACTIONS = frozenset({"dbt", "dbt-lineage", "dbt-problems", "dbt-references", "dbt-rename-column"})
+_DBT_ACTIONS = frozenset(name for _, _, name in ACTIONS if name == "dbt" or name.startswith("dbt-"))
 
 
 @dataclass(frozen=True)
