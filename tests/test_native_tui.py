@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 from functools import wraps
 from textual import events
-from textual.widgets import Button, DataTable, Input, Select, Static, Tab, TabbedContent, TextArea
+from textual.widgets import Button, DataTable, Input, OptionList, Select, Static, Tab, TabbedContent, TextArea
 
 from d8r.tui.add_source import AddSourceModal
 from d8r.tui.app import D8RApp
@@ -99,34 +99,40 @@ async def test_sql_completion_run_results_and_multiple_tabs(parquet_source):
         assert "3 results" in footer and "3 rows" not in footer
 
 
+async def _pointer_event(pilot, event, point, *, button=1):
+    # Pilot.click bypasses App's MouseDown/MouseUp synthesis.
+    pilot.app.post_message(event(None, *point, 0, 0, button, False, False, False))
+    await pilot.pause()
+
+
+async def _click_at(pilot, point):
+    await _pointer_event(pilot, events.MouseDown, point)
+    await _pointer_event(pilot, events.MouseUp, point)
+
+
 @async_test
-async def test_source_menu_does_not_swallow_editor_or_run_clicks(parquet_source):
-    session = Session({parquet_source.id: parquet_source})
+async def test_source_menu_does_not_swallow_editor_or_run_clicks(parquet_source, d1_source):
+    session = Session({parquet_source.id: parquet_source, d1_source.id: d1_source})
     app = D8RApp(session)
     async with app.run_test(size=(80, 24)) as pilot:
-        async def click_at(x, y):
-            # Textual's Pilot.click bypasses App's MouseDown/MouseUp synthesis.
-            for event in (events.MouseDown, events.MouseUp):
-                app.post_message(event(None, x, y, 0, 0, 1, False, False, False))
-                await pilot.pause()
-
         picker = app.query_one("#source-select", Select)
+        label = picker.query_one("SelectCurrent #label")
         editor = app.editor
         editor.load_text("SELECT 42")
         await pilot.pause()
 
-        await click_at(*picker.region.offset)
+        await _click_at(pilot, label.region.offset)
         assert picker.expanded
-        await click_at(editor.region.x + editor.gutter.left + editor.gutter_width + 4,
-                       editor.region.y + editor.gutter.top)
+        await _click_at(pilot, (editor.region.x + editor.gutter.left + editor.gutter_width + 4,
+                                editor.region.y + editor.gutter.top))
         assert not picker.expanded
         assert app.focused is editor
         assert editor.cursor_location == (0, 4)
 
-        await click_at(*picker.region.offset)
+        await _click_at(pilot, label.region.offset)
         assert picker.expanded
         run = app.query_one("#run-query", Button)
-        await click_at(*run.region.offset)
+        await _click_at(pilot, run.region.offset)
         await app.workers.wait_for_complete()
         await pilot.pause()
         results = app.query_one("#results-table", ResultsTable)
@@ -135,7 +141,7 @@ async def test_source_menu_does_not_swallow_editor_or_run_clicks(parquet_source)
         assert results.raw_rows == ((42,),)
 
         editor.load_text("SELECT 43")
-        await click_at(*picker.region.offset)
+        await _click_at(pilot, label.region.offset)
         assert picker.expanded
         await pilot.press("f5")
         await app.workers.wait_for_complete()
@@ -144,9 +150,71 @@ async def test_source_menu_does_not_swallow_editor_or_run_clicks(parquet_source)
         assert app.focused is editor
         assert results.raw_rows == ((43,),)
 
-        await click_at(*picker.region.offset)
+        await _click_at(pilot, label.region.offset)
+        assert picker.expanded
+        await _click_at(pilot, label.region.offset)
+        assert not picker.expanded
+        await _click_at(pilot, label.region.offset)
+        menu = picker.query_one("SelectOverlay", OptionList)
+        option = next(i for i in range(menu.option_count) if menu.get_option_at_index(i).prompt.plain == d1_source.display)
+        x = menu.content_region.x
+        y = next(y for y in range(menu.content_region.y, menu.content_region.bottom)
+                 if app.screen.get_style_at(x, y).meta.get("option") == option)
+        await _click_at(pilot, (x, y))
+        assert session.source is d1_source
+        assert picker.value == d1_source.id
+        assert not picker.expanded
+
+        await _click_at(pilot, label.region.offset)
         await pilot.press("home", "enter")
         assert isinstance(app.screen, AddSourceModal)
+
+
+@async_test
+async def test_interrupted_drag_does_not_block_workspace_clicks(parquet_source):
+    app = D8RApp(Session({parquet_source.id: parquet_source}))
+    async with app.run_test(size=(110, 35)) as pilot:
+        editor = app.editor
+        editor.load_text("SELECT 42")
+        await pilot.pause()
+        text_point = (editor.region.x + editor.gutter.left + editor.gutter_width, editor.region.y + editor.gutter.top)
+        await _pointer_event(pilot, events.MouseDown, text_point)
+        assert app.mouse_captured is editor
+
+        # The previous drag's button-up never arrived. The next click still opens the picker.
+        picker = app.query_one("#source-select", Select)
+        await _click_at(pilot, picker.query_one("SelectCurrent #label").region.offset)
+        assert picker.expanded
+        explorer = app.query_one("#explorer-tabs", TabbedContent)
+        await _click_at(pilot, explorer.get_tab("tab-pages").region.center)
+        assert explorer.active == "tab-pages"
+        assert not picker.expanded
+
+        await pilot.press("f5")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        results = app.query_one("#results-table", ResultsTable)
+        region = results.content_region
+        cell = next((x, y) for y in range(region.y, region.bottom) for x in range(region.x, region.right)
+                    if app.screen.get_style_at(x, y).meta.get("row") == 0)
+        await _pointer_event(pilot, events.MouseDown, cell)
+        assert app.mouse_captured is results
+
+        # Clear the selection and hide the pane while the pointer is still captured.
+        await pilot.press("escape", "escape")
+        assert not app.query_one("#output-slot").display
+        schema = explorer.get_tab("tab-schema")
+        await _pointer_event(pilot, events.MouseMove, schema.region.center, button=0)
+        assert schema.mouse_hover
+        await _click_at(pilot, schema.region.center)
+        assert explorer.active == "tab-schema"
+
+        await _pointer_event(pilot, events.MouseDown, text_point)
+        selection = editor.selection
+        app.post_message(events.AppBlur())
+        app.post_message(events.AppFocus())
+        await _pointer_event(pilot, events.MouseMove, (text_point[0] + 5, text_point[1]), button=0)
+        assert editor.selection == selection  # Refocusing doesn't continue the old drag.
 
 
 @async_test

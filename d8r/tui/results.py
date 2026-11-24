@@ -323,6 +323,9 @@ class ResultsTable(DataTable):
         if cell is not None:
             self._select_to(cell)
 
+    @on(events.MouseRelease)
+    @on(events.Hide)
+    @on(events.Unmount)
     def _end_drag(self) -> None:
         if self._dragging:
             self._dragging = False

@@ -341,6 +341,20 @@ class D8RApp(App):
         """The IDE runs on `IdeScreen`, whose tab does not walk the panes."""
         return IdeScreen(id="_default")
 
+    async def on_event(self, event: events.Event) -> None:
+        if isinstance(event, events.AppBlur) or (
+            isinstance(event, events.MouseDown) and not event.is_forwarded
+        ):
+            # A release outside the terminal or after hiding a drag target may
+            # never reach its widget. A new press must hit-test independently.
+            if (captured := self.mouse_captured) is not None:
+                if isinstance(captured, TextArea):
+                    captured._end_mouse_selection()
+                captured.release_mouse()
+            if isinstance(event, events.AppBlur):
+                self.screen.suppress_click()
+        await super().on_event(event)
+
     # -- layout -------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
@@ -380,6 +394,13 @@ class D8RApp(App):
             with Vertical(id="work-bench"):
                 with Vertical(id="editor-slot"):
                     with Vertical(id="query-header"):
+                        with Horizontal(id="query-targets"):
+                            yield _WorkspaceSourceSelect(
+                                self._source_options(), allow_blank=False,
+                                value=self.session.active_id, id="source-select",
+                                tooltip="Switch source workspace",
+                            )
+                            yield Static("", id="source-version", markup=False)
                         with Horizontal(id="document-actions"):
                             yield Button("Run SQL", id="run-query", compact=True,
                                          tooltip=binding_tooltip(self.BINDINGS, "run") + " · Page reads; execute writes once")
@@ -390,15 +411,6 @@ class D8RApp(App):
                             yield Button("Ask AI", id="open-ai", compact=True)
                             yield Button("Show Page Details", id="page-details-toggle", compact=True)
                             yield Button("Reconnect", id="reconnect-source", compact=True)
-                        # Keep actions above the popup, and the left edge of the
-                        # editor clear when the right-aligned picker is open.
-                        with Horizontal(id="query-targets"):
-                            yield Static("", id="source-version", markup=False)
-                            yield _WorkspaceSourceSelect(
-                                self._source_options(), allow_blank=False,
-                                value=self.session.active_id, id="source-select",
-                                tooltip="Switch source workspace",
-                            )
                         yield PageDetails(self, id="page-details")
                         yield Static("", id="dbt-file-path", markup=False)
                     with Horizontal(id="editor-tools"):
