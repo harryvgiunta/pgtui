@@ -888,23 +888,41 @@ class Session:
                          if self._postgres_profile_id(profile) == source_id), None)
         return {**postgres, "kind": "postgres-live"} if postgres is not None else None
 
-    def source_options(self) -> list[tuple[str, str]]:
-        """Registered sources plus saved targets that are not registered yet."""
+    def _source_choices(self) -> list[tuple[str, str, str]]:
+        """Display label, selector ID and native dialect; no target needs to be opened."""
         registered = {self.source_key(name) for name in self.sources}
-        return [(source.display, source.id) for source in self.sources.values()] + [
-            (f"{profile['display']} · disconnected", self._postgres_profile_id(profile))
+        return [(source.display, source.id, source.dialect) for source in self.sources.values()] + [
+            (f"{profile['display']} · disconnected", self._postgres_profile_id(profile), "postgres")
             for profile in self.postgres_profiles
             if self._postgres_profile_id(profile) not in registered
         ] + [
-            (f"{profile['display']} · disconnected", self._d1_profile_id(profile))
+            (f"{profile['display']} · disconnected", self._d1_profile_id(profile), "sqlite")
             for profile in self.d1_profiles
             if self._d1_profile_id(profile) not in registered
         ] + [
-            (f"{source['display']} · disconnected", key)
+            (f"{source['display']} · disconnected", key,
+             "duckdb" if source["kind"] == "parquet" else "sqlite" if source["kind"] == "d1-live" else "postgres")
             for key, source in self.workspace["sources"].items()
             if (source["kind"] in {"parquet", "d1-live"} or key.startswith("dbt:")) and key not in registered
             and not any(self._d1_profile_id(profile) == key for profile in self.d1_profiles)
         ]
+
+    def source_options(self) -> list[tuple[str, str]]:
+        return [(label, source_id) for label, source_id, _ in self._source_choices()]
+
+    def page_copy_targets(self) -> dict[str, tuple[str, str]]:
+        """Other configured workspaces, keyed by durable identity rather than a registry slug."""
+        current = self.source_key()
+        targets = {}
+        for label, source_id, dialect in self._source_choices():
+            key = self.source_key(source_id)
+            if key == current:
+                continue
+            source = self.sources.get(source_id)
+            if source_id == "postgres" and source and source.kind == "disconnected" and not source.connection_key:
+                continue  # The blank startup placeholder is not a configured destination.
+            targets[key] = (label, dialect)
+        return targets
 
     def set_active(self, source_id: str) -> None:
         """Point the session at another registered source and capture its schema."""

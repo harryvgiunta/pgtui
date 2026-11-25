@@ -111,6 +111,39 @@ async def _click_at(pilot, point):
 
 
 @async_test
+async def test_editor_click_selects_caret_word_and_logical_line():
+    session = Session()
+    session.update_settings(intellisense=False)
+    app = D8RApp(session)
+    async with app.run_test(size=(110, 42)) as pilot:
+        editor = app.editor
+        word = "注文.order_id"
+        line = "\tSELECT " + "value, " * 20 + word + "  FROM orders;  "
+        sql = "-- before\r\n" + line + "\r\n-- after"
+        editor.soft_wrap = True
+        editor.load_text(sql)
+        await pilot.pause()
+
+        async def click(column, times):
+            point = editor.wrapped_document.location_to_offset((1, column)) - editor.scroll_offset
+            offset = (editor.gutter.left + editor.gutter_width + point.x, editor.gutter.top + point.y)
+            assert await pilot.click(editor, offset=offset, times=times)
+
+        column = line.index("_")
+        assert editor.wrapped_document.location_to_offset((1, column)).y > 1
+        await click(column, 1)
+        assert editor.cursor_location == (1, column) and not editor.selected_text
+        await click(column, 2)
+        assert editor.selected_text == word
+        await click(column, 3)
+        assert editor.selected_text == line  # Includes indentation and trailing spaces, not CRLF.
+        space = line.index("  FROM")
+        await click(space, 2)
+        assert editor.cursor_location == (1, space) and not editor.selected_text
+        assert editor.text == sql
+
+
+@async_test
 async def test_source_menu_does_not_swallow_editor_or_run_clicks(parquet_source, d1_source):
     session = Session({parquet_source.id: parquet_source, d1_source.id: d1_source})
     app = D8RApp(session)
@@ -254,7 +287,7 @@ async def test_results_drag_bar_operates_on_current_tab_and_preserves_pins(parqu
             assert control.region.height == 1 and control.region.y == handle.region.y
         initial = app.session.pane_sizes["editor"]
         await pilot.click("#results-copy")
-        assert app.clipboard.splitlines() == ["n", "22"]
+        assert app.clipboard == "22"
         await pilot.click("#results-export")
         assert isinstance(app.screen, ExportModal) and app.screen.snapshot.rows == ((22,),)
         await pilot.press("escape")

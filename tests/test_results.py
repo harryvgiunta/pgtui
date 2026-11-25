@@ -109,7 +109,7 @@ def test_range_and_disjoint_selection_copy_raw_tsv_and_highlight_full_rows():
 
         await pilot.press("escape", "ctrl+c")
         assert not table.selected_rows
-        assert list(csv.reader(io.StringIO(app.clipboard), delimiter="\t")) == [["amount"], ["4.50"]]
+        assert app.clipboard == "4.50"
 
     run_grid(scenario, result)
 
@@ -128,7 +128,7 @@ def test_select_all_resets_on_new_result_and_resize_still_works():
         assert not table.selected_rows
         assert table.row_count == 1
         await pilot.press("ctrl+c")
-        assert list(csv.reader(io.StringIO(app.clipboard), delimiter="\t")) == [["fresh"], ["7"]]
+        assert app.clipboard == "7"
 
     run_grid(scenario)
 
@@ -157,7 +157,7 @@ def test_cell_range_reverses_and_copies_only_highlighted_fields():
         assert cells[1].bgcolor != cells[0].bgcolor
         assert cells[2].bgcolor == cells[1].bgcolor
         await pilot.press("left", "ctrl+c")
-        assert list(csv.reader(io.StringIO(app.clipboard), delimiter="\t")) == [["amount"], [""]]
+        assert app.clipboard == ""
         await pilot.press("ctrl+space", "ctrl+c")
         assert list(csv.reader(io.StringIO(app.clipboard), delimiter="\t")) == [
             ["amount"], ["1.20"], [""], ["3.40"], ["4.50"],
@@ -168,6 +168,9 @@ def test_cell_range_reverses_and_copies_only_highlighted_fields():
 
 def test_mouse_drag_shift_click_and_row_column_headers():
     async def scenario(app, pilot, table):
+        await pilot.click(table, offset=cell_offset(table, 0, 0))
+        await pilot.press("ctrl+c")
+        assert app.clipboard == 'first\t"quoted"\nline'
         await pilot.mouse_down(table, offset=cell_offset(table, 0, 1))
         await pilot.hover(table, offset=cell_offset(table, 2, 2))
         await pilot.mouse_up(table, offset=cell_offset(table, 2, 2))
@@ -207,7 +210,7 @@ def test_range_scrolls_and_stays_within_buffer_then_resets():
         table.show_result(RunOutcome(ok=True, columns=["new"], rows=[[42]], total=1))
         await pilot.pause()
         await pilot.press("ctrl+c")
-        assert list(csv.reader(io.StringIO(app.clipboard), delimiter="\t")) == [["new"], ["42"]]
+        assert app.clipboard == "42"
 
     run_grid(scenario, result)
 

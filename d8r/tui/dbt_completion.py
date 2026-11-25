@@ -1,21 +1,36 @@
-"""Local, completion-only metadata and SQL projection for the manual dbt test editor."""
+"""Completion-only SQL projections for the dbt model and manual test editors."""
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, fields, replace
+from functools import lru_cache
 from itertools import count
 from pathlib import Path
 
-from d8r.completion.catalog import keywords_for
+from d8r.completion.catalog import dialect_name, keywords_for
 from d8r.completion.context import _MAX_CHARS, _MAX_TOKENS, _Model, _scan, command_span
 from d8r.completion.engine import complete
 from d8r.completion.models import Completion, Context
-from d8r.dbt import DbtError, _call, _expression_end, _JINJA_OPEN, _yaml
+from d8r.dbt import DbtError, _call, _JINJA_OPEN, _yaml
 from d8r.dbt_files import DbtFiles, DbtModel
+from d8r.dbt_index import DbtIndex, DbtResource, _Tag, _calls, _tags
 from d8r.sql import ColumnDef, SchemaContext, TableDef, relation_parts
 
 
+def _pad(tag: str, insertion: str) -> str | None:
+    """Keep every offset, including the line endings *inside* multiline tags."""
+    blank = re.sub(r"[^\r\n]+", lambda m: " " * len(m[0]), tag)
+    if not insertion:
+        return blank
+    run = re.search(r" {%d}" % len(insertion), blank)
+    if run is None:
+        return None
+    return blank[:run.start()] + insertion + blank[run.end():]
+
+
 def _shadow(document: str, dialect: str, *,
+            bind: Callable[[_Tag], str] | None = None,
             selected_ref: Callable[[list, dict], bool] | None = None,
             names: tuple[str, str] = ("_dbr0_", "_dbr1_")) -> tuple[str, tuple[tuple[int, int], ...]] | None:
     """Map literal refs to temporary relation identifiers, preserving all offsets.
@@ -29,21 +44,25 @@ def _shadow(document: str, dialect: str, *,
         return document, ()
     chunks, spans = [], []
     previous = 0
-    for token in _scan(document, dialect):
-        if token.start < previous or token.kind != "symbol" or not _JINJA_OPEN.match(document, token.start):
+    # The manual test editor recognizes tags only in native SQL, whereas the
+    # dbt model editor owns template spans even in lexically incomplete SQL
+    # (notably an unfinished quoted identifier before a templated FROM).
+    active = None if bind else {t.start for t in _scan(document, dialect)
+                                if t.kind == "symbol" and _JINJA_OPEN.match(document, t.start)}
+    last_tag = 0
+    for tag in _tags(document):
+        last_tag = tag.end
+        if active is not None and tag.start not in active:
             continue
-        start = token.start
-        opening = document[start:start + 2]
-        if opening == "{#":
-            close = document.find("#}", start + 2)
-            if close < 0:
-                return None
+        if not tag.closed or tag.broken or tag.kind not in {"#", "{"}:
+            return None  # Never flatten alternative branches into a single scope.
+        if tag.kind == "#":
             insertion = ""
-        elif opening == "{{":
+        elif bind:
+            insertion = bind(tag)
+        else:
             try:
-                close = _expression_end(document, start + 2)
-                expression = document[start + 2:close].strip().removeprefix("-").removesuffix("-")
-                kind, args, kwargs = _call(expression)
+                kind, args, kwargs = _call(document[tag.body_start:tag.body_end])
             except DbtError:
                 return None
             if kind == "config":
@@ -52,19 +71,20 @@ def _shadow(document: str, dialect: str, *,
                 insertion = names[0] if kind == "ref" and selected_ref and selected_ref(args, kwargs) else names[1]
             else:
                 return None
-        else:
-            return None  # Control flow can change the shape and names of the projection.
-        end = close + 2
-        if len(insertion) > end - start:
+        start, end = tag.start, tag.end
+        padded = _pad(document[start:end], insertion)
+        if padded is None:
             return None
-        blank = "".join(char if char in "\r\n" else " " for char in document[start:end])
-        chunks.extend((document[previous:start], insertion + blank[len(insertion):]))
+        chunks.extend((document[previous:start], padded))
         spans.append((start, end))
         previous = end
+    if _JINJA_OPEN.search(document, last_tag):
+        return None  # The bounded tag scanner stopped before EOF.
     chunks.append(document[previous:])
     return "".join(chunks), tuple(spans)
 
 
+@lru_cache(maxsize=32)
 def _projection(document: str, dialect: str) -> tuple[str, ...]:
     shadow = _shadow(document, dialect)
     if shadow is None:
@@ -199,3 +219,150 @@ class DbtTestCompletion:
             detail = item.detail.replace(marker, self.model.name).replace(unknown, "dbt relation")
             proposals.append(replace(item, insert=insert, detail=detail, table=None))
         return replace(result, items=tuple(proposals))
+
+
+@dataclass(frozen=True, kw_only=True)
+class _BoundSchema(SchemaContext):
+    """Lookup-only dbt relations on top of an existing immutable native catalog."""
+
+    native: SchemaContext
+    bindings: dict[str, TableDef]
+
+    def __post_init__(self) -> None:
+        # Share the catalog, indexes and routines; never rebuild the column pool
+        # per keystroke. Nor should an unbound SELECT offer arbitrary pool fields.
+        for field in fields(SchemaContext):
+            value = () if field.name == "pool" else getattr(self.native, field.name)
+            object.__setattr__(self, field.name, value)
+
+    def table_by_name(self, name: str, *, dialect: str = "postgres") -> TableDef | None:
+        return self.bindings.get(name) or self.native.table_by_name(name, dialect=dialect)
+
+
+# Cache one immutable snapshot by identity: hashing SchemaContext walks its
+# columns. A target switch replaces the lookup instead of accumulating catalogs.
+_physical_cache: tuple[SchemaContext, str, dict[tuple[str, ...], TableDef | None]] | None = None
+
+
+def _physical_table(schema: SchemaContext, relation: str, dialect: str) -> TableDef | None:
+    if not relation:
+        return None
+    default = schema.default_schema or ("main" if dialect == "sqlite" else None)
+
+    def identity(name: str) -> tuple[str, ...]:
+        parts = relation_parts(name, dialect=dialect) or ()
+        # DuckDB Parquet and D1 cache default-namespace tables unqualified.
+        if len(parts) == 1 and default:
+            parts = (default, *parts)
+        return parts if dialect == "postgres" else tuple(part.lower() for part in parts)
+
+    global _physical_cache
+    cache = _physical_cache
+    if cache is None or cache[0] is not schema or cache[1] != dialect:
+        tables: dict[tuple[str, ...], TableDef | None] = {}
+        for table in schema.tables:
+            if key := identity(table.name):
+                tables[key] = None if key in tables else table
+        cache = _physical_cache = (schema, dialect, tables)
+    return cache[2].get(identity(relation))
+
+
+def _resource_table(index: DbtIndex, resource: DbtResource, schema: SchemaContext, dialect: str) -> TableDef:
+    physical = _physical_table(schema, resource.relation, dialect)
+    key = (lambda name: name) if dialect == "postgres" else str.lower
+    columns = {key(col.name): col for col in physical.columns} if physical else {}
+    for declared in resource.columns:
+        name = key(declared.name)
+        cached = columns.get(name)
+        columns[name] = (ColumnDef(cached.name, declared.type or cached.type,
+                                   declared.doc or cached.doc, cached.values) if cached else declared)
+    if resource.path.lower().endswith(".sql"):
+        try:
+            sql = index.read(resource.path)  # DbtIndex.read is snapshot-only.
+        except DbtError:
+            pass
+        else:
+            if len(sql) <= _MAX_CHARS:
+                for name in _projection(sql, dialect):
+                    columns.setdefault(key(name), ColumnDef(name, ""))
+    # Use the real table identity for FK/lineage metadata, never the shadow
+    # identifier. A logical dbt name alone is not a physical SQL table name.
+    return TableDef(physical.name if physical else resource.relation or "", resource.label, tuple(columns.values()))
+
+
+def complete_dbt_sql(index: DbtIndex | None, document: str, offset: int, schema: SchemaContext,
+                     *, dialect: str, manual: bool) -> Completion | None:
+    """Complete the SQL outside template tags using only the two supplied snapshots."""
+    if not 0 <= offset <= len(document) or len(document) > _MAX_CHARS or not _JINJA_OPEN.search(document):
+        return None
+    dialect = dialect_name(dialect)
+    if command_span(document, offset, dialect=dialect) is not None:
+        return None
+
+    # A fresh family absent from the authored SQL cannot collide with an alias
+    # or CTE, even one deliberately named like one of our parser identifiers.
+    occupied = set(re.findall(r"_d([0-9a-f]+)_", document.casefold()))
+    family = next(f"{i:x}" for i in count() if f"{i:x}" not in occupied)
+    prefix = f"_d{family}_"
+    bindings: dict[str, TableDef] = {}
+    markers: dict[str | None, str] = {}
+
+    def bind(tag: _Tag) -> str:
+        if tag.tokens and tag.tokens[0].text == "config":
+            try:
+                if _call(document[tag.body_start:tag.body_end])[0] == "config":
+                    return ""
+            except DbtError:
+                pass  # A compound/dynamic expression is not a known empty config tag.
+        resource = None
+        if index is not None:
+            call = next((c for c in _calls((tag,)) if c.standalone and not c.dynamic), None)
+            if call:
+                resource = index.resolve(call.kind, call.args, call.kwargs)
+        key = resource.key if resource else None
+        if key not in markers:
+            marker = markers[key] = prefix + f"{len(markers):x}"
+            bindings[marker] = (_resource_table(index, resource, schema, dialect)
+                                if resource and index is not None else TableDef(""))
+        return markers[key]
+
+    projected = _shadow(document, dialect, bind=bind)
+    if projected is None:
+        return None
+    text, spans = projected
+    blocked = Completion(Context(offset, offset, blocked=True))
+    if any(a <= offset < b for a, b in spans):
+        return blocked
+    result = complete(text, offset, _BoundSchema(native=schema, bindings=bindings), dialect=dialect, manual=manual)
+    context = result.context
+    if (context.blocked or context.literal or prefix in context.qualifier.casefold()
+            or any(context.start < b and a < context.end for a, b in spans)):
+        return blocked
+    items = []
+    for item in result.items:
+        start = context.start if item.start is None else item.start
+        end = context.end if item.end is None else item.end
+        if any(start < b and a < end for a, b in spans):
+            continue
+        if item.kind == "expansion" or (context.group_expressions and item.kind == "snippet"
+                                         and item.label.startswith("GROUP BY all")):
+            # Native relations don't track completeness through stars/CTEs;
+            # a dbt properties column list is not an exhaustive projection.
+            continue
+        insert, detail = item.insert, item.detail
+        if item.kind == "column" and insert.startswith(prefix) and prefix not in item.label.casefold():
+            marker, dot, component = insert.partition(".")
+            if dot and marker in bindings:
+                # Native labels are unqualified only for unambiguous columns.
+                insert = component
+                detail = detail.replace(marker, bindings[marker].doc)
+        if any(prefix in value.casefold() for value in (item.label, insert, detail, item.documentation)):
+            continue
+        if (insert, detail) != (item.insert, item.detail):
+            item = replace(item, insert=insert, detail=detail)
+        items.append(item)
+    # Parser relation/lineage objects may contain private marker names. Only
+    # publish facts about the authored caret and its edit, not the shadow scope.
+    editor = Context(context.start, context.end, context.token, context.qualifier, context.quote, context.clause,
+                     statement_start=context.statement_start, statement_end=context.statement_end)
+    return Completion(editor, tuple(items), result.signature, result.hint)

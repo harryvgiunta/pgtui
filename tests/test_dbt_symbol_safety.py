@@ -87,3 +87,39 @@ def test_schema_warnings_only_for_complete_inputs(tmp_path):
     warning, = result.diagnostics
     assert warning.severity == 'warning'
     assert files.read(path).text[warning.start:warning.end] == 'missing'
+
+
+@pytest.mark.parametrize(('dialect', 'alias', 'in_cte', 'clause'), [
+    ('postgres', 'x', True, '\r\nWHERE y.id > 0'),
+    ('duckdb', '"Left ""Side"""', False, '\r\nWHERE y.id > 0'),
+    ('postgres', 'x', True, '\r\nORDER BY y.id'),
+    ('sqlite', '"Left Side"', False, ''),  # Dot at EOF.
+    ('postgres', 'x', True, ''),  # Dot immediately before the CTE closes.
+])
+def test_dbt_join_diagnostic_points_to_authored_dot(dialect, alias, in_cte, clause):
+    relation = "{{ source('landing', 'transactions') }}"
+    prefix = (('WITH q AS (\r\n' if in_cte else '') + f'SELECT 1 AS n FROM {relation} AS {alias}\r\n'
+              f'LEFT JOIN {relation} AS y ON {alias}.')
+    suffix = clause + (') SELECT n FROM q' if in_cte else '')
+    problem, = analyze_file(None, 'model.sql', prefix + suffix, dialect, SchemaContext()).diagnostics
+    assert (problem.source, problem.severity) == ('SQL', 'error')
+    assert (problem.start, problem.end) == (len(prefix) - 1, len(prefix))
+    assert problem.message == f'Expected a column name after {alias}.'
+
+    complete = prefix + 'id = y.id' + suffix
+    assert not analyze_file(None, 'model.sql', complete, dialect, SchemaContext()).diagnostics
+
+
+@pytest.mark.parametrize(('sql', 'source'), [
+    ('WITH q AS (SELECT x.id FROM t x JOIN t y ON x.id = y.id WHERE true', 'SQL'),
+    ('SELECT (x.where', 'SQL'),  # Qualified keyword; the missing parenthesis is real.
+    ('SELECT 1 FROM t x JOIN t y ON x. where )', 'SQL'),  # A stray close, not a predicate.
+    ('SELECT 1 FROM t x JOIN t y ON x.\n!WHERE y.id > 0', 'SQL'),
+    ("SELECT 1 FROM {{ source('landing', ) } AS x JOIN t y ON x.\nWHERE true", 'Jinja'),
+])
+def test_unfinished_qualifier_hint_does_not_mask_other_errors(sql, source):
+    problem, = analyze_file(None, 'model.sql', sql, 'postgres', SchemaContext()).diagnostics
+    assert (problem.source, problem.severity) == (source, 'error')
+    assert 'Expected a column name' not in problem.message
+    if sql.startswith(('WITH', 'SELECT (')):
+        assert ')' in problem.message

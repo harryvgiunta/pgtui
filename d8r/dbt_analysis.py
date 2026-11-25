@@ -689,9 +689,48 @@ def _query_chunks(tokens: list[Token]) -> Iterator[list[Token]]:
         yield tokens[start:]
 
 
+_CLAUSE_AFTER_DOT = {
+    TokenType.WHERE, TokenType.FROM, TokenType.JOIN, TokenType.GROUP_BY, TokenType.HAVING,
+    TokenType.ORDER_BY, TokenType.LIMIT, TokenType.OFFSET, TokenType.QUALIFY,
+    TokenType.UNION, TokenType.INTERSECT, TokenType.EXCEPT,
+}
+
+
+def _unfinished_qualifier(tokens: list[Token], at: int, description: str) -> tuple[Token, Token] | None:
+    if description == f"Required keyword: 'this' missing for {exp.Column}":
+        # At EOF SQLGlot points back to the dot; at a delimiter it points ahead.
+        if at == len(tokens) - 1 and tokens[at].token_type == TokenType.DOT:
+            dot = at
+        elif tokens[at].token_type in {TokenType.COMMA, TokenType.R_PAREN}:
+            dot = at - 1
+        else:
+            return None
+    elif description in {"Expecting )", "Invalid expression / Unexpected token"}:
+        # SQLGlot accepts keywords as fields after a dot. It can consume WHERE as
+        # the column and then fail on the first token of its predicate. Do not
+        # reinterpret attached keyword names (x.where) or errors farther afield.
+        clause = at - 1
+        if clause < 2 or tokens[clause].token_type not in _CLAUSE_AFTER_DOT:
+            return None
+        if tokens[at].token_type not in {
+            TokenType.VAR, TokenType.IDENTIFIER, TokenType.STRING, TokenType.NUMBER, TokenType.TRUE,
+            TokenType.FALSE, TokenType.NULL, TokenType.CASE, TokenType.EXISTS, TokenType.SELECT,
+        }:
+            return None
+        dot = clause - 1
+        if tokens[dot].end + 1 == tokens[clause].start:
+            return None
+    else:
+        return None
+    if (dot < 1 or tokens[dot].token_type != TokenType.DOT
+            or tokens[dot - 1].token_type not in {TokenType.VAR, TokenType.IDENTIFIER}):
+        return None
+    return tokens[dot - 1], tokens[dot]
+
+
 def _sql_problems(text: str, shadow: _Shadow, sql: str, tokens: list[Token],
                   error: ParseError) -> tuple[Diagnostic, ...]:
-    positions = {(token.line, token.col): (token.start, token.end + 1) for token in tokens}
+    positions = {(token.line, token.col): i for i, token in enumerate(tokens)}
     lines = [0, *(m.end() for m in _NEWLINE.finditer(sql))]
     problems: list[Diagnostic] = []
     names = {symbol: text[call.start:call.end] for symbol, (_, call) in shadow.refs.items()}
@@ -701,8 +740,14 @@ def _sql_problems(text: str, shadow: _Shadow, sql: str, tokens: list[Token],
         end = min(len(sql), lines[line] + (entry.get("col") or 0))
         highlight = entry.get("highlight") or ""
         start = max(0, end - len(highlight))
-        start, end = positions.get((entry.get("line"), entry.get("col")), (start, end))
         description = entry.get("description") or "Invalid SQL syntax."
+        at = positions.get((entry.get("line"), entry.get("col")))
+        if at is not None:
+            start, end = tokens[at].start, tokens[at].end + 1
+            if unfinished := _unfinished_qualifier(tokens, at, description):
+                name, dot = unfinished
+                start, end = dot.start, dot.end + 1
+                description = f"Expected a column name after {sql[name.start:name.end + 1]}."
         if synthetic is not None:
             description = synthetic.sub(lambda match: names.get(match[0], match[0]), description)
         problems.append(_problem(text, *shadow.span(start, end), description, "SQL"))

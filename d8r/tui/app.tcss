@@ -259,6 +259,11 @@ Tabs Tab:disabled {
     text-overflow: ellipsis;
 }
 
+#copy-page-to-ws {
+    width: auto;
+    padding: 0 1;
+}
+
 #query-targets SelectCurrent {
     height: 3;
     padding: 0 1;
@@ -439,10 +444,12 @@ DbtExplorer { height: 1fr; }
     padding: 0 1;
 }
 
-#dbt-view-controls { width: auto; height: 1; }
+#dbt-view-controls, #yaml-view-controls { width: auto; height: 1; }
 .dbt-switch-label { width: auto; margin: 0 1; }
-#dbt-toggle { height: 1; padding: 0; border: none; }
-#dbt-file-path { height: 1; color: $text-accent; text-overflow: ellipsis; text-wrap: nowrap; }
+#dbt-toggle, #yaml-toggle { height: 1; padding: 0; border: none; }
+#dbt-file-bar { height: 1; }
+#dbt-file-path { width: 1fr; height: 1; color: $text-accent; text-overflow: ellipsis; text-wrap: nowrap; }
+#dbt-close-file { width: auto; min-width: 0; padding: 0 1; }
 
 #refresh-schema {
     width: 1fr;

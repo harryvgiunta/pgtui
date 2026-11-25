@@ -21,6 +21,7 @@ from d8r.dbt_files import DbtFiles, file_revision
 from d8r.dbt_index import DbtIndex
 from d8r.dbt_profiles import DbtTargetSettings
 from d8r.dbt_references import DbtReference, find_references
+from .dbt_completion import complete_dbt_sql
 from .dbt_model_completion import complete_dbt
 
 if TYPE_CHECKING:
@@ -224,14 +225,18 @@ class DbtAuthoring:
         if self.current:
             editor = self.ide.editor
             editor.move_cursor(editor.dbt_diagnostic_location(problem.start))
-            editor.focus()
+            self.ide.focus_raw_editor()
 
     def complete(self, document: str, offset: int, manual: bool):
         if not self.ide.session.dbt_enabled or self.ide.function_mode:
             return None
         if "{{" not in document and "{%" not in document and "{#" not in document:
             return None
-        return complete_dbt(self._index, document, offset, manual)
+        jinja = complete_dbt(self._index, document, offset, manual)
+        if jinja is not None or not self.ide.editor.dbt_template:
+            return jinja
+        return complete_dbt_sql(self._index, document, offset, self.ide.session.schema,
+                                dialect=self.ide.editor.dialect, manual=manual)
 
     def references(self) -> None:
         ide, site, index = self.ide, self._published, self._index

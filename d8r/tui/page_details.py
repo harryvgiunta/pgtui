@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from typing import TYPE_CHECKING
 
 from textual import on
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Button, Input, Static, TextArea
+from textual.screen import ModalScreen
+from textual.widgets import Button, Input, OptionList, Static, TextArea
+from textual.widgets.option_list import Option
 from textual.worker import Worker, get_current_worker
 
 from d8r.ai.client import AIError
@@ -16,6 +20,44 @@ from .editing import DraftTextArea
 
 if TYPE_CHECKING:
     from .app import D8RApp
+
+
+class CopyPageScreen(ModalScreen[str | None]):
+    """Choose a destination without activating or reconnecting its workspace."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    DEFAULT_CSS = """
+    CopyPageScreen { align: center middle; }
+    CopyPageScreen > Vertical {
+        width: 64; max-width: 95%; height: auto; max-height: 95%;
+        border: round $primary; padding: 0 1; background: $surface;
+    }
+    #copy-page-targets { height: auto; max-height: 12; }
+    """
+
+    def __init__(self, choices: list[tuple[str, str]]) -> None:
+        super().__init__()
+        self._choices = sorted(choices, key=lambda item: (item[0].casefold(), item[1]))
+
+    def compose(self) -> ComposeResult:
+        names = Counter(label.casefold() for label, _ in self._choices)
+        with Vertical():
+            yield Static("Copy page to workspace")
+            yield Static("Choose a destination. Your current workspace stays open.")
+            yield OptionList(*(Option(label if names[label.casefold()] == 1 else f"{label}\n  {key}", id=key)
+                               for label, key in self._choices), id="copy-page-targets", markup=False)
+            yield Button("Cancel", id="copy-page-cancel", compact=True)
+
+    def on_mount(self) -> None:
+        self.query_one(OptionList).focus()
+
+    @on(OptionList.OptionSelected, "#copy-page-targets")
+    def _choose(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(event.option_id)
+
+    @on(Button.Pressed, "#copy-page-cancel")
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class PageDetails(Vertical):

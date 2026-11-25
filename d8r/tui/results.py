@@ -356,6 +356,11 @@ class ResultsTable(DataTable):
             self.app.notify("No buffered result rows to copy.", severity="warning")
             return
         rows, columns = self._selected_indices()
+        if len(rows) == 1 and len(columns) == 1:
+            value = self.raw_rows[rows[0]][columns[0]]
+            self.app.copy_to_clipboard("" if value is None else str(value))
+            self.app.notify("Copied cell value.")
+            return
         output = io.StringIO(newline="")
         writer = csv.writer(output, delimiter="\t")
         writer.writerow(self.raw_columns[column] for column in columns)

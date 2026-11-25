@@ -32,11 +32,35 @@ or read the [contributing guide](CONTRIBUTING.md). Small, focused improvements c
 
 ## Run
 
-Requires Python 3.13+ and [uv](https://docs.astral.sh/uv/).
+From a source checkout on **Linux**, run the installer as the user who will run
+PGTUI (not with `sudo`):
 
 ```sh
 git clone https://github.com/harryvgiunta/pgtui.git
 cd pgtui
+sh install.sh
+.venv/bin/pgtui
+```
+
+The installer reuses `uv` or bootstraps a checksum-pinned installer with `curl`
+into `~/.local/bin`. `uv sync --locked` gets the pinned Python version and missing
+project packages. The script then smoke-tests `pgtui --help` and checks native
+keyring discovery without reading, writing or unlocking credentials.
+This path was tested in a clean Rocky Linux 8.10 container. Launching the installed
+`.venv/bin/pgtui` never invokes the installer or `sudo`.
+
+- `sh install.sh --check` runs the checks without downloading or installing anything.
+  A missing keyring is a warning: uncheck **Remember** for session-only use.
+- `sh install.sh --with-keyring` also installs missing `gnome-keyring` and
+  `dbus-daemon` packages with `dnf` (Rocky/RHEL) or `apt-get` if no native backend
+  is detected. Only these system package operations may use `sudo`.
+- `sh install.sh --check --with-keyring` exits nonzero if the required environment
+  or native backend is missing. Discovery does not guarantee the vault is unlocked.
+
+On other platforms, or if Python 3.13+ and [uv](https://docs.astral.sh/uv/) are
+already set up, the manual commands from the checkout are unchanged:
+
+```sh
 uv sync --locked
 uv run pgtui
 ```
@@ -67,6 +91,15 @@ reconnects only the selected saved target, without executing or changing its dra
 Missing credentials leave the target disconnected. Use **Cancel connection** or
 **F8** to abandon a pending connection; a late connection cannot run the queued SQL.
 
+**Headless Linux (including Rocky/RHEL servers):** No keyring is needed to connect.
+If Add reports “Secure system keyring unavailable or locked”, uncheck **Remember
+credentials in system keyring** and retry **Add**. For an AI provider, uncheck
+**Remember API key and headers in system keyring** before **Save & use**. Re-enter
+the required secrets next time you start PGTUI; there is no plaintext fallback.
+If you do want persistence, a full desktop is not required: run an unlocked Secret
+Service provider such as GNOME Keyring in the same user D-Bus session as PGTUI.
+See [python-keyring’s headless Linux setup](https://keyring.readthedocs.io/en/latest/#using-keyring-on-headless-linux-systems).
+
 Run it with a restricted database role while trying the alpha. Manual Run sends
 native SQL with your role's permissions, including writes and DDL; it is not a
 read-only sandbox. Do not paste credentials or private data into public bug reports.
@@ -84,6 +117,12 @@ requests. A failed statement does not undo earlier committed work.
 Click the database name at the top left of the query workspace to switch sources.
 The list lines up with the database field's left edge, below the query toolbar.
 Clicking **Run SQL** or visible SQL outside the list dismisses it and acts on the same click.
+
+To reuse a query in another environment, click **Copy Page To WS** next to the
+database selector and choose the destination. Its **Pages** list gets a new,
+independent draft with the current SQL, page name, description, and cursor position.
+You stay in the original workspace. Copying never connects to the destination,
+executes SQL, or overwrites an existing page.
 
 SQL failures include actionable hints for syntax, ambiguous references, missing
 objects, grouping, and type/function mismatches. PostgreSQL diagnostics retain a
@@ -147,6 +186,8 @@ so concurrent changes can shift rows during export. Full export requires a
 pageable result on its original connection, outside a user transaction. Choose
 **All buffered rows** or **Selected rows** to export the captured data without
 running SQL again. Clipboard copying still uses only the displayed buffer.
+Copying one result cell gives you just its value, with no column name or added
+newline. Copying multiple cells includes column headers and uses tab-separated text.
 
 Parquet connections are in-memory and restricted to the selected file. The file
 is never modified. External writes, attachments, extension loading and configuration
@@ -325,6 +366,27 @@ artifacts or switch the active database connection.
 - Edits to project files, including SQL models, data tests, and YAML, autosave to
   disk after a short pause or when you switch pages. **Pages** remembers opened files
   and any unsaved drafts. Removing a page never deletes its project file.
+- Open `sources.yml` or another project `.yml` or `.yaml` file under **dbt → Files**.
+  Use **RAW / UI** (**Alt+Y**) to switch views of the same draft. UI opens with all
+  groups expanded. List items show their contents: for example, `- name: orders`
+  rather than `[0] Mapping`. Click the name or value on that row to edit it inline.
+  **Enter** applies, **Esc** cancels, and **Shift+Enter**
+  inserts a line break in a value. Selecting another field or returning to RAW also
+  applies valid edits. Use the arrow or **Space** to fold a group, **A** to add an entry,
+  and **Delete** to request removal. Switching views without editing leaves the YAML
+  untouched. Incomplete YAML and
+  constructs the form cannot edit losslessly (such as anchors, aliases and custom
+  tags) stay in RAW. Private `profiles.yml` files and generated directories remain
+  outside the explorer.
+- To add a dbt source table, select the source and choose **Add Table** (**C**),
+  or select its `tables` list and press **A**. Type the table name and press **Enter**.
+  The new table stays selected: **A** adds a field such as `description`, and **C**
+  adds a named column, creating `columns` if needed. On a column, **A** adds a field
+  such as `data_type`; **C** adds the next column. If a table was previously stored
+  as plain text, adding a field or column keeps that text as its `name`.
+- **Close File**, beside the YAML filename, returns to the query or SQL model you
+  were editing. **Alt+W** does the same with the file editor focused. If no query
+  remains in the workspace, a blank one opens. The YAML draft stays in **Pages**.
 - On a SQL model, **Show Page Details** opens its properties YAML at the model's
   entry. If no properties file exists, it opens a new YAML draft alongside the model.
 - **Ctrl+click** a literal `source()` or `ref()` in the editor to open the local
@@ -363,7 +425,14 @@ artifacts or switch the active database connection.
   group. SQLite's single `min()`/`max()` extremum idiom is left alone. These
   draft checks neither validate against the warehouse nor run dbt.
 - The model editor suggests `ref()`, `source()`, and macro names while typing
-  Jinja. **Ctrl+Space** requests suggestions; **Tab** accepts the selection.
+  Jinja. In `source()`, typing the first argument suggests source names declared
+  in the project; typing the second suggests only that source’s tables. Neither
+  requires accepting the `source()` suggestion first. **Ctrl+Space** requests
+  suggestions; **Tab** accepts the selection.
+- In SQL around literal `source()` or `ref()` calls, type a relation alias and a
+  dot (for example, `ON x.`) to see its known columns. This works while the join
+  predicate is incomplete, even before an existing `WHERE`. Suggestions use the
+  local project index and cached catalog; typing does not run dbt or query the database.
 - Hover over a relation, column, or `SELECT *`, or press **F9** at the caret,
   to inspect known schema and types. **Shift+F9** expands `*` in the draft only
   when the complete projection is known. YAML can document a partial schema;
@@ -673,6 +742,11 @@ otherwise they type normally. The IntelliSense toggle requires a non-typing key
 because it also works with the suggestion list closed.
 Tab remains an alternate accept key. Esc still dismisses inline AI after the
 IntelliSense toggle is rebound.
+
+In a multiline draft editor, **click once** to place the cursor. **Double-click**
+to select the word between whitespace boundaries (`orders.order_id` stays together).
+**Triple-click** to select the whole logical line, including indentation but not its
+newline, even if the line wraps on screen. Click and drag to select a custom range.
 
 In query and function SQL, **Format SQL** indents CTE bodies, lays out clauses and
 join conditions, and puts long SELECT lists on separate lines, including inside

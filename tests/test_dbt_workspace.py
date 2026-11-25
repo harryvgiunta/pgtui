@@ -10,6 +10,7 @@ import sys
 
 import httpx
 import pytest
+import yaml
 from textual.widgets import Button, Input, OptionList, Switch, TabbedContent, TextArea, Tree
 
 from d8r.ai import client
@@ -101,7 +102,8 @@ def test_explorer_links_edit_real_yaml_and_restore_historical_drafts(tmp_path):
             model_page = app._document_identity
             await follow(app, pilot, 0, sql.index("landing"))
             assert app.editor.file_format == "yaml" and app._dbt_file["path"].endswith("sources.yml")
-            app.open_page(model_page)
+            assert await pilot.click("#dbt-close-file")
+            assert app._document_identity == model_page and app.editor.text == sql and app.editor.has_focus
             await follow(app, pilot, 1, sql.splitlines()[1].index("upstream"))
             assert app.editor.text == upstream.read_text(), str(app.query_one("#status").content)
             app.open_page(model_page)
@@ -116,7 +118,7 @@ def test_explorer_links_edit_real_yaml_and_restore_historical_drafts(tmp_path):
             await pilot.pause(app._WORKSPACE_SAVE_INTERVAL + 0.1)
             assert "description: Edited from PGTUI" in properties.read_text()
             assert properties.read_text().startswith("# Keep my comment")
-            app.open_page(model_page)
+            await pilot.press("alt+w")
             assert app._document_identity == model_page
             app.editor.load_text(sql + "-- autosaved on page switch\n")
             await pilot.press("ctrl+n")
@@ -130,6 +132,151 @@ def test_explorer_links_edit_real_yaml_and_restore_historical_drafts(tmp_path):
             pages.focus()
             await pilot.press("enter")
             assert restored.editor.text == model.read_text()
+
+    asyncio.run(scenario())
+
+
+def test_yaml_form_adds_a_table_to_the_draft_without_clobbering_external_edits(tmp_path):
+    root = project(tmp_path)
+    original = "# Catalog\r\nsources:\r\n  - name: landing  # keep this\r\n    tables:\r\n      - name: orders\r\n"
+    file = put(root, "models/sources.yml", original)
+    put(root, "config/checks.yaml", "checks: [\n")
+
+    async def scenario():
+        app = D8RApp(workspace(tmp_path))
+        async with app.run_test(size=(120, 40)) as pilot:
+            files = await open_home(app, pilot, root)
+            query_page = app._document_identity
+            await select(files, pilot, ("file", "models/sources.yml"))
+            page = app._document_identity
+            app.delete_page(query_page)  # No query left to return to when the file closes.
+            toggle = app.query_one("#yaml-toggle", Switch)
+            await pilot.click(toggle)
+            await pilot.press("alt+y")
+            assert app.editor.text == original and file.read_bytes() == original.encode()
+
+            external = original + "# Edited on disk\r\n"
+            file.write_bytes(external.encode())
+            app.editor.load_text(original.replace("landing", "pending"))
+            await pilot.press("alt+y")
+            tree = app.query_one("#yaml-tree", Tree)
+            assert tree.has_focus
+
+            tables = ("sources", 0, "tables")
+            tree.move_cursor(tree_node(tree.root, tables))
+            await pilot.pause()
+            await pilot.click("#yaml-add")
+            assert app.query_one("#yaml-value", TextArea).has_focus
+            await pilot.press(*"returns: US", "enter")
+            table = (*tables, 1)
+            assert tree.has_focus and tree.cursor_node.data == table
+
+            # No type selector, empty mapping, or trip back up the tree.
+            await pilot.press("a", *"description")
+            await pilot.click("#yaml-value")
+            await pilot.press(*"Refunds", "enter")
+            assert await pilot.click("#yaml-add-child")
+            await pilot.press(*"id", "enter")
+            assert tree.has_focus and tree.cursor_node.data == (*table, "columns", 0)
+            await pilot.press("a", *"data_type")
+            await pilot.click("#yaml-value")
+            await pilot.press(*"bigint")
+            assert await pilot.click("#dbt-close-file")  # Finish the live field, without an Apply click.
+            assert app.editor.has_focus and app.editor.file_format == "sql" and app.editor.text == ""
+            assert app._document_identity not in {query_page, page}
+            edited = next(p["document"] for p in app.session.workspace["pages"] if p["id"] == page)
+            source_entry, = yaml.safe_load(edited)["sources"]
+            assert source_entry["name"] == "pending"
+            assert source_entry["tables"] == [
+                {"name": "orders"},
+                {"name": "returns: US", "description": "Refunds", "columns": [{"name": "id", "data_type": "bigint"}]},
+            ]
+            assert "# Catalog" in edited and "# keep this" in edited
+
+            # An incomplete YAML file outside model-paths still opens for repair in RAW.
+            await select(files, pilot, ("file", "config/checks.yaml"))
+            await pilot.click(toggle)
+            assert not toggle.value and app.editor.has_focus and app.editor.text == "checks: [\n"
+            app.open_page(page)
+            assert app.editor.text == edited and file.read_bytes() == external.encode()
+
+    asyncio.run(scenario())
+
+
+def test_adding_a_column_to_a_legacy_text_table_preserves_its_name_and_undo(tmp_path):
+    home = project(tmp_path)
+    original = 'sources:\n  - name: landing\n    tables:\n      - staging\n      - "orders"  # warehouse table\n'
+    put(home, "models/sources.yml", original)
+
+    async def scenario():
+        app = D8RApp(workspace(tmp_path))
+        async with app.run_test(size=(100, 36)) as pilot:
+            files = await open_home(app, pilot, home)
+            await select(files, pilot, ("file", "models/sources.yml"))
+            await pilot.press("alt+y")
+            tree = app.query_one("#yaml-tree", Tree)
+            table = ("sources", 0, "tables", 1)
+            tree.move_cursor(tree_node(tree.root, table))
+            await pilot.press("c", *"ignored", "escape")
+            assert app.editor.text == original  # Opening or cancelling must not convert anything.
+            await pilot.press("c", *"order_id", "enter")
+            assert tree.has_focus and tree.cursor_node.data == (*table, "columns", 0)
+            assert yaml.safe_load(app.editor.text)["sources"][0]["tables"] == [
+                "staging", {"name": "orders", "columns": [{"name": "order_id"}]}]
+            assert "# warehouse table" in app.editor.text
+            await pilot.press("alt+y", "ctrl+z")
+            assert app.editor.text == original  # Conversion plus column creation is one undo.
+
+    asyncio.run(scenario())
+
+
+def test_yaml_names_and_values_edit_on_click_without_leaving_the_workspace(tmp_path):
+    root = project(tmp_path)
+    original = ("metadata:\n  owner: Alex  # maintainer\nsources:\n"
+                "  - schema: raw\n    name: landing\n    tags: [nightly, core]\n  - name: landing\n")
+    put(root, "models/sources.yml", original)
+
+    async def scenario():
+        app = D8RApp(workspace(tmp_path))
+        async with app.run_test(size=(120, 40)) as pilot:
+            files = await open_home(app, pilot, root)
+            await select(files, pilot, ("file", "models/sources.yml"))
+            await pilot.click("#yaml-toggle")
+            tree = app.query_one("#yaml-tree", Tree)
+            workspace_screen = app.screen
+
+            async def click_node(node, part):
+                region = tree.content_region
+                y = region.y + node.line - tree.scroll_offset.y
+                x = next(x for x in reversed(range(region.x, region.right))
+                         if (meta := app.screen.get_style_at(x, y).meta).get("node") == node.id
+                         and (meta.get("toggle") if part == "arrow" else meta.get("yaml_part") == part))
+                await pilot.click(offset=(x, y))
+
+            metadata, sources = tree.root.children
+            assert tree.root.label.plain == "sources.yml" and sources.label.plain == "sources:"
+            assert metadata.is_expanded and sources.is_expanded and sources.children[0].is_expanded
+            await click_node(metadata, "arrow")
+            assert not metadata.is_expanded and tree.has_focus and tree.cursor_node is metadata
+            name = sources.children[0]
+            assert name.label.plain == "- name: landing"
+            schema, tags = name.children  # No duplicate name row beneath the item.
+            assert schema.label.plain == "schema: raw"
+            assert [item.label.plain for item in tags.children] == ["- nightly", "- core"]
+            await click_node(name, "key")
+            key = app.query_one("#yaml-key", Input)
+            assert app.screen is workspace_screen and key.has_focus and key.value == "name"
+            await pilot.press("a", "l", "i", "a", "s")
+            await click_node(name, "value")
+            value = app.query_one("#yaml-value", TextArea)
+            assert value.has_focus and value.text == "landing" and key.value == "alias"
+            await pilot.press("r", "a", "w", "enter")
+            assert not tree.root.children[0].is_expanded  # Editing another branch respects this fold.
+            alias = tree_node(tree.root, ("sources", 0, "alias"))
+            await click_node(alias, "value")
+            await pilot.press("s", "r", "c")
+            await pilot.click("#yaml-toggle")  # Leave directly; no Apply click or dialog to dismiss.
+            assert app.editor.has_focus and app.editor.text == original.replace("name: landing", "alias: src", 1)
 
     asyncio.run(scenario())
 

@@ -7,12 +7,13 @@ from threading import Event
 
 import psycopg
 import pytest
-from textual.widgets import Input, OptionList, Static, Tree
+from textual.widgets import Button, Input, OptionList, Static, TextArea, Tree
 
 from d8r.ai.context import AIProposal, AIQuery
 from d8r.engine import close_source
 from d8r.tui.app import D8RApp
 from d8r.tui.session import Session
+from tests.test_d1_session import postgres_profile
 from tests.test_native_engine import postgres_source
 from tests.test_native_tui import async_test
 
@@ -53,6 +54,66 @@ async def test_pages_keep_creation_order_across_open_search_proposal_and_restore
         app.open_page(first)
         assert visible() == ids
     assert [page["id"] for page in Session(data_dir=tmp_path).workspace["pages"]] == ids
+
+
+@async_test
+async def test_copy_live_page_to_connected_and_saved_workspaces(parquet_source, d1_source, tmp_path):
+    sources = {s.id: s for s in (parquet_source, d1_source)}
+    session = Session(sources, data_dir=tmp_path)
+    prod = {**postgres_profile(), "display": "PROD"}
+    session.remember_postgres(prod)
+    prod_key = session._postgres_profile_id(prod)
+    stage_key = session.source_key(d1_source.id)
+    app = D8RApp(session)
+    app._WORKSPACE_SAVE_INTERVAL = 60  # Copy before the idle save of SQL and Page Details.
+    async with app.run_test(size=(110, 40)) as pilot:
+        await pilot.pause()
+        assert app.select_source(d1_source.id)
+        old_stage = app._document_identity
+        app.editor.load_text("SELECT 'previous draft'")
+        assert app.select_source(parquet_source.id)
+        dev = app._document_identity
+        sql = "-- Keep the entire page\nSELECT 42 AS answer"
+        app.editor.load_text(sql)
+        app.editor.move_cursor((1, 8))
+        await pilot.pause()  # The toolbar relayouts for the restored source.
+        assert await pilot.click("#page-details-toggle")
+        app.query_one("#page-name", Input).value = "Answer"
+        app.query_one("#page-description", TextArea).load_text("Deployment check")
+
+        assert not session.history
+        button = app.query_one("#copy-page-to-ws", Button)
+        for key in (stage_key, prod_key):
+            if button.has_class("-active"):
+                await pilot.pause(button.active_effect_duration)
+            assert await pilot.click(button)
+            options = app.screen.query_one("#copy-page-targets", OptionList)
+            assert {option.id for option in options.options} == {stage_key, prod_key}
+            options.highlighted = options.get_option_index(key)
+            await pilot.press("enter")
+            assert session.source is parquet_source and app._document_identity == dev
+            assert not session.history
+
+        assert set(session.sources) == set(sources)  # PROD wasn't even registered to copy to it.
+        pages = session.workspace["pages"]
+        copies = [page for page in pages if page["source"] in {stage_key, prod_key} and page["id"] != old_stage]
+        assert {page["source"]: page["dialect"] for page in copies} == {stage_key: "sqlite", prod_key: "postgres"}
+        assert len({dev, old_stage, *(page["id"] for page in copies)}) == 4
+        for page in copies:
+            assert (page["document"], page["title"], page["description"], page["cursor"]) == (
+                sql, "Answer", "Deployment check", [1, 8])
+        assert app.select_source(d1_source.id)
+        assert app._document_identity == old_stage and app.editor.text == "SELECT 'previous draft'"
+        stage_copy = next(page for page in copies if page["source"] == stage_key)
+        listing = app.query_one("#pages-list", OptionList)
+        listing.highlighted = listing.get_option_index(stage_copy["id"])
+        app.open_page(stage_copy["id"])
+        assert app.editor.text == sql
+        app.editor.load_text("SELECT 'edited in STAGE'")
+
+    pages = Session(sources, data_dir=tmp_path).workspace["pages"]
+    assert next(page for page in pages if page["id"] == dev)["document"] == sql
+    assert next(page for page in pages if page["source"] == prod_key)["document"] == sql
 
 
 @async_test

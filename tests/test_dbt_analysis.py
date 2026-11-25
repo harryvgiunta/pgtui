@@ -14,8 +14,10 @@ from d8r.dbt_rename import apply_rename
 from d8r.engine import refresh_source_schema
 from d8r.sql import ColumnDef, RoutineDef, SchemaContext, TableDef
 from d8r.tui.app import D8RApp
+from d8r.tui.dbt_authoring import DbtProblems
+from d8r.tui.dbt_model_completion import complete_dbt
 from d8r.tui.session import Session
-from tests.test_dbt_exchange import project, put
+from tests.test_dbt_exchange import project, put, source
 from tests.test_dbt_workspace import open_home
 
 
@@ -156,6 +158,107 @@ async def feedback_ready(app, pilot):
     await app.workers.wait_for_complete()
     await pilot.pause()
     assert app.dbt_authoring.current
+
+
+def test_typing_source_arguments_shows_project_names_without_accepting_macro(tmp_path, parquet_source):
+    home = project(tmp_path)
+    source(home)  # landing.orders
+    put(home, 'models/other.yml', 'sources: [{name: other, tables: [{name: oranges}]}]\n')
+    head, tail = 'select * from ', ") }} as s\nwhere s.status = 'active'"
+    path = 'models/report.sql'
+    put(home, path, head + tail)
+    app = D8RApp(Session({parquet_source.id: parquet_source}, data_dir=tmp_path / 'workspace'))
+
+    async def scenario():
+        async with app.run_test(size=(140, 50)) as pilot:
+            await open_home(app, pilot, home)
+            app.open_dbt_file(str(home), path)
+            await feedback_ready(app, pilot)
+            app.editor.move_cursor((0, len(head)))
+            await pilot.press(*"{{ source ('la")
+            await pilot.pause(0.05)
+            assert app.palette.suggestions_visible and app.palette.view.labels == ['landing']
+            await pilot.press(*"nding', 'or")  # Type the source name too, without accepting it.
+            await pilot.pause(0.05)
+            assert app.palette.suggestions_visible and app.palette.view.labels == ['orders']
+            typed = app.editor.text
+            await pilot.press('tab')
+            assert app.editor.text == head + "{{ source ('landing', 'orders'" + tail
+            app.editor.action_undo()
+            assert app.editor.text == typed
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('source_fixture, fields', [
+    ('parquet_source', ('id', 'label')),  # Cached main.data; no columns in sources.yml.
+    ('d1_source', ('order_id', 'amount')),  # Declared dbt fields, not in the native catalog.
+])
+def test_jinja_left_join_completes_each_alias_before_where(tmp_path, request, source_fixture, fields):
+    native = request.getfixturevalue(source_fixture)
+    d1 = request.getfixturevalue('d1_harness') if source_fixture == 'd1_source' else None
+    home = project(tmp_path)
+    definition = ('schema: main, tables: [{name: orders, identifier: data}]' if not d1 else
+                  'schema: warehouse, tables: [{name: orders, columns: [{name: order_id}, {name: amount}]}]')
+    put(home, 'models/sources.yml', 'sources: [{name: landing, ' + definition + '}]\n')
+    field = fields[0]
+    source_call = "{{ source('landing','orders') }}"
+    head = f'WITH joined AS (\r\nSELECT x.{field}\r\nFROM {source_call} x\r\nLEFT JOIN {source_call} y\r\nON '
+    tail = f'\r\nWHERE x.{field} > 0\r\n) SELECT * FROM joined'
+    app = D8RApp(Session({native.id: native}, data_dir=tmp_path / 'workspace'))
+
+    async def scenario():
+        async with app.run_test(size=(140, 50)) as pilot:
+            await open_home(app, pilot, home)
+            before = list(d1.requests) if d1 else None
+            editor = app.editor
+            editor.load_text(head + tail)
+            editor.move_cursor(editor.document.get_location_from_index(len(head)))
+            editor.focus()
+            await feedback_ready(app, pilot)
+            for alias, prefix in [('x', 'x.'), ('y', ' = y.')]:
+                await pilot.press(*prefix)
+                await pilot.pause(0.05)
+                palette = app.palette
+                assert editor.has_focus and palette.suggestions_visible
+                assert {e.label for e in palette.view.entries if e.kind == 'column'} == {f'{alias}.{f}' for f in fields}
+                if alias == 'x':
+                    await feedback_ready(app, pilot)
+                    dot = len(head) + 1
+                    assert 'column' in editor.dbt_detail(dot).lower()
+                    assert not editor.dbt_detail(editor.text.index('WHERE'))
+                palette.highlighted = palette.view.labels.index(f'{alias}.{field}')
+                await pilot.press('tab')
+            assert editor.text == head + f'x.{field} = y.{field}' + tail
+            await feedback_ready(app, pilot)
+            assert not [d for d in app.query_one(DbtProblems).diagnostics if d.severity == 'error']
+            assert not app.session.history
+            if d1:
+                assert d1.requests == before
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(('marked', 'label', 'expected'), [
+    ('''{{ source ("la|) }} join {{ ref("model") }}''', 'landing',
+     '''{{ source ("landing", ) }} join {{ ref("model") }}'''),
+    ("{{ source('landing', 'or|\nwhere status = 'active'", 'orders',
+     "{{ source('landing', 'orders')\nwhere status = 'active'"),
+    ("{{ source('landing', 'or|; -- finish here", 'orders',
+     "{{ source('landing', 'orders'); -- finish here"),
+    ("{{ source('la|', 'old_table') }}", 'landing', "{{ source('landing', 'old_table') }}"),
+])
+def test_source_completion_edits_only_the_authored_slot(tmp_path, marked, label, expected):
+    home = project(tmp_path)
+    source(home)
+    put(home, 'models/other.yml', 'sources: [{name: other, tables: [{name: old_table}]}]\n')
+    index = DbtIndex(DbtFiles(home), {})
+    before, after = marked.split('|')
+    text = before + after
+    result = complete_dbt(index, text, len(before), manual=False)
+    item, = result.items
+    assert item.label == label
+    assert text[:result.context.start] + item.insert + text[result.context.end:] == expected
 
 
 def test_later_diagnostics_are_reachable_in_lineage_and_problems(tmp_path, d1_source):

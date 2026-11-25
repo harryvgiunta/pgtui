@@ -60,6 +60,7 @@ from d8r.dbt_vars import PROJECT_YAML
 from d8r.engine import POSTGRES_VERSION, DataSource, EngineError, postgres_definition
 from d8r.sql import ColumnDef, format_parameters
 from d8r.themes import COZY_PASTEL
+from d8r.yaml_form import YamlFormError
 
 from .add_source import AddSourceModal
 from .catalog import (CatalogDefinitionScreen, DefinitionLink, add_catalog_groups, definition_leaf,
@@ -73,12 +74,13 @@ from .editor_tools import FindBar, format_editor
 from .ai import AIChats, AIPanel, AITarget, ConversationTabs, DeleteOptionList
 from .palette import CommandPalette, EditorPane
 from .query_editor import QueryTextArea
-from .page_details import PageDetails
+from .page_details import CopyPageScreen, PageDetails
 from .results import PlanTree, ResultsTable
 from .session import RunOutcome, Session
 from .settings import CompletionKeyScreen, SettingsScreen, binding_tooltip
 from .fn import FnEditor, FnExplorer, HINT as FUNCTION_HINT
 from .layout import PaneSplitter
+from .yaml_form import YamlForm
 from . import splash
 
 
@@ -140,6 +142,10 @@ class IdeScreen(Screen):
             raise SkipAction()
 
 
+
+
+class EditorSlot(Vertical):
+    BINDINGS = [Binding("alt+w", "app.close_yaml_file", "Close file", show=False)]
 
 
 class ExplorerSlot(Vertical):
@@ -231,7 +237,7 @@ class HistoryPreview(Static):
 
     def on_mouse_down(self, event: events.MouseDown) -> None:
         # Like the palette, do not let a click focus a scrollable ancestor.
-        self.app.editor.focus()
+        self.app._focus_editor()
         event.stop()
         event.prevent_default()
 
@@ -283,6 +289,7 @@ class D8RApp(App):
         Binding("ctrl+d", "delete_function", "Delete function", show=False),
         Binding("ctrl+o", "add_source", "Data source", priority=True),
         Binding("ctrl+n", "new_query", "New query", priority=True),
+        Binding("alt+y", "toggle_yaml_form", "Switch YAML RAW / UI", show=False),
         # The way back into Settings when the Intellisense switch has the
         # palette shut — `\settings` itself needs the popup.
         Binding("f12", "dbt_definition", "Open dbt definition", show=False),
@@ -306,6 +313,8 @@ class D8RApp(App):
         document = self.session.workspace.get("document")
         self._initial_document = document or ""
         self._dbt_file: dict[str, str] | None = None
+        self._yaml_form_page: str | None = None
+        self._last_query_page: dict[str, str] = {}
         # A loaded page or conversion preview is not itself an edit to a project file.
         self._dbt_autosave_text = ""
         self.dbt_authoring = DbtAuthoring(self)
@@ -404,7 +413,7 @@ class D8RApp(App):
             yield PaneSplitter("#explorer-slot", "width", "explorer", min_size=16,
                                min_remaining=30, id="explorer-splitter")
             with Vertical(id="work-bench"):
-                with Vertical(id="editor-slot"):
+                with EditorSlot(id="editor-slot"):
                     with Vertical(id="query-header"):
                         with Horizontal(id="query-targets"):
                             yield _WorkspaceSourceSelect(
@@ -413,6 +422,8 @@ class D8RApp(App):
                                 tooltip="Switch source workspace",
                             )
                             yield Static("", id="source-version", markup=False)
+                            yield Button("Copy Page To WS", id="copy-page-to-ws",
+                                         tooltip="Copy this query page to another workspace without switching or running it")
                         with Horizontal(id="document-actions"):
                             yield Button("Run SQL", id="run-query", compact=True,
                                          tooltip=binding_tooltip(self.BINDINGS, "run") + " · Page reads; execute writes once")
@@ -424,7 +435,12 @@ class D8RApp(App):
                             yield Button("Show Page Details", id="page-details-toggle", compact=True)
                             yield Button("Reconnect", id="reconnect-source", compact=True)
                         yield PageDetails(self, id="page-details")
-                        yield Static("", id="dbt-file-path", markup=False)
+                        with Horizontal(id="dbt-file-bar"):
+                            yield Static("", id="dbt-file-path", markup=False)
+                            yield Button("Close File", id="dbt-close-file", compact=True,
+                                         tooltip=binding_tooltip(EditorSlot.BINDINGS, "app.close_yaml_file",
+                                                                 context="YAML editor focused")
+                                         + " · Return to the query; keep the draft in Pages")
                     with Horizontal(id="editor-tools"):
                         yield Button("Cancel query", id="cancel-query", variant="warning", compact=True,
                                      tooltip=binding_tooltip(self.BINDINGS, "cancel_operation"))
@@ -435,6 +451,11 @@ class D8RApp(App):
                         yield Button("Fold/Expand All", id="query-sections", compact=True,
                                      tooltip=binding_tooltip(self.BINDINGS, "query_sections"))
                     with Horizontal(id="dbt-editor-tools"):
+                        with Horizontal(id="yaml-view-controls"):
+                            yield Static("RAW", classes="dbt-switch-label")
+                            yield Switch(id="yaml-toggle", animate=False,
+                                         tooltip=binding_tooltip(self.BINDINGS, "toggle_yaml_form"))
+                            yield Static("UI", classes="dbt-switch-label")
                         yield Button("Git Diff", id="dbt-file-diff", compact=True)
                         yield Button("Rename Model", id="dbt-rename-model", compact=True,
                                      tooltip=binding_tooltip(self.BINDINGS, "dbt_rename"))
@@ -454,6 +475,7 @@ class D8RApp(App):
                                                 show_line_numbers=True, id="editor")
                             yield CommandPalette(self.session, id="palette", markup=False,
                                                  template_completion=self.dbt_authoring.complete)
+                        yield YamlForm(self._apply_yaml_form, id="yaml-form")
                         with Vertical(id="dbt-compiled-pane"):
                             yield Static("", id="dbt-compiled-status", markup=False)
                             yield TextArea("", read_only=True, soft_wrap=False, id="dbt-compiled-sql")
@@ -586,6 +608,8 @@ class D8RApp(App):
 
     def exit(self, *args, **kwargs) -> None:
         """Flush live widget values even if their change messages are still queued."""
+        if self._workspace_ready and not self._finish_yaml_edit():
+            return
         for palette in self.query(CommandPalette):
             palette.close()
         self._cancel_connection()
@@ -787,11 +811,40 @@ class D8RApp(App):
         self.query_one("#page-details-toggle", Button).label = (
             "Hide Page Details" if details.display else "Show Page Details")
 
+    @on(Button.Pressed, "#copy-page-to-ws")
+    def action_copy_page_to_ws(self) -> None:
+        if self._modal_open() or self.function_mode or self.editor.file_format != "sql" or self.editor.read_only:
+            return
+        targets = self.session.page_copy_targets()
+        if not targets:
+            self._set_status("No other configured workspace. Add a data source to copy this page.")
+            return
+        origin = (self._workspace_key, self._document_identity)
+        draft = {**self.query_one(PageDetails).values(), "document": self.editor.text,
+                 "cursor": list(self.editor.cursor_location)}
+        if self._dbt_file and not draft["title"]:
+            draft["title"] = self._dbt_file["path"]
+
+        def copy_to(key: str | None) -> None:
+            if key is None:
+                return
+            target = self.session.page_copy_targets().get(key)
+            if target is None or origin != (self._workspace_key, self._document_identity):
+                self._set_status("The page or destination changed. Choose Copy Page To WS again.")
+                return
+            label, dialect = target
+            # A copy is an independent query draft, never a link back to a dbt file or its compiled views.
+            page = {**draft, "id": str(uuid4()), "source": key, "dialect": dialect}
+            if self.save_workspace(pages=[*self.session.workspace["pages"], page]):
+                self._set_status(f"Copied page to {label} · open Pages in that workspace")
+
+        self.push_screen(CopyPageScreen([(label, key) for key, (label, _) in targets.items()]), copy_to)
+
     @on(Button.Pressed, "#page-new")
     @on(Button.Pressed, "#query-new")
     def action_new_query(self) -> None:
         """Open a blank query without discarding query, function or chat drafts."""
-        if self._modal_open() or self.refuse_busy("New query page"):
+        if self._modal_open() or self.refuse_busy("New query page") or not self._finish_yaml_edit():
             return
         if self.function_mode:
             self.action_workspace()
@@ -837,6 +890,8 @@ class D8RApp(App):
         active = page_id == self._document_identity
         if active and self.session.busy != "AI context lookup running" and self.refuse_busy("Delete query page"):
             return
+        if active and not self._finish_yaml_edit():
+            return
         self._flush_workspace()
         pages = self.session.workspace["pages"]
         remaining = [page for page in pages if page["id"] != page_id]
@@ -871,6 +926,8 @@ class D8RApp(App):
             if self.function_mode:
                 self.action_workspace()
             return
+        if not self._finish_yaml_edit():
+            return
         self._flush_workspace()
         page = next((item for item in self.session.workspace["pages"]
                      if item["id"] == page_id and item["source"] == self._workspace_key), None)
@@ -896,6 +953,8 @@ class D8RApp(App):
         changed_source = page["source"] != self._workspace_key
         if changed_source:
             self._prepare_workspace_switch()
+        elif self.editor.file_format == "sql":
+            self._last_query_page[self._workspace_key] = self._document_identity
         self.session.restore_source(page["source"])
         if changed_source:
             self._load_source_workspace(page)
@@ -984,7 +1043,10 @@ class D8RApp(App):
         return self.function_editor.query_one("#fn-body", QueryTextArea) if self.function_mode else self.editor
 
     def _focus_editor(self) -> None:
-        self.active_sql_editor().focus()
+        if self._yaml_form_page is not None and not self.function_mode:
+            self.query_one("#yaml-tree", Tree).focus()
+        else:
+            self.active_sql_editor().focus()
 
     def action_find_sql(self) -> None:
         self._open_find(from_toolbar=False)
@@ -1040,6 +1102,8 @@ class D8RApp(App):
             return None
         if self.editor.read_only:
             raise DbtError("This file draft is read-only while dbt is disabled for the workspace.")
+        if self._yaml_form_page is not None and self.query_one(YamlForm).dirty:
+            raise DbtError("Finish or cancel the edited YAML field before applying a replacement.")
         if proposal.dbt_drafts:
             return self._apply_dbt_drafts(proposal.dbt_drafts)
         if proposal.function is not None:
@@ -1305,6 +1369,7 @@ class D8RApp(App):
         self.query_one("#fn-param-guide").display = self.function_mode
         self.query_one("#query-header").display = not self.function_mode
         self.query_one("#dbt-compile-split").display = not self.function_mode
+        self._sync_yaml_view()
         self.function_editor.display = self.function_mode
         # Data tabs are part of the strip too: hiding Results, SQL and History
         # never throws away a result the user pinned or a run still holding.
@@ -1366,8 +1431,13 @@ class D8RApp(App):
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if self.screen_stack and isinstance(self.screen, (CompletionKeyScreen, DbtTestScreen, DbtRenameScreen,
-                                                          DbtRunScreen, DbtRunOptionsScreen)):
+                                                          DbtRunScreen, DbtRunOptionsScreen, CopyPageScreen)):
             return False  # Keep workspace shortcuts out of the modal editor.
+        if action == "close_yaml_file":
+            return (self._workspace_ready and not self._modal_open() and not self.function_mode
+                    and self.editor.file_format == "yaml")
+        if action == "toggle_yaml_form":
+            return self._workspace_ready and not self._modal_open() and self._can_edit_yaml()
         if action == "dbt_definition":
             return (self._workspace_ready and not self.function_mode and not self._modal_open()
                     and self.screen.focused is self.editor and self.editor.dbt_navigation)
@@ -1857,6 +1927,7 @@ class D8RApp(App):
         preview = editor.text == views.get("sql")
         editor.read_only = bool(self._dbt_file and not enabled or preview and views.get("render_only"))
         editor.file_format = "sql" if sql else "yaml" if suffix in {".yaml", ".yml"} else "text"
+        self._sync_yaml_view()
         editor.dbt_navigation = bool(self._dbt_home)
         dbt_template = enabled and sql and not preview and has_query_jinja(
             editor.text, dialect=self.session.dialect, dbt_file=link is not None)
@@ -1864,7 +1935,10 @@ class D8RApp(App):
             self.palette.close()
         editor.dbt_template = dbt_template
         file_path = self.query_one("#dbt-file-path", Static)
-        file_path.display = bool(link)
+        yaml_file = editor.file_format == "yaml"
+        self.query_one("#dbt-file-bar").display = bool(link) or yaml_file
+        self.query_one("#dbt-close-file").display = yaml_file
+        self.query_one("#results-close", Button).label = "Tab ×" if yaml_file else "Close"
         if link:
             modified = file_revision(editor.text) != link["revision"]
             file_path.update(link["path"] + (" · draft" if modified else " · saved"))
@@ -1872,8 +1946,12 @@ class D8RApp(App):
             details = self.query_one("#page-details", PageDetails)
             details.display = False
             self.query_one("#page-details-toggle", Button).label = "Show Page Details"
+        elif yaml_file:
+            file_path.update(self._dbt_file["path"] + " · read-only draft")
+            file_path.tooltip = None
         can_query = self._can_query_workspace()
         self.query_one("#run-query", Button).display = can_query
+        self.query_one("#copy-page-to-ws", Button).display = sql and not editor.read_only
         self.query_one("#explain-query", Button).display = can_query and self.session.dialect == "postgres"
         for selector in ("#format-query", "#query-sections", "#page-details-toggle"):
             self.query_one(selector, Button).display = sql and not editor.read_only
@@ -1892,6 +1970,71 @@ class D8RApp(App):
             switch.value = dbt_template
         if self._workspace_ready:
             self.dbt_authoring.request()
+
+    def _can_edit_yaml(self) -> bool:
+        return (not self.function_mode and self.session.dbt_enabled and self._dbt_file is not None
+                and self.editor.file_format == "yaml" and not self.editor.read_only)
+
+    def _sync_yaml_view(self) -> None:
+        form = self.query_one(YamlForm)
+        available = self._can_edit_yaml()
+        self.query_one("#yaml-view-controls").display = available
+        if not available or self._yaml_form_page != self._document_identity or form.text != self.editor.text:
+            self._yaml_form_page = None
+        show = self._yaml_form_page is not None
+        if show != form.display:
+            form.display = show
+            self.query_one("#editor-pane").display = not show
+            self.query_one("#editor-tools").display = not show
+            if not show:
+                form.clear_document()
+        switch = self.query_one("#yaml-toggle", Switch)
+        with switch.prevent(Switch.Changed):
+            switch.value = show
+
+    def _finish_yaml_edit(self) -> bool:
+        # Keyboard navigation may replace a page before its fields receive blur.
+        if self._yaml_form_page is None or self.query_one(YamlForm).finish_edit():
+            return True
+        self._set_status("YAML field not applied · correct it or use Cancel to discard the field edit")
+        return False
+
+    def action_toggle_yaml_form(self) -> None:
+        self.query_one("#yaml-toggle", Switch).toggle()
+
+    @on(Switch.Changed, "#yaml-toggle")
+    def _yaml_switch_changed(self, event: Switch.Changed) -> None:
+        if not event.value and not self._finish_yaml_edit():
+            self._sync_yaml_view()  # Keep the invalid field available for correction.
+            return
+        self._yaml_form_page = None
+        if event.value and self._can_edit_yaml():
+            try:
+                self.query_one(YamlForm).open_document(self.editor.text, Path(self._dbt_file["path"]).name)
+            except YamlFormError as exc:
+                self._set_status(str(exc))
+            else:
+                self.query_one(FindBar).close(restore_focus=False)
+                self.palette.close()
+                self._yaml_form_page = self._document_identity
+        self._sync_yaml_view()
+        self._focus_editor()
+
+    def _apply_yaml_form(self, before: str, after: str) -> bool:
+        # The raw editor owns undo, Pages and revision-checked autosave in both modes.
+        if not self._can_edit_yaml() or self._yaml_form_page != self._document_identity or self.editor.text != before:
+            return False
+        if after != before:
+            self._replace_dbt_draft(self.editor, after)
+        return True
+
+    def focus_raw_editor(self) -> None:
+        if self._yaml_form_page is not None:
+            if not self._finish_yaml_edit():
+                return
+            self._yaml_form_page = None
+            self._sync_yaml_view()
+        self.editor.focus()
 
     def _dbt_conversion_target(self) -> dict[str, str]:
         source = self.session.source
@@ -2300,6 +2443,8 @@ class D8RApp(App):
     def set_dbt_enabled(self, enabled: bool) -> bool:
         if self.session.dbt_enabled == enabled:
             return True
+        if not self._finish_yaml_edit():
+            return False
         self.palette.close()
         # Do not write project files as a side effect of toggling the switch.
         # A pending edit remains in Pages, where it can be resumed later.
@@ -2467,9 +2612,23 @@ class D8RApp(App):
             status += " Workspace history could not be saved."
         return status
 
+    @on(Button.Pressed, "#dbt-close-file")
+    def action_close_yaml_file(self) -> None:
+        if self._modal_open() or self.function_mode or self.editor.file_format != "yaml":
+            return
+        # Pages are in creation order, not visit order. Prefer the actual query we left.
+        queries = [page["id"] for page in self.session.workspace["pages"]
+                   if page["source"] == self._workspace_key and ("dbt_file" not in page
+                       or Path(page["dbt_file"]["path"]).suffix.lower() == ".sql")]
+        if queries:
+            previous = self._last_query_page.get(self._workspace_key)
+            self.open_page(previous if previous in queries else queries[-1])
+        else:
+            self.action_new_query()
+
     def open_dbt_file(self, home: str, path: str, *, row: int | None = None,
                       draft: DbtDraft | None = None, autosave: bool = False) -> None:
-        if not self.session.dbt_enabled or self.refuse_busy("Open dbt file"):
+        if not self.session.dbt_enabled or self.refuse_busy("Open dbt file") or not self._finish_yaml_edit():
             return
         self.ai_panel._flush_chat()
         self._flush_workspace()
@@ -2492,7 +2651,7 @@ class D8RApp(App):
             self._dbt_autosave_text = draft.before.text
         if row is not None:
             self.editor.move_cursor((min(row, self.editor.document.line_count - 1), 0))
-        self.editor.focus()
+        self.focus_raw_editor()
         self._flush_workspace()
         if not self._autosave_error and not autosave:
             self._set_status(f"dbt · {path}")
@@ -2712,7 +2871,7 @@ class D8RApp(App):
             self._set_status(f"Autosaved {link['path']} · nothing executed")
 
     def reload_dbt_file(self) -> None:
-        if not self.session.dbt_enabled or self._dbt_file is None or self.function_mode:
+        if not self.session.dbt_enabled or self._dbt_file is None or self.function_mode or not self._finish_yaml_edit():
             return
         try:
             disk = self._read_dbt_page(self._dbt_file)
@@ -2824,7 +2983,7 @@ class D8RApp(App):
     def _open_fn(self, focus: str = "", new_name: str = "", new_body: str = "", *,
                  restore_draft: bool = True, reveal_list: bool = True) -> None:
         """Open the function editor while keeping the workspace mounted."""
-        if self._modal_open() or self.refuse_busy("Function library"):
+        if self._modal_open() or self.refuse_busy("Function library") or not self._finish_yaml_edit():
             return
         if reveal_list and not self.session.pane_visibility["schema"]:
             if not self.update_settings(panes={"schema": True}):
@@ -2862,7 +3021,7 @@ class D8RApp(App):
         self.ai_panel.target_changed()
         self.save_workspace(active_view="workspace")
         self.query_one("#keymap", Static).update(KEY_HINTS)
-        self.editor.focus()
+        self._focus_editor()
         self.palette.sync()
 
     def _function_pick_snapshot(self) -> tuple:
@@ -2882,7 +3041,7 @@ class D8RApp(App):
         if self.function_mode:
             self.action_workspace()
         else:
-            self.editor.focus()
+            self._focus_editor()
 
     @on(FnExplorer.InsertRequested)
     def _insert_function(self, event: FnExplorer.InsertRequested) -> None:
@@ -3166,7 +3325,7 @@ class D8RApp(App):
         """Select the offline workspace first; reconnect without delaying navigation."""
         key = self.session.source_key(source_id)
         if key != self._workspace_key:
-            if self.refuse_busy("Change data source"):
+            if self.refuse_busy("Change data source") or not self._finish_yaml_edit():
                 self._sync_source_select()
                 return False
             self._cancel_connection()
@@ -3429,7 +3588,7 @@ class D8RApp(App):
     def _history_selected(self, event: DataTable.RowSelected) -> None:
         """Restore the recorded document and target without executing or connecting."""
         if 0 <= event.cursor_row < len(self.session.history):
-            if self.refuse_busy("Load history"):
+            if self.refuse_busy("Load history") or not self._finish_yaml_edit():
                 return
             entry = self.session.history[event.cursor_row]
             self._prepare_workspace_switch()

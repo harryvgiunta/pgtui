@@ -13,6 +13,8 @@ from d8r.dbt_index import (
 
 _LIMIT = 100
 _BARE_NAME = re.compile(r"[\w.-]+\Z")
+_NAME_TAIL = re.compile(r"[\w.-]*")
+_SPACE = re.compile(r"\s*")
 _MACRO = re.compile(r"(?:[A-Za-z_]\w*\.)?(?:[A-Za-z_]\w*)?\Z")
 _MASK = re.compile(r"[^\r\n]")
 _COMMON = ("config", "doc", "env_var", "is_incremental", "log", "ref", "return", "run_query", "source", "var")
@@ -159,6 +161,40 @@ def _value(document: str, span: tuple[int, int]) -> tuple[str, _Slot] | None:
     return slot.prefix, slot
 
 
+def _draft_source_arguments(tag: _Tag, document: str, offset: int, args: _Arguments) -> _Arguments:
+    """An unfinished call owns the name at the caret, not the SQL after it."""
+    if tag.closed and not tag.broken:
+        return args
+    span = args.spans[args.index]
+    delimiter = "}}" if tag.kind == "{" else "%}"
+    complete = _value(document, span)
+    if complete is not None and all(document.find(mark, offset, complete[1].end) < 0 for mark in ("\n", "\r", delimiter)):
+        return args  # An intact literal may contain spaces or punctuation; replace it as a unit.
+
+    before = (span[0], offset)
+    slot = _slot(document, offset, before)
+    if slot is None or (slot.quote and _value(document, before) is not None):
+        return args  # Never turn a computed argument into a literal.
+    end = _NAME_TAIL.match(document, offset, tag.body_end).end()
+    if end > offset and document.startswith("-" + delimiter, end - 1):
+        end -= 1
+    closed_quote = bool(slot.quote and document.startswith(slot.quote, end))
+    end += int(closed_quote)
+    next_pos = _SPACE.match(document, end).end()
+    following = document[next_pos:next_pos + 1]
+    if next_pos < tag.body_end and following not in {",", ")"} and not document.startswith(
+            (delimiter, "-" + delimiter, "+" + delimiter), next_pos):
+        # After a closed quote or a bare name, operators may continue a Jinja expression.
+        # Inside an unfinished quote, never absorb following punctuation or host SQL.
+        if closed_quote or (not slot.quote and (next_pos == end or not following.isalpha())):
+            return args
+    spans = (*args.spans[:args.index], (span[0], end))
+    if following == ",":
+        rest = args.spans[args.index + 1:] if next_pos == span[1] else ()
+        spans += rest or ((next_pos + 1, tag.body_end),)
+    return _Arguments(args.name, args.start, args.index, spans, following == ")")
+
+
 def _quote(name: str, quote: str = "'") -> str:
     return quote + name.replace("\\", "\\\\").replace(quote, "\\" + quote) + quote
 
@@ -211,10 +247,7 @@ def _complete_source(index: DbtIndex, document: str, offset: int, args: _Argumen
         return _result(_Slot(offset, offset, ""), (), args)
     sources = [item for item in index.resources.values() if item.kind == "source"]
     if args.index == 0:
-        table = _value(document, args.spans[1]) if len(args.spans) == 2 else None
-        known_table = table and any(item.name == table[0] for item in sources)
-        groups = {item.source for item in sources if (not known_table or item.name == table[0])
-                  and index.resolve("source", (item.source, item.name), {}) is not None}
+        groups = {item.source for item in sources if index.resolve("source", (item.source, item.name), {}) is not None}
         return _result(slot, (_item(slot, name, "source name", "source", args, next_slot=True)
                               for name in _matching(slot.prefix, groups)), args)
     if args.index == 1 and (first := _value(document, args.spans[0])):
@@ -342,6 +375,7 @@ def complete_dbt(index: DbtIndex | None, document: str, offset: int, manual: boo
     if args is not None:
         if index is None:
             return _result(_Slot(offset, offset, ""), (), args)
-        complete = _complete_ref if args.name == "ref" else _complete_source
-        return complete(index, document, offset, args)
+        if args.name == "source":
+            return _complete_source(index, document, offset, _draft_source_arguments(tag, document, offset, args))
+        return _complete_ref(index, document, offset, args)
     return _complete_macro(index, document, offset, tag, manual)
