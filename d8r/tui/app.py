@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 from time import monotonic
 from collections.abc import Callable
 from copy import deepcopy
@@ -18,13 +19,14 @@ from typing import TypeVar
 from uuid import uuid4
 
 from rich.rule import Rule
-from textual import events, on
+from textual import constants, events, on
 from textual.actions import SkipAction
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
 from textual.content import Content, Text
+from textual.driver import Driver
 from textual.screen import ModalScreen, Screen
 from textual.widgets import (
     Button,
@@ -336,6 +338,16 @@ class D8RApp(App):
         self._main_outcome: RunOutcome | None = None
         self._plan_tree: PlanTree | None = None
         self._workspace_outputs: dict[str, tuple[RunOutcome | None, str, bool]] = {}
+
+    def get_driver_class(self) -> type[Driver]:
+        if os.name == "posix" and constants.DRIVER is None and (
+            os.environ.get("TERM_PROGRAM", "").casefold() == "ghostty"
+            or os.environ.get("TERM") == "xterm-ghostty"
+            or os.environ.get("GHOSTTY_RESOURCES_DIR")  # Retained by multiplexers.
+        ):
+            from .ghostty import GhosttyDriver  # POSIX-only (termios).
+            return GhosttyDriver
+        return super().get_driver_class()
 
     def get_default_screen(self) -> Screen:
         """The IDE runs on `IdeScreen`, whose tab does not walk the panes."""

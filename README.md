@@ -650,6 +650,9 @@ filtered. Up from the first row or an empty list focuses search; Down returns to
 Query batches open **Results 1**, **Results 2**, and so on, one tab per statement.
 The next run replaces unpinned results. Pin on Results 1 keeps a separate snapshot;
 Pin on another result keeps that tab. Pinned tabs are marked ◆.
+In Ghostty on macOS and Linux, PGTUI uses row-and-column mouse coordinates rather
+than pixel coordinates. Click a schema row to browse it or **[x]** to close
+Explorer. Type `\schema` in the editor to toggle it back on.
 Drag the vertical dividers to resize Explorer or Conversations. Drag the horizontal
 line beside **Query results**, or the title itself, to resize the editor and results.
 **Close** or **Ctrl+W** closes the selected result tab, including **Results 1**.
