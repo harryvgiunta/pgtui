@@ -272,8 +272,8 @@ Tabs Tab:disabled {
 
 #query-targets SelectOverlay {
     min-width: 12;
-    /* Open beside the selector's column, below the Run row. */
-    offset: 100% 1;
+    /* Align with the field, leaving the Run row clickable. */
+    offset: 0 1;
 }
 
 

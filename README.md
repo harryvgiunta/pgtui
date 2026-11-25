@@ -82,8 +82,8 @@ DuckDB support explicit transactions; D1 does not keep transactions across HTTP
 requests. A failed statement does not undo earlier committed work.
 
 Click the database name at the top left of the query workspace to switch sources.
-The list opens to the right, below the query toolbar. Clicking **Run SQL** or
-visible SQL outside the list dismisses it and acts on the same click.
+The list lines up with the database field's left edge, below the query toolbar.
+Clicking **Run SQL** or visible SQL outside the list dismisses it and acts on the same click.
 
 SQL failures include actionable hints for syntax, ambiguous references, missing
 objects, grouping, and type/function mismatches. PostgreSQL diagnostics retain a

@@ -118,16 +118,19 @@ async def test_source_menu_does_not_swallow_editor_or_run_clicks(parquet_source,
         picker = app.query_one("#source-select", Select)
         label = picker.query_one("SelectCurrent #label")
         editor = app.editor
-        editor.load_text("SELECT 42")
+        editor.load_text("SELECT 40 + 2 AS expected_answer")
         await pilot.pause()
 
         await _click_at(pilot, label.region.offset)
         assert picker.expanded
-        await _click_at(pilot, (editor.region.x + editor.gutter.left + editor.gutter_width + 4,
-                                editor.region.y + editor.gutter.top))
+        menu = picker.query_one("SelectOverlay", OptionList)
+        assert menu.region.x == picker.region.x
+        # Click visible SQL to the right of the list.
+        column = editor.text.index("answer")
+        await _click_at(pilot, (editor.content_region.x + editor.gutter_width + column, editor.content_region.y))
         assert not picker.expanded
         assert app.focused is editor
-        assert editor.cursor_location == (0, 4)
+        assert editor.cursor_location == (0, column)
 
         await _click_at(pilot, label.region.offset)
         assert picker.expanded
@@ -154,8 +157,12 @@ async def test_source_menu_does_not_swallow_editor_or_run_clicks(parquet_source,
         assert picker.expanded
         await _click_at(pilot, label.region.offset)
         assert not picker.expanded
+
+        await _click_at(pilot, app.query_one("#explorer-close").region.center)
+        assert not app.query_one("#explorer-slot").display
         await _click_at(pilot, label.region.offset)
-        menu = picker.query_one("SelectOverlay", OptionList)
+        assert picker.expanded
+        assert menu.region.x == picker.region.x
         option = next(i for i in range(menu.option_count) if menu.get_option_at_index(i).prompt.plain == d1_source.display)
         x = menu.content_region.x
         y = next(y for y in range(menu.content_region.y, menu.content_region.bottom)
